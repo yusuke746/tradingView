@@ -7,7 +7,7 @@ app = Flask(__name__)
 # MT5の「共通フォルダ」のパス
 LOG_FILE = r"C:\Users\MT4ver2-u70-t1jaowH5\AppData\Roaming\MetaQuotes\Terminal\Common\Files\signals_tradingview.csv"
 
-def cleanup_csv(file_path, max_size_kb=1000, keep_records=50):
+def cleanup_csv(file_path, max_size_kb=10, keep_records=50):
     """
     CSVファイルが指定サイズを超えていたら、ヘッダーと最新のデータを残してトリミングする関数
    
