@@ -1,2 +1,3 @@
-# Dynamically generated signal log files
-signals.csv
+.env
+__pycache__/
+*.csv
