@@ -41,7 +41,7 @@ AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
 
 # --- AI entry filter (v2.7 hybrid upgrade) ---
 AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "true").lower() == "true"
-AI_ENTRY_MIN_CONFIDENCE = max(75, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "75")))
+AI_ENTRY_MIN_CONFIDENCE = max(75, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70")))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
 # on AI error: "skip" (safest) or "default_allow"
 AI_ENTRY_FALLBACK = os.getenv("AI_ENTRY_FALLBACK", "skip").strip().lower()
