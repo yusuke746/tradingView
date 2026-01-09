@@ -416,7 +416,12 @@ def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: st
 
     # 既存のコンテキスト構築を流用しつつ、出力スキーマだけ仕様に合わせる
     base = _build_entry_filter_prompt(symbol, market, stats, action)
-
+    now = time.time()
+    # statsがNoneなら空の辞書として扱う
+    if stats is None:
+        stats = {}
+    
+    q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
     # base内のスキーマ案内を上書き（出力はaction=ENTRY|SKIP）
     # NOTE: baseはJSONコンテキストを含むので、ここでは先頭の指示を強化するだけに留める
     return (
@@ -436,7 +441,11 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     - AIは action/confidence/multiplier のみを返す。
     """
     now = time.time()
-    q_age_sec = int(now - stats["q_time"]) if stats.get("q_time") else -1
+    # statsがNoneまたは空の場合のガードを追加
+    if not stats:
+        q_age_sec = -1
+    else:
+        q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
 
     m15_trend = "UP" if market["bid"] > market["m15_ma"] else "DOWN"
     trend_align = "ALIGNED" if (action == "BUY" and m15_trend == "UP") or (action == "SELL" and m15_trend == "DOWN") else "MISALIGNED"
