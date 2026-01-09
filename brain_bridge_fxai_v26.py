@@ -39,6 +39,10 @@ MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
 FORCE_AI_CALL_WHEN_FLAT = os.getenv("FORCE_AI_CALL_WHEN_FLAT", "false").lower() == "true"
 AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
 
+# --- Webhook auth (optional) ---
+# If set, require the token to match either header `X-Webhook-Token` or JSON field `token`.
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+
 # --- AI entry filter (v2.7 hybrid upgrade) ---
 AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "true").lower() == "true"
 AI_ENTRY_MIN_CONFIDENCE = max(75, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70")))
@@ -47,6 +51,11 @@ AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
 AI_ENTRY_FALLBACK = os.getenv("AI_ENTRY_FALLBACK", "skip").strip().lower()
 AI_ENTRY_DEFAULT_CONFIDENCE = int(os.getenv("AI_ENTRY_DEFAULT_CONFIDENCE", "50"))
 AI_ENTRY_DEFAULT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_MULTIPLIER", "1.0"))
+
+# --- Webhook compatibility / safety ---
+# If true, an alert that only contains action=BUY/SELL (without source) is treated as Q-Trend.
+# Default false to avoid accidental Q-Trend triggers.
+ASSUME_ACTION_IS_QTREND = os.getenv("ASSUME_ACTION_IS_QTREND", "false").lower() == "true"
 
 # --- OpenAI ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -417,7 +426,10 @@ def _call_openai_with_retry(prompt: str) -> Optional[Dict[str, Any]]:
 
 
 def _validate_ai_entry_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """期待するJSON: {action: "ENTRY"|"SKIP", confidence: 0-100, multiplier: 0.5-1.5, reason: str}."""
+    """期待するJSON: {action: "ENTRY"|"SKIP", confidence: 0-100, multiplier: 0.5-1.5, reason: str}。
+
+    NOTE: multiplier は "local_multiplier に掛ける係数"（0.5-1.5）として扱う。
+    """
     if not isinstance(decision, dict):
         return None
 
@@ -526,6 +538,8 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     opposition_score = (opp_u * 3) + min(opp_n, 6)
     strong_flag = bool(stats.get("strong_after_q"))
 
+    local_multiplier = _compute_entry_multiplier(confirm_u, strong_flag)
+
     # スプレッドが大きすぎる局面はEVが落ちやすい（簡易目安）
     spread_points = float(market.get("spread") or 0.0)
     spread_flag = "WIDE" if spread_points >= 40 else "NORMAL"
@@ -567,9 +581,11 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "spread_flag": spread_flag,
         },
         "constraints": {
-            "multiplier_range": [0.5, 1.5],
+            "multiplier_factor_range": [0.5, 1.5],
             "confidence_range": [0, 100],
-            "note": "Return JSON only. Do not propose BUY/SELL; decide ENTRY or SKIP for the given proposed_action.",
+            "local_multiplier": local_multiplier,
+            "final_multiplier_max": 2.0,
+            "note": "Return JSON only. Do not propose BUY/SELL; decide ENTRY or SKIP for the given proposed_action. multiplier is a FACTOR applied to local_multiplier, clamped to final_multiplier_max.",
         },
     }
 
@@ -581,7 +597,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
         "- Penalize opposition: higher oppose_unique_sources, higher weighted_oppose_score, fvg/zones touches against.\n"
         "- Penalize wide spread.\n"
-        "Return ONLY strict JSON schema:\n"
+        "Return ONLY strict JSON schema (multiplier is a FACTOR for local_multiplier):\n"
         '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
@@ -607,6 +623,14 @@ def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Opt
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """TradingViewからのシグナルを受信し、AIフィルターを適用してエントリーを決定。"""
+    # Optional shared-secret authentication
+    if WEBHOOK_TOKEN:
+        header_token = (request.headers.get("X-Webhook-Token") or "").strip()
+        data_peek = request.get_json(silent=True)
+        body_token = (data_peek.get("token") if isinstance(data_peek, dict) else "") or ""
+        if header_token != WEBHOOK_TOKEN and str(body_token).strip() != WEBHOOK_TOKEN:
+            return "Unauthorized", 401
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return "Invalid data", 400
@@ -615,7 +639,8 @@ def webhook():
     symbol = data.get("symbol", SYMBOL)
 
     # 受信シグナルをキャッシュに保存（合流判定のため）
-    # TradingViewテンプレが action しか送らない場合は、互換目的で source=Q-Trend 扱いに寄せる。
+    # NOTE: デフォルトでは action=BUY/SELL だけで Q-Trend 扱いにしない（誤発火防止）。
+    # 旧テンプレ互換が必要なら ASSUME_ACTION_IS_QTREND=true を設定。
     raw_action = data.get("action") or data.get("side")
     raw_action_upper = (raw_action or "").strip().upper()
     inferred_side = ""
@@ -624,9 +649,14 @@ def webhook():
     elif isinstance(raw_action, str) and raw_action.strip().lower() in {"buy", "sell"}:
         inferred_side = raw_action.strip().lower()
 
+    source_in = (data.get("source") or "").strip()
+    source_for_cache = source_in
+    if not source_for_cache and ASSUME_ACTION_IS_QTREND and inferred_side:
+        source_for_cache = "Q-Trend"
+
     signal = {
         "symbol": symbol,
-        "source": data.get("source") or ("Q-Trend" if inferred_side else ""),
+        "source": source_for_cache,
         "side": data.get("side") or inferred_side,
         "strength": data.get("strength"),
         "signal_type": data.get("signal_type"),
@@ -644,6 +674,7 @@ def webhook():
     normalized = _normalize_signal_fields(signal)
 
     # エントリートリガーは Q-Trend のみ（それ以外は保存して終了）
+    # sourceが空のままの場合、誤発火防止のためトリガーしない。
     qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
     if not qtrend_trigger:
         return "Stored", 200
@@ -687,10 +718,28 @@ def webhook():
 
     # AIフィルター（有効時のみ）
     if AI_ENTRY_ENABLED:
+        # Throttle AI calls to avoid rate-limit/cost spikes on repeated triggers.
+        global _last_ai_attempt_key, _last_ai_attempt_at
+        attempt_key = f"{symbol}:{action}:{float(stats.get('q_time') or 0.0):.3f}"
+        now_mono = time.time()
+        if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+            return "AI throttled", 200
+        _last_ai_attempt_key = attempt_key
+        _last_ai_attempt_at = now_mono
+
         ai_decision = _ai_entry_filter(symbol, market, stats, action)
         if (not ai_decision) or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
             print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
-            return "Blocked by AI", 403
+            # Fallback policy on AI error/invalid response
+            if (not ai_decision) and AI_ENTRY_FALLBACK == "default_allow":
+                ai_decision = {
+                    "action": "ENTRY",
+                    "confidence": int(_clamp(AI_ENTRY_DEFAULT_CONFIDENCE, 0, 100)),
+                    "multiplier": float(_clamp(AI_ENTRY_DEFAULT_MULTIPLIER, 0.5, 1.5)),
+                    "reason": "fallback_default_allow",
+                }
+            else:
+                return "Blocked by AI", 403
         ai_conf = ai_decision["confidence"]
         ai_reason = ai_decision.get("reason") or ""
         # AIのmultiplierはローカル倍率への係数として扱う（過度に増えないよう上限を2.0に丸める）
@@ -701,6 +750,8 @@ def webhook():
         "type": "ORDER",
         "action": action,
         "symbol": symbol,
+        # EA expects `atr` to validate and calculate SL/lot sizing.
+        "atr": float(market.get("atr") or 0.0),
         "multiplier": final_multiplier,
         "reason": ai_reason,
         "ai_confidence": ai_conf,
