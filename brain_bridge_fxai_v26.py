@@ -300,16 +300,37 @@ def get_mt5_market_data(symbol: str):
     """MT5のティック/レートが取れないケースでも落ちないように安全に取得する。"""
     tick = mt5.symbol_info_tick(symbol)
 
+    def _rate_field(rate_row, key: str, default: float = 0.0) -> float:
+        """MT5のrate行はdictの場合もnumpy.voidの場合もあるので両対応で取り出す。"""
+        if rate_row is None:
+            return default
+        # dict-like
+        if isinstance(rate_row, dict):
+            try:
+                return float(rate_row.get(key, default) or default)
+            except Exception:
+                return default
+        # numpy.void / structured array row
+        try:
+            return float(rate_row[key])
+        except Exception:
+            pass
+        # attribute fallback
+        try:
+            return float(getattr(rate_row, key, default) or default)
+        except Exception:
+            return default
+
     rates_m15 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 20)
     if rates_m15 is not None and len(rates_m15) > 0:
-        closes = [float(r.get("close", 0.0)) for r in rates_m15]
+        closes = [_rate_field(r, "close", 0.0) for r in rates_m15]
         ma15 = sum(closes) / max(1, len(closes))
     else:
         ma15 = 0.0
 
     rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 14)
     if rates_m5 is not None and len(rates_m5) > 0:
-        ranges = [abs(float(r.get("high", 0.0)) - float(r.get("low", 0.0))) for r in rates_m5]
+        ranges = [abs(_rate_field(r, "high", 0.0) - _rate_field(r, "low", 0.0)) for r in rates_m5]
         atr = sum(ranges) / max(1, len(ranges))
     else:
         atr = 0.0
