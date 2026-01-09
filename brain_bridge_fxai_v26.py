@@ -417,10 +417,12 @@ def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: st
     # 既存のコンテキスト構築を流用しつつ、出力スキーマだけ仕様に合わせる
     base = _build_entry_filter_prompt(symbol, market, stats, action)
     now = time.time()
-    # statsがNoneなら空の辞書として扱う
-    if stats is None:
-        stats = {}
     
+    # statsがNone(空)の場合、計算をスキップして安全なメッセージを返す
+    if stats is None:
+        return f"Market: {symbol}, Action: {action}. Alert: No previous Q-Trend data stored yet."
+
+    # statsが存在する場合のみ計算を実行
     q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
     # base内のスキーマ案内を上書き（出力はaction=ENTRY|SKIP）
     # NOTE: baseはJSONコンテキストを含むので、ここでは先頭の指示を強化するだけに留める
