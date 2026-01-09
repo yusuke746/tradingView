@@ -554,7 +554,10 @@ def webhook():
         return "Invalid data", 400
 
     symbol = data.get("symbol", SYMBOL)
-    action = data.get("action")
+    # 修正後（sideもactionも両方受け取れるようにする）
+    action = data.get("action") or data.get("side")
+    if action:
+        action = action.upper() # 小文字のbuyを大文字のBUYに変換
     if action not in {"BUY", "SELL"}:
         return "Invalid action", 400
 
