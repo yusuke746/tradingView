@@ -14,7 +14,7 @@ app = Flask(__name__)
 load_dotenv()
 
 # --- 設定 ---
-WEBHOOK_PORT = 5001
+WEBHOOK_PORT = 80
 ZMQ_PORT = os.getenv("ZMQ_PORT")
 SYMBOL = "GOLD"  # 取引通貨
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # .env から読み込む
