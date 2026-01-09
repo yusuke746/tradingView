@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import socket
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Optional, Dict, Any
@@ -66,6 +67,12 @@ API_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "7.0"))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# If no OpenAI client is available, AI-entry gating cannot run.
+# In that case, disable AI_ENTRY to avoid blocking entries unexpectedly.
+if AI_ENTRY_ENABLED and not client:
+    print("[FXAI][WARN] AI_ENTRY_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI entry filter.")
+    AI_ENTRY_ENABLED = False
+
 # --- ZMQ ---
 context = zmq.Context.instance()
 zmq_socket = context.socket(zmq.PUSH)
@@ -77,6 +84,49 @@ if not mt5.initialize():
 
 signals_lock = Lock()
 signals_cache = []  # list[dict]
+
+# --- Runtime status (for debugging / health checks) ---
+_status_lock = Lock()
+_last_status: Dict[str, Any] = {
+    "started_at": time.time(),
+    "last_webhook_at": None,
+    "last_webhook_symbol": None,
+    "last_webhook_source": None,
+    "last_webhook_side": None,
+    "last_result": None,  # e.g. Stored / Waiting confluence / Blocked by AI / OK
+    "last_result_at": None,
+    "last_order": None,
+}
+
+
+def _set_status(**kwargs) -> None:
+    with _status_lock:
+        _last_status.update(kwargs)
+
+
+def _get_status_snapshot() -> Dict[str, Any]:
+    with _status_lock:
+        snap = dict(_last_status)
+    # add lightweight cache stats without holding status lock
+    with signals_lock:
+        snap["signals_cache_len"] = len(signals_cache)
+    return snap
+
+
+def _check_port_bindable(host: str, port: int) -> Optional[str]:
+    """Return error message if the port cannot be bound, else None."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        return None
+    except OSError as e:
+        return str(e)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 # --- De-dupe / throttle ---
 _last_entry_q_time = None
@@ -272,6 +322,10 @@ def get_qtrend_anchor_stats(target_symbol: str):
                 zones_touch_same += 1
             else:
                 zones_touch_opp += 1
+
+        # Ignore unnamed sources to avoid counting malformed alerts as confluence.
+        if not src:
+            continue
 
         if side == q_side:
             confirm_signals += 1
@@ -638,6 +692,15 @@ def webhook():
     now = time.time()
     symbol = data.get("symbol", SYMBOL)
 
+    _set_status(
+        last_webhook_at=now,
+        last_webhook_symbol=symbol,
+        last_result=None,
+        last_result_at=None,
+        last_webhook_source=(data.get("source") or ""),
+        last_webhook_side=(data.get("side") or data.get("action") or ""),
+    )
+
     # 受信シグナルをキャッシュに保存（合流判定のため）
     # NOTE: デフォルトでは action=BUY/SELL だけで Q-Trend 扱いにしない（誤発火防止）。
     # 旧テンプレ互換が必要なら ASSUME_ACTION_IS_QTREND=true を設定。
@@ -677,24 +740,29 @@ def webhook():
     # sourceが空のままの場合、誤発火防止のためトリガーしない。
     qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
     if not qtrend_trigger:
+        _set_status(last_result="Stored", last_result_at=time.time())
         return "Stored", 200
 
     stats = get_qtrend_anchor_stats(symbol)
     if not stats:
+        _set_status(last_result="Stored (no qtrend stats)", last_result_at=time.time())
         return "Stored", 200
 
     q_age_sec = int(now - float(stats.get("q_time") or now))
     if Q_TREND_MAX_AGE_SEC > 0 and q_age_sec > Q_TREND_MAX_AGE_SEC:
+        _set_status(last_result="Stale Q-Trend", last_result_at=time.time())
         return "Stale Q-Trend", 200
 
     # 合流条件（ユニークソースで最低限の合流が取れていない場合は見送り）
     if int(stats.get("confirm_unique_sources") or 0) < MIN_OTHER_SIGNALS_FOR_ENTRY:
+        _set_status(last_result="Waiting confluence", last_result_at=time.time())
         return "Waiting confluence", 200
 
     # ローカルで BUY/SELL を確定（AIに決めさせない）
     q_side = (stats.get("q_side") or normalized.get("side") or "").lower()
     action = "BUY" if q_side == "buy" else "SELL" if q_side == "sell" else ""
     if action not in {"BUY", "SELL"}:
+        _set_status(last_result="Invalid action", last_result_at=time.time())
         return "Invalid action", 400
 
     # 重複送信ガード（同じQ-Trend起点で何度もORDERを出さない）
@@ -702,6 +770,7 @@ def webhook():
     if _last_entry_q_time is not None:
         try:
             if abs(float(_last_entry_q_time) - float(stats.get("q_time") or 0.0)) < 0.0001:
+                _set_status(last_result="Duplicate", last_result_at=time.time())
                 return "Duplicate", 200
         except Exception:
             pass
@@ -723,6 +792,7 @@ def webhook():
         attempt_key = f"{symbol}:{action}:{float(stats.get('q_time') or 0.0):.3f}"
         now_mono = time.time()
         if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+            _set_status(last_result="AI throttled", last_result_at=time.time())
             return "AI throttled", 200
         _last_ai_attempt_key = attempt_key
         _last_ai_attempt_at = now_mono
@@ -739,6 +809,7 @@ def webhook():
                     "reason": "fallback_default_allow",
                 }
             else:
+                _set_status(last_result="Blocked by AI", last_result_at=time.time())
                 return "Blocked by AI", 403
         ai_conf = ai_decision["confidence"]
         ai_reason = ai_decision.get("reason") or ""
@@ -758,13 +829,47 @@ def webhook():
         "ai_reason": ai_reason,
     })
 
+    _set_status(
+        last_result="OK",
+        last_result_at=time.time(),
+        last_order={
+            "action": action,
+            "symbol": symbol,
+            "atr": float(market.get("atr") or 0.0),
+            "multiplier": final_multiplier,
+            "ai_confidence": ai_conf,
+            "ai_reason": ai_reason,
+            "q_time": float(stats.get("q_time") or now),
+        },
+    )
+
     _last_entry_q_time = float(stats.get("q_time") or now)
     print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {final_multiplier}")
     return "OK", 200
+
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return {"ok": True, "ts": time.time()}, 200
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    # Optional shared-secret authentication (same rule as /webhook)
+    if WEBHOOK_TOKEN:
+        header_token = (request.headers.get("X-Webhook-Token") or "").strip()
+        if header_token != WEBHOOK_TOKEN:
+            return "Unauthorized", 401
+    return _get_status_snapshot(), 200
 
 
 if __name__ == '__main__':
     print(f"[FXAI] webhook http://0.0.0.0:{WEBHOOK_PORT}/webhook")
     print(f"[FXAI] ZMQ bind: {ZMQ_BIND}")
     print(f"[FXAI] symbol: {SYMBOL}")
+    bind_err = _check_port_bindable("0.0.0.0", int(WEBHOOK_PORT))
+    if bind_err:
+        print(f"[FXAI][FATAL] Cannot bind WEBHOOK_PORT={WEBHOOK_PORT}. OS error: {bind_err}")
+        print("[FXAI][HINT] Set WEBHOOK_PORT to an available port (e.g. 8000) or run with sufficient privileges.")
+        raise SystemExit(2)
     app.run(host='0.0.0.0', port=WEBHOOK_PORT)
