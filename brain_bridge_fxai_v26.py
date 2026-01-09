@@ -607,42 +607,108 @@ def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Opt
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """TradingViewからのシグナルを受信し、AIフィルターを適用してエントリーを決定。"""
-    data = request.get_json()
-    if not data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
         return "Invalid data", 400
 
+    now = time.time()
     symbol = data.get("symbol", SYMBOL)
-    # 修正後（sideもactionも両方受け取れるようにする）
-    action = data.get("action") or data.get("side")
-    if action:
-        action = action.upper() # 小文字のbuyを大文字のBUYに変換
+
+    # 受信シグナルをキャッシュに保存（合流判定のため）
+    # TradingViewテンプレが action しか送らない場合は、互換目的で source=Q-Trend 扱いに寄せる。
+    raw_action = data.get("action") or data.get("side")
+    raw_action_upper = (raw_action or "").strip().upper()
+    inferred_side = ""
+    if raw_action_upper in {"BUY", "SELL"}:
+        inferred_side = raw_action_upper.lower()
+    elif isinstance(raw_action, str) and raw_action.strip().lower() in {"buy", "sell"}:
+        inferred_side = raw_action.strip().lower()
+
+    signal = {
+        "symbol": symbol,
+        "source": data.get("source") or ("Q-Trend" if inferred_side else ""),
+        "side": data.get("side") or inferred_side,
+        "strength": data.get("strength"),
+        "signal_type": data.get("signal_type"),
+        "event": data.get("event"),
+        "confirmed": data.get("confirmed"),
+        # TradingViewで time/timenow を渡している場合に備える
+        "time": data.get("time") or data.get("timenow") or data.get("timestamp"),
+        "receive_time": now,
+    }
+
+    with signals_lock:
+        signals_cache.append(signal)
+        _prune_signals_cache_locked(now)
+
+    normalized = _normalize_signal_fields(signal)
+
+    # エントリートリガーは Q-Trend のみ（それ以外は保存して終了）
+    qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
+    if not qtrend_trigger:
+        return "Stored", 200
+
+    stats = get_qtrend_anchor_stats(symbol)
+    if not stats:
+        return "Stored", 200
+
+    q_age_sec = int(now - float(stats.get("q_time") or now))
+    if Q_TREND_MAX_AGE_SEC > 0 and q_age_sec > Q_TREND_MAX_AGE_SEC:
+        return "Stale Q-Trend", 200
+
+    # 合流条件（ユニークソースで最低限の合流が取れていない場合は見送り）
+    if int(stats.get("confirm_unique_sources") or 0) < MIN_OTHER_SIGNALS_FOR_ENTRY:
+        return "Waiting confluence", 200
+
+    # ローカルで BUY/SELL を確定（AIに決めさせない）
+    q_side = (stats.get("q_side") or normalized.get("side") or "").lower()
+    action = "BUY" if q_side == "buy" else "SELL" if q_side == "sell" else ""
     if action not in {"BUY", "SELL"}:
         return "Invalid action", 400
 
+    # 重複送信ガード（同じQ-Trend起点で何度もORDERを出さない）
+    global _last_entry_q_time
+    if _last_entry_q_time is not None:
+        try:
+            if abs(float(_last_entry_q_time) - float(stats.get("q_time") or 0.0)) < 0.0001:
+                return "Duplicate", 200
+        except Exception:
+            pass
+
     market = get_mt5_market_data(symbol)
-    stats = get_qtrend_anchor_stats(symbol)
+    local_multiplier = _compute_entry_multiplier(
+        int(stats.get("confirm_unique_sources") or 0),
+        bool(stats.get("strong_after_q")),
+    )
 
-    # AIフィルターを適用
-    ai_decision = _ai_entry_filter(symbol, market, stats, action)
-    if not ai_decision or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
-        print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
-        return "Blocked by AI", 403
+    final_multiplier = float(local_multiplier)
+    ai_conf = None
+    ai_reason = ""
 
-    multiplier = ai_decision["multiplier"]
-    reason = ai_decision["reason"]
+    # AIフィルター（有効時のみ）
+    if AI_ENTRY_ENABLED:
+        ai_decision = _ai_entry_filter(symbol, market, stats, action)
+        if (not ai_decision) or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
+            print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
+            return "Blocked by AI", 403
+        ai_conf = ai_decision["confidence"]
+        ai_reason = ai_decision.get("reason") or ""
+        # AIのmultiplierはローカル倍率への係数として扱う（過度に増えないよう上限を2.0に丸める）
+        final_multiplier = float(_clamp(local_multiplier * float(ai_decision["multiplier"]), 0.5, 2.0))
 
     # ZMQでエントリー指示を送信
     zmq_socket.send_json({
         "type": "ORDER",
         "action": action,
         "symbol": symbol,
-        "multiplier": multiplier,
-        "reason": reason,
-        "ai_confidence": ai_decision["confidence"],
-        "ai_reason": reason,
+        "multiplier": final_multiplier,
+        "reason": ai_reason,
+        "ai_confidence": ai_conf,
+        "ai_reason": ai_reason,
     })
 
-    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {multiplier}")
+    _last_entry_q_time = float(stats.get("q_time") or now)
+    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {final_multiplier}")
     return "OK", 200
 
 
