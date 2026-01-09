@@ -297,18 +297,31 @@ def get_qtrend_anchor_stats(target_symbol: str):
 
 
 def get_mt5_market_data(symbol: str):
+    """MT5のティック/レートが取れないケースでも落ちないように安全に取得する。"""
     tick = mt5.symbol_info_tick(symbol)
+
     rates_m15 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 20)
-    ma15 = sum([r["close"] for r in rates_m15]) / 20 if rates_m15 is not None else 0
+    if rates_m15 is not None and len(rates_m15) > 0:
+        closes = [float(r.get("close", 0.0)) for r in rates_m15]
+        ma15 = sum(closes) / max(1, len(closes))
+    else:
+        ma15 = 0.0
 
     rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 14)
-    atr = sum([abs(r["high"] - r["low"]) for r in rates_m5]) / 14 if rates_m5 is not None else 0
+    if rates_m5 is not None and len(rates_m5) > 0:
+        ranges = [abs(float(r.get("high", 0.0)) - float(r.get("low", 0.0))) for r in rates_m5]
+        atr = sum(ranges) / max(1, len(ranges))
+    else:
+        atr = 0.0
 
     info = mt5.symbol_info(symbol)
-    point = info.point if info else 0
-    spread = (tick.ask - tick.bid) / point if (tick and point) else 0
+    point = float(getattr(info, "point", 0.0) or 0.0)
 
-    return {"bid": tick.bid, "ask": tick.ask, "m15_ma": ma15, "atr": atr, "spread": spread}
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    spread = ((ask - bid) / point) if point > 0 else 0.0
+
+    return {"bid": bid, "ask": ask, "m15_ma": ma15, "atr": atr, "spread": spread}
 
 
 def get_mt5_position_state(symbol: str):
@@ -414,18 +427,31 @@ def _validate_ai_entry_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
 def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
     """Q-Trend発生時の環境を渡し、AIに ENTRY/SKIP と倍率を判断させる専用プロンプト。"""
 
+    # statsが無い（まだQ-Trendを保持していない/鮮度で弾かれた）場合でも500にしない。
+    if not stats:
+        minimal_payload = {
+            "symbol": symbol,
+            "proposed_action": action,
+            "market": {
+                "bid": market.get("bid"),
+                "ask": market.get("ask"),
+                "m15_sma20": market.get("m15_ma"),
+                "atr_m5_approx": market.get("atr"),
+                "spread_points": market.get("spread"),
+            },
+            "note": "No Q-Trend stats available yet. Be conservative.",
+        }
+        return (
+            "You are a strict trading entry decision engine.\n"
+            "Decide if the proposed entry should be executed now.\n"
+            "Return ONLY strict JSON with this schema:\n"
+            '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+            "ContextJSON:\n"
+            + json.dumps(minimal_payload, ensure_ascii=False)
+        )
+
     # 既存のコンテキスト構築を流用しつつ、出力スキーマだけ仕様に合わせる
     base = _build_entry_filter_prompt(symbol, market, stats, action)
-    now = time.time()
-    
-    # statsがNone(空)の場合、計算をスキップして安全なメッセージを返す
-    if stats is None:
-        return f"Market: {symbol}, Action: {action}. Alert: No previous Q-Trend data stored yet."
-
-    # statsが存在する場合のみ計算を実行
-    q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
-    # base内のスキーマ案内を上書き（出力はaction=ENTRY|SKIP）
-    # NOTE: baseはJSONコンテキストを含むので、ここでは先頭の指示を強化するだけに留める
     return (
         "You are a strict trading entry decision engine.\n"
         "Decide if the proposed entry should be executed now.\n"
@@ -443,13 +469,13 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     - AIは action/confidence/multiplier のみを返す。
     """
     now = time.time()
-    # statsがNoneまたは空の場合のガードを追加
-    if not stats:
-        q_age_sec = -1
-    else:
-        q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
+    stats = stats or {}
 
-    m15_trend = "UP" if market["bid"] > market["m15_ma"] else "DOWN"
+    q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
+
+    bid = float(market.get("bid") or 0.0)
+    m15_ma = float(market.get("m15_ma") or 0.0)
+    m15_trend = "UP" if bid > m15_ma else "DOWN"
     trend_align = "ALIGNED" if (action == "BUY" and m15_trend == "UP") or (action == "SELL" and m15_trend == "DOWN") else "MISALIGNED"
 
     # 文脈スコア（AIへ“判断の軸”として提供。AIにBUY/SELLはさせない）
