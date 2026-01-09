@@ -41,7 +41,7 @@ AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
 
 # --- AI entry filter (v2.7 hybrid upgrade) ---
 AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "true").lower() == "true"
-AI_ENTRY_MIN_CONFIDENCE = int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "55"))
+AI_ENTRY_MIN_CONFIDENCE = max(75, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "75")))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
 # on AI error: "skip" (safest) or "default_allow"
 AI_ENTRY_FALLBACK = os.getenv("AI_ENTRY_FALLBACK", "skip").strip().lower()
@@ -383,19 +383,23 @@ def _call_openai_with_retry(prompt: str) -> Optional[Dict[str, Any]]:
 
 
 def _validate_ai_entry_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """期待するJSON: {allow: bool, confidence: 0-100, multiplier: 0.5-1.5, reason: str}."""
+    """期待するJSON: {action: "ENTRY"|"SKIP", confidence: 0-100, multiplier: 0.5-1.5, reason: str}."""
     if not isinstance(decision, dict):
         return None
 
-    allow_raw = decision.get("allow")
-    if isinstance(allow_raw, str):
-        allow = allow_raw.strip().lower() in {"true", "1", "yes", "y", "allow", "ok"}
-    else:
-        allow = bool(allow_raw)
+    action = decision.get("action")
+    if not isinstance(action, str):
+        return None
+    action = action.strip().upper()
+    if action not in {"ENTRY", "SKIP"}:
+        return None
 
     confidence = _safe_int(decision.get("confidence"), AI_ENTRY_DEFAULT_CONFIDENCE)
     confidence = int(_clamp(confidence, 0, 100))
 
+    # multiplier must be explicitly present
+    if "multiplier" not in decision:
+        return None
     multiplier = _safe_float(decision.get("multiplier"), AI_ENTRY_DEFAULT_MULTIPLIER)
     multiplier = float(_clamp(multiplier, 0.5, 1.5))
 
@@ -404,14 +408,32 @@ def _validate_ai_entry_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
         reason = ""
     reason = reason.strip()
 
-    return {"allow": allow, "confidence": confidence, "multiplier": multiplier, "reason": reason}
+    return {"action": action, "confidence": confidence, "multiplier": multiplier, "reason": reason}
+
+
+def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
+    """Q-Trend発生時の環境を渡し、AIに ENTRY/SKIP と倍率を判断させる専用プロンプト。"""
+
+    # 既存のコンテキスト構築を流用しつつ、出力スキーマだけ仕様に合わせる
+    base = _build_entry_filter_prompt(symbol, market, stats, action)
+
+    # base内のスキーマ案内を上書き（出力はaction=ENTRY|SKIP）
+    # NOTE: baseはJSONコンテキストを含むので、ここでは先頭の指示を強化するだけに留める
+    return (
+        "You are a strict trading entry decision engine.\n"
+        "Decide if the proposed entry should be executed now.\n"
+        "Return ONLY strict JSON with this schema:\n"
+        '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+        "--- CONTEXT BELOW (do not output it) ---\n"
+        + base
+    )
 
 
 def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
     """ENTRY最終判断のためのコンテキストを構築。
 
     - BUY/SELL自体はローカルで確定済み（action）。
-    - AIは allow/confidence/multiplier のみを返す。
+    - AIは action/confidence/multiplier のみを返す。
     """
     now = time.time()
     q_age_sec = int(now - stats["q_time"]) if stats.get("q_time") else -1
@@ -489,7 +511,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "constraints": {
             "multiplier_range": [0.5, 1.5],
             "confidence_range": [0, 100],
-            "note": "Return JSON only. Do not propose BUY/SELL; decide allow or not for the given proposed_action.",
+            "note": "Return JSON only. Do not propose BUY/SELL; decide ENTRY or SKIP for the given proposed_action.",
         },
     }
 
@@ -502,215 +524,64 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "- Penalize opposition: higher oppose_unique_sources, higher weighted_oppose_score, fvg/zones touches against.\n"
         "- Penalize wide spread.\n"
         "Return ONLY strict JSON schema:\n"
-        '{"allow": true|false, "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+        '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
 
 
-def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Dict[str, Any]:
-    """AIでENTRYを最終フィルタ。失敗時はフォールバック方針に従う。"""
-    if not AI_ENTRY_ENABLED or not client:
-        return {
-            "allow": True,
-            "confidence": 100,
-            "multiplier": 1.0,
-            "reason": "AI entry filter disabled/unavailable",
-            "fallback": True,
-        }
+def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Optional[Dict[str, Any]]:
+    """AIにエントリーの許可を求めるフィルター。"""
+    prompt = _build_entry_logic_prompt(symbol, market, stats, action)
+    decision = _call_openai_with_retry(prompt)
+    if not decision:
+        print("[FXAI][AI] No response from AI. Using fallback.")
+        return None
 
-    now = time.time()
-    # throttle: q_time + stats summary + action で同一判断を短時間に連呼しない
-    ai_key = f"{stats.get('q_time')}|{stats.get('q_side')}|{stats.get('confirm_unique_sources')}|{stats.get('opp_unique_sources')}|{action}"
-    global _last_entry_ai_key, _last_entry_ai_at
-    if _last_entry_ai_key == ai_key and (now - _last_entry_ai_at) < AI_ENTRY_THROTTLE_SEC:
-        # throttle中は「判断保留（スキップ）」扱い
-        return {
-            "allow": False,
-            "confidence": 0,
-            "multiplier": 1.0,
-            "reason": "AI entry filter throttled",
-            "fallback": True,
-        }
-    _last_entry_ai_key = ai_key
-    _last_entry_ai_at = now
+    validated_decision = _validate_ai_entry_decision(decision)
+    if not validated_decision:
+        print("[FXAI][AI] Invalid AI response. Using fallback.")
+        return None
 
-    prompt = _build_entry_filter_prompt(symbol, market, stats, action)
-    raw = _call_openai_with_retry(prompt)
-    validated = _validate_ai_entry_decision(raw) if raw else None
-    if validated:
-        validated["fallback"] = False
-        return validated
-
-    # fallback behavior
-    if AI_ENTRY_FALLBACK == "default_allow":
-        return {
-            "allow": True,
-            "confidence": int(_clamp(AI_ENTRY_DEFAULT_CONFIDENCE, 0, 100)),
-            "multiplier": float(_clamp(AI_ENTRY_DEFAULT_MULTIPLIER, 0.5, 1.5)),
-            "reason": "AI error -> default_allow fallback",
-            "fallback": True,
-        }
-
-    return {
-        "allow": False,
-        "confidence": 0,
-        "multiplier": 1.0,
-        "reason": "AI error -> skip fallback",
-        "fallback": True,
-    }
-
-
-def _build_management_prompt(symbol: str, market: dict, state: dict, stats: dict) -> str:
-    q_age_sec = int(time.time() - stats["q_time"]) if stats.get("q_time") else -1
-    m15_trend = "UPTREND" if market["bid"] > market["m15_ma"] else "DOWNTREND"
-
-    return f"""
-Role: Elite Gold (XAUUSD/GOLD) Scalper on M5.
-Objective: Maximize Expected Value while avoiding low-quality entries.
-
-### Market Context (MT5 Live)
-- Symbol: {symbol}
-- M15 Trend (SMA20): {m15_trend}  (Bid={market['bid']}, Ask={market['ask']}, SMA20={market['m15_ma']})
-- M5 ATR(approx): {market['atr']}  Spread(points): {market['spread']}
-
-### State
-- PositionsOpen: {state['positions_open']}
-
-### Q-Trend Anchor (Computed Locally, do NOT recompute)
-- LatestQTrendTimeEpoch: {stats['q_time']}
-- LatestQTrendSide: {stats['q_side']}
-- LatestQTrendAgeSec: {q_age_sec}
-- LatestQTrendIsStrong: {str(stats['q_is_strong']).lower()}
-
-### Post-Q Confluence (Computed Locally)
-- ConfirmUniqueSources (excluding Q-Trend): {stats['confirm_unique_sources']}
-- ConfirmSignals (count): {stats['confirm_signals']}
-- OpposeUniqueSources (excluding Q-Trend): {stats['opp_unique_sources']}
-- OpposeSignals (count): {stats['opp_signals']}
-- StrongDetectedAfterQ: {str(stats['strong_after_q']).lower()}
-
-### Strategy (fxChartAI v2.6 aligned)
-1) ENTRY:
-    - Entries are handled locally. When PositionsOpen == 0, output HOLD.
-2) MANAGEMENT (PositionsOpen > 0):
-    - If oppositions rise (OpposeUniqueSources >= 1) and/or M15 trend flips against Q-Trend side, consider CLOSE.
-    - If Q-Trend side remains supported and oppositions are low, output HOLD.
-3) Output must be STRICT JSON only:
-    {{"action": "HOLD"|"CLOSE", "confidence": "HIGH"|"NORMAL", "reason": "txt"}}
-""".strip()
+    return validated_decision
 
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(silent=True)
+    """TradingViewからのシグナルを受信し、AIフィルターを適用してエントリーを決定。"""
+    data = request.get_json()
     if not data:
-        return "No data", 400
+        return "Invalid data", 400
 
-    now = time.time()
+    symbol = data.get("symbol", SYMBOL)
+    action = data.get("action")
+    if action not in {"BUY", "SELL"}:
+        return "Invalid action", 400
 
-    data['receive_time'] = now
-    with signals_lock:
-        signals_cache.append(data)
-        _prune_signals_cache_locked(now)
+    market = get_mt5_market_data(symbol)
+    stats = get_qtrend_anchor_stats(symbol)
 
-    stats = get_qtrend_anchor_stats(SYMBOL)
-    if not stats:
-        return "No Q-Trend", 200
+    # AIフィルターを適用
+    ai_decision = _ai_entry_filter(symbol, market, stats, action)
+    if not ai_decision or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
+        print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
+        return "Blocked by AI", 403
 
-    market = get_mt5_market_data(SYMBOL)
-    state = get_mt5_position_state(SYMBOL)
+    multiplier = ai_decision["multiplier"]
+    reason = ai_decision["reason"]
 
-    q_age_sec = int(now - stats["q_time"]) if stats.get("q_time") else -1
-    entry_window_ok = (q_age_sec >= 0 and q_age_sec <= Q_TREND_MAX_AGE_SEC)
-    entry_confluence_ok = (stats["confirm_unique_sources"] >= MIN_OTHER_SIGNALS_FOR_ENTRY)
+    # ZMQでエントリー指示を送信
+    zmq_socket.send_json({
+        "type": "ORDER",
+        "action": action,
+        "symbol": symbol,
+        "multiplier": multiplier,
+        "reason": reason,
+        "ai_confidence": ai_decision["confidence"],
+        "ai_reason": reason,
+    })
 
-    m15_up = market["bid"] > market["m15_ma"]
-    m15_down = market["ask"] < market["m15_ma"]
-
-    # 1) ENTRY (local, v2.6 aligned)
-    if state["positions_open"] == 0:
-        if entry_window_ok and entry_confluence_ok:
-            action = "BUY" if stats["q_side"] == "buy" else "SELL" if stats["q_side"] == "sell" else None
-
-            # Trend Guard (same as your current prompt intent)
-            if action == "BUY" and not m15_up:
-                action = None
-            if action == "SELL" and not m15_down:
-                action = None
-
-            if action:
-                global _last_entry_q_time
-                # de-dupe: same Q anchor -> only once
-                if _last_entry_q_time is None or float(stats["q_time"]) != float(_last_entry_q_time):
-                    # v2.7 upgrade: AI entry filter (final gate)
-                    entry_ai = _ai_entry_filter(SYMBOL, market, stats, action)
-                    allow = bool(entry_ai.get("allow"))
-                    confidence = int(entry_ai.get("confidence") or 0)
-                    ai_mult = float(entry_ai.get("multiplier") or 1.0)
-                    ai_mult = float(_clamp(ai_mult, 0.5, 1.5))
-
-                    if (not allow) or (confidence < AI_ENTRY_MIN_CONFIDENCE):
-                        zmq_socket.send_json(
-                            {
-                                "type": "HOLD",
-                                "reason": f"AI entry filter denied: allow={allow} conf={confidence} min={AI_ENTRY_MIN_CONFIDENCE} {entry_ai.get('reason','')}",
-                            }
-                        )
-                        return "OK", 200
-
-                    _last_entry_q_time = float(stats["q_time"])
-
-                    local_mult = _compute_entry_multiplier(stats["confirm_unique_sources"], stats["strong_after_q"])
-                    # Spec: AI multiplier is 0.5-1.5. Use it for lot scaling; local_mult remains informational.
-                    cmd = {
-                        "type": "ORDER",
-                        "action": action,
-                        "multiplier": ai_mult,
-                        "ai_confidence": confidence,
-                        "ai_reason": entry_ai.get("reason", ""),
-                        "ai_fallback": bool(entry_ai.get("fallback")),
-                        "local_multiplier": local_mult,
-                        "atr": market["atr"],
-                        "reason": f"Q-Trend entry gated by AI (uSrc={stats['confirm_unique_sources']} strongAfterQ={stats['strong_after_q']})",
-                    }
-                    zmq_socket.send_json(cmd)
-                    print(f">>> SENT ORDER (AI gated): {cmd}")
-
-                return "OK", 200
-
-        # flat時は原則AI呼ばない（pasadと同じ）
-        if not FORCE_AI_CALL_WHEN_FLAT:
-            zmq_socket.send_json({"type": "HOLD", "reason": "Flat: waiting for Q-Trend confluence"})
-            return "OK", 200
-
-    # 2) MANAGEMENT (AI: CLOSE/HOLD only)
-    # throttle key: (q_time, positions_open)
-    key = f"{stats.get('q_time')}|{state['positions_open']}"
-    global _last_ai_attempt_key, _last_ai_attempt_at
-    if _last_ai_attempt_key == key and (now - _last_ai_attempt_at) < AI_THROTTLE_SEC:
-        return "OK", 200
-    _last_ai_attempt_key = key
-    _last_ai_attempt_at = now
-
-    if state["positions_open"] == 0 and not FORCE_AI_CALL_WHEN_FLAT:
-        return "OK", 200
-
-    prompt = _build_management_prompt(SYMBOL, market, state, stats)
-    decision = _call_openai_with_retry(prompt)
-    if not decision:
-        return "OK", 200
-
-    action = (decision.get("action") or "").strip().upper()
-    reason = (decision.get("reason") or "").strip()
-
-    if action == "CLOSE":
-        zmq_socket.send_json({"type": "CLOSE", "reason": reason or "AI CLOSE"})
-        print(">>> SENT CLOSE")
-    else:
-        zmq_socket.send_json({"type": "HOLD", "reason": reason or "AI HOLD"})
-        print(">>> SENT HOLD")
-
+    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {multiplier}")
     return "OK", 200
 
 
