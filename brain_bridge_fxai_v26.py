@@ -35,6 +35,13 @@ SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))  # v2.6 SignalM
 CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
+# --- Signal retention / freshness ---
+SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))     # 通常シグナル: 20分
+SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))
+# ★追加: Zone系シグナルの保持期間 (デフォルト24時間=86400秒)
+ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "86400"))
+# ★追加: キャッシュファイル名
+CACHE_FILE = "signals_cache.json"
 
 # --- Debug / behavior ---
 FORCE_AI_CALL_WHEN_FLAT = os.getenv("FORCE_AI_CALL_WHEN_FLAT", "false").lower() == "true"
@@ -223,10 +230,57 @@ def _weight_confirmed(confirmed: str) -> float:
     return 0.8
 
 
-def _prune_signals_cache_locked(now: float) -> None:
-    # 受信時刻ベースの保持（既存ロジック）
-    signals_cache[:] = [s for s in signals_cache if now - s.get("receive_time", now) < SIGNAL_LOOKBACK_SEC]
+def _load_cache():
+    """起動時にファイルからシグナル履歴を復元する"""
+    if not os.path.exists(CACHE_FILE):
+        return
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                with signals_lock:
+                    signals_cache.extend(data)
+                print(f"[FXAI] Cache loaded: {len(data)} signals recovered.")
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to load cache: {e}")
 
+def _save_cache_locked():
+    """シグナルキャッシュをファイルに保存する (Lock保持中に呼ぶこと)"""
+    try:
+        # アトミック書き込みが理想だが、簡易的に上書き
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(signals_cache, f)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to save cache: {e}")
+
+def _prune_signals_cache_locked(now: float) -> None:
+    """期限切れシグナルを削除（Zoneは長く保持する特別ルール適用）"""
+    keep_list = []
+    has_changes = False
+    
+    for s in signals_cache:
+        # ソース名で保持期間を分岐
+        src = (s.get("source") or "").lower()
+        # TradingViewのアラート名に合わせて調整（zones, structure, resistance, supportなど）
+        zone_keywords = ["zonesdetector", "zones", "zone", "structure", "resistance", "support"]
+        is_zone = any(k in src for k in zone_keywords)
+        
+        limit_sec = ZONE_LOOKBACK_SEC if is_zone else SIGNAL_LOOKBACK_SEC
+        
+        age = now - s.get("receive_time", now)
+        if age < limit_sec:
+            keep_list.append(s)
+        else:
+            has_changes = True # 削除が発生した
+
+    # リストが変化した場合のみ更新
+    if len(keep_list) != len(signals_cache):
+        signals_cache[:] = keep_list
+        has_changes = True
+
+    # ここでは「削除」時の保存は頻度を下げるため必須ではないが、
+    # 確実性を取るなら保存しても良い。今回は「追加時」に保存するためここはメモリ操作のみとする。
+    pass
 
 def _filter_fresh_signals(symbol: str, now: float) -> list:
     """v2.6の SignalMaxAgeSec 相当：signal_time が古すぎるものを落とす。"""
@@ -733,6 +787,7 @@ def webhook():
     with signals_lock:
         signals_cache.append(signal)
         _prune_signals_cache_locked(now)
+        _save_cache_locked()  # ★追加: 更新されたキャッシュをファイルに保存
 
     normalized = _normalize_signal_fields(signal)
 
@@ -867,6 +922,8 @@ if __name__ == '__main__':
     print(f"[FXAI] webhook http://0.0.0.0:{WEBHOOK_PORT}/webhook")
     print(f"[FXAI] ZMQ bind: {ZMQ_BIND}")
     print(f"[FXAI] symbol: {SYMBOL}")
+    # ★追加: 起動時にキャッシュを復元
+    _load_cache()
     bind_err = _check_port_bindable("0.0.0.0", int(WEBHOOK_PORT))
     if bind_err:
         print(f"[FXAI][FATAL] Cannot bind WEBHOOK_PORT={WEBHOOK_PORT}. OS error: {bind_err}")
