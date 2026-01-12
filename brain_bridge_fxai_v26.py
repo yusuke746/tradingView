@@ -160,7 +160,9 @@ def _check_port_bindable(host: str, port: int) -> Optional[str]:
             pass
 
 # --- De-dupe / throttle ---
-_last_entry_q_time = None
+_executed_qtrend_times_by_symbol: Dict[str, list] = {}
+EXECUTED_QTREND_RETENTION_SEC = int(os.getenv("EXECUTED_QTREND_RETENTION_SEC", "86400"))
+
 _last_ai_attempt_key = None
 _last_ai_attempt_at = 0.0
 
@@ -169,6 +171,40 @@ _last_close_attempt_at = 0.0
 
 _last_entry_ai_key = None
 _last_entry_ai_at = 0.0
+
+
+def _qtime_equal(a: float, b: float, eps: float = 1e-4) -> bool:
+    try:
+        return abs(float(a) - float(b)) < float(eps)
+    except Exception:
+        return False
+
+
+def _was_qtrend_executed(symbol: str, q_time: float) -> bool:
+    arr = _executed_qtrend_times_by_symbol.get(symbol, [])
+    for t in arr:
+        if _qtime_equal(t, q_time):
+            return True
+    return False
+
+
+def _mark_qtrend_executed(symbol: str, q_time: float) -> None:
+    now = time.time()
+    arr = _executed_qtrend_times_by_symbol.get(symbol, [])
+
+    # prune old
+    keep = []
+    for t in arr:
+        try:
+            if (now - float(t)) <= float(EXECUTED_QTREND_RETENTION_SEC):
+                keep.append(float(t))
+        except Exception:
+            continue
+
+    if not any(_qtime_equal(t, q_time) for t in keep):
+        keep.append(float(q_time))
+
+    _executed_qtrend_times_by_symbol[symbol] = keep
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -291,11 +327,13 @@ def _prune_signals_cache_locked(now: float) -> None:
     keep_list = []
 
     for s in signals_cache:
-        src = (s.get("source") or "").strip().lower()
+        src_raw = (s.get("source") or "").strip().lower()
+        src = src_raw
         event = (s.get("event") or "").strip().lower()
         sig_type = (s.get("signal_type") or "").strip().lower()
 
-        is_zones = (src == "zones") or ("zone" in src)
+        src_norm = src_raw.replace(" ", "").replace("_", "")
+        is_zones = (src_norm in {"zones", "zonesdetector"}) or ("zone" in src_norm)
 
         # Zoneの「構造/存在」イベント（長期保持）
         zone_presence_events = {
@@ -339,7 +377,8 @@ def _is_zone_presence_signal(s: dict) -> bool:
     event = (s.get("event") or "").strip().lower()
     sig_type = (s.get("signal_type") or "").strip().lower()
 
-    is_zones = (src == "zones") or ("zone" in src)
+    src_norm = src.replace(" ", "").replace("_", "")
+    is_zones = (src_norm in {"zones", "zonesdetector"}) or ("zone" in src_norm)
     if not is_zones:
         return False
 
@@ -356,7 +395,8 @@ def _is_zone_presence_signal(s: dict) -> bool:
 def _is_zone_touch_signal(s: dict) -> bool:
     src = (s.get("source") or "").strip().lower()
     event = (s.get("event") or "").strip().lower()
-    is_zones = (src == "zones") or ("zone" in src)
+    src_norm = src.replace(" ", "").replace("_", "")
+    is_zones = (src_norm in {"zones", "zonesdetector"}) or ("zone" in src_norm)
     if not is_zones:
         return False
     # match the canonical touch events used elsewhere
@@ -567,7 +607,19 @@ def get_mt5_market_data(symbol: str):
     ask = float(getattr(tick, "ask", 0.0) or 0.0)
     spread = ((ask - bid) / point) if point > 0 else 0.0
 
-    return {"bid": bid, "ask": ask, "m15_ma": ma15, "atr": atr, "spread": spread}
+    atr_points = (atr / point) if point > 0 else 0.0
+    atr_to_spread = (atr_points / spread) if spread > 0 else None
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "m15_ma": ma15,
+        "atr": atr,
+        "point": point,
+        "atr_points": atr_points,
+        "atr_to_spread": atr_to_spread,
+        "spread": spread,
+    }
 
 
 def get_mt5_position_state(symbol: str):
@@ -893,6 +945,8 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "m15_trend": m15_trend,
             "trend_alignment": trend_align,
             "atr_m5_approx": market.get("atr"),
+            "atr_points_approx": market.get("atr_points"),
+            "atr_to_spread_approx": market.get("atr_to_spread"),
             "spread_points": spread_points,
             "spread_flag": spread_flag,
         },
@@ -906,20 +960,135 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     }
 
     return (
-        "You are a strict trading entry gate for XAUUSD/GOLD **DAY TRADING** (not scalping).\n"
-        "Your objective is Loss-cut small / Profit-target large: avoid easy counter-trend entries; only enter/hold when evidence is strong and reward potential is meaningfully larger than risk.\n"
+        "You are a strict XAUUSD/GOLD DAY TRADING entry gate (not scalping).\n"
+        "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
         "- Prefer ALIGNED higher-timeframe trend_alignment and OSGFC alignment.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
-        "- Evaluate opposition with nuance: structural opposition (confirmed) matters most; touch-based opposition can be noise.\n"
-        "- When opposition exists, compare it against reward potential (use ATR/spread and confluence strength as a proxy). Do not over-penalize low-quality/noisy opposite signals.\n"
+        "- Evaluate opposition with nuance: confirmed/structural opposition matters most; touch-based opposition can be noise.\n"
+        "- If some opposite FVG/Zones exist BUT trend is aligned and ATR-to-spread is healthy and confluence is decent, you MAY still approve ENTRY (EV can remain positive).\n"
+        "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
         "Return ONLY strict JSON schema (multiplier is a FACTOR for local_multiplier):\n"
         '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
+
+
+def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict, now: float) -> tuple[str, int]:
+    """Try to place an order based on latest Q-Trend stats.
+
+    Returns (message, http_status).
+    """
+    if not stats:
+        _set_status(last_result="Stored (no qtrend stats)", last_result_at=time.time())
+        return "Stored", 200
+
+    q_time = float(stats.get("q_time") or now)
+    q_age_sec = int(now - q_time)
+
+    if Q_TREND_MAX_AGE_SEC > 0 and q_age_sec > Q_TREND_MAX_AGE_SEC:
+        _set_status(last_result="Stale Q-Trend", last_result_at=time.time())
+        return "Stale Q-Trend", 200
+
+    # strict duplicate prevention for the same q_time
+    if (not ALLOW_MULTI_ENTRY_SAME_QTREND) and _was_qtrend_executed(symbol, q_time):
+        _set_status(last_result="Duplicate", last_result_at=time.time())
+        return "Duplicate", 200
+
+    # confluence requirement
+    if int(stats.get("confirm_unique_sources") or 0) < MIN_OTHER_SIGNALS_FOR_ENTRY:
+        _set_status(last_result="Waiting confluence", last_result_at=time.time())
+        return "Waiting confluence", 200
+
+    q_side = (stats.get("q_side") or "").lower()
+    action = "BUY" if q_side == "buy" else "SELL" if q_side == "sell" else ""
+    if action not in {"BUY", "SELL"}:
+        _set_status(last_result="Invalid action", last_result_at=time.time())
+        return "Invalid action", 400
+
+    market = get_mt5_market_data(symbol)
+    local_multiplier = _compute_entry_multiplier(
+        int(stats.get("confirm_unique_sources") or 0),
+        bool(stats.get("strong_after_q")),
+    )
+
+    final_multiplier = float(local_multiplier)
+    ai_conf = None
+    ai_reason = ""
+
+    # AIフィルター（有効時のみ）
+    if AI_ENTRY_ENABLED:
+        # Throttle AI calls but allow re-eval when a NEW supporting signal arrives.
+        global _last_ai_attempt_key, _last_ai_attempt_at
+        trig_src = (normalized_trigger.get("source") or "")
+        trig_evt = (normalized_trigger.get("event") or "")
+        trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
+        attempt_key = f"{symbol}:{action}:{q_time:.3f}:{trig_src}:{trig_evt}:{trig_st:.3f}"
+
+        now_mono = time.time()
+        if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+            _set_status(last_result="AI throttled", last_result_at=time.time())
+            return "AI throttled", 200
+        _last_ai_attempt_key = attempt_key
+        _last_ai_attempt_at = now_mono
+
+        ai_decision = _ai_entry_filter(symbol, market, stats, action)
+        if (not ai_decision) or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
+            print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
+            if (not ai_decision) and AI_ENTRY_FALLBACK == "default_allow":
+                ai_decision = {
+                    "action": "ENTRY",
+                    "confidence": int(_clamp(AI_ENTRY_DEFAULT_CONFIDENCE, 0, 100)),
+                    "multiplier": float(_clamp(AI_ENTRY_DEFAULT_MULTIPLIER, 0.5, 1.5)),
+                    "reason": "fallback_default_allow",
+                }
+            else:
+                _set_status(last_result="Blocked by AI", last_result_at=time.time())
+                return "Blocked by AI", 403
+
+        ai_conf = ai_decision["confidence"]
+        ai_reason = ai_decision.get("reason") or ""
+        final_multiplier = float(_clamp(local_multiplier * float(ai_decision["multiplier"]), 0.5, 2.0))
+
+    # ZMQでエントリー指示を送信
+    zmq_socket.send_json(
+        {
+            "type": "ORDER",
+            "action": action,
+            "symbol": symbol,
+            "atr": float(market.get("atr") or 0.0),
+            "multiplier": final_multiplier,
+            "reason": ai_reason,
+            "ai_confidence": ai_conf,
+            "ai_reason": ai_reason,
+        }
+    )
+
+    _set_status(
+        last_result="OK",
+        last_result_at=time.time(),
+        last_order={
+            "action": action,
+            "symbol": symbol,
+            "atr": float(market.get("atr") or 0.0),
+            "multiplier": final_multiplier,
+            "ai_confidence": ai_conf,
+            "ai_reason": ai_reason,
+            "q_time": q_time,
+            "trigger": {
+                "source": normalized_trigger.get("source"),
+                "event": normalized_trigger.get("event"),
+                "signal_time": normalized_trigger.get("signal_time"),
+            },
+        },
+    )
+
+    _mark_qtrend_executed(symbol, q_time)
+    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {final_multiplier}")
+    return "OK", 200
 
 
 def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1125,17 +1294,13 @@ def webhook():
     # Determine Q-Trend trigger early (used for both management and optional add-on entries)
     qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
 
-    # ポジションがある場合は「管理（CLOSE/HOLD）」を優先する
+    # --- POSITION MANAGEMENT MODE (CLOSE/HOLD) ---
     pos_summary = get_mt5_positions_summary(symbol)
     if int(pos_summary.get("positions_open") or 0) > 0:
         net_side = (pos_summary.get("net_side") or "flat").lower()
 
         # Optional: allow add-on entries when SAME-DIRECTION Q-Trend arrives
-        # (e.g., pyramiding) while keeping management logic for other cases.
-        if ALLOW_ADD_ON_ENTRIES and qtrend_trigger and net_side in {"buy", "sell"} and normalized.get("side") == net_side:
-            # proceed to entry gating below (do NOT early-return here)
-            pass
-        else:
+        if not (ALLOW_ADD_ON_ENTRIES and qtrend_trigger and net_side in {"buy", "sell"} and normalized.get("side") == net_side):
             # 管理対象外のソースはAI呼び出しを避けて保存のみ（コスト/レート制御）
             if (normalized.get("source") or "") not in {"Q-Trend", "FVG", "Zones", "OSGFC"}:
                 _set_status(last_result="Stored (mgmt ignored source)", last_result_at=time.time())
@@ -1148,8 +1313,6 @@ def webhook():
                 global _last_close_attempt_key, _last_close_attempt_at
                 now_mono = time.time()
 
-                # Throttle management AI by time (not by PnL changes) to avoid high-frequency calls.
-                # Allow bypass for clear reversal-like signals against the current net_side.
                 src = (normalized.get("source") or "")
                 evt = (normalized.get("event") or "")
                 sig_side = (normalized.get("side") or "").lower()
@@ -1184,7 +1347,6 @@ def webhook():
 
                 ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized)
                 if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
-                    # Fallback policy on AI error/invalid response
                     if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
                         ai_decision = {
                             "action": "CLOSE",
@@ -1192,7 +1354,6 @@ def webhook():
                             "reason": "fallback_default_close",
                         }
                     else:
-                        # safest fallback is HOLD
                         _set_status(
                             last_result="HOLD (AI fallback)",
                             last_result_at=time.time(),
@@ -1234,116 +1395,35 @@ def webhook():
                 _set_status(last_result="Stored (mgmt disabled)", last_result_at=time.time())
                 return "Stored", 200
 
-    # エントリートリガーは Q-Trend のみ（それ以外は保存して終了）
-    # sourceが空のままの場合、誤発火防止のためトリガーしない。
-    if not qtrend_trigger:
+        # if add-on entries allowed, fall through to entry section
+
+    # --- ENTRY MODE (Q-Trend reservation + follow-up entry) ---
+    stats = get_qtrend_anchor_stats(symbol)
+    if not stats:
         _set_status(last_result="Stored", last_result_at=time.time())
         return "Stored", 200
 
-    stats = get_qtrend_anchor_stats(symbol)
-    if not stats:
-        _set_status(last_result="Stored (no qtrend stats)", last_result_at=time.time())
-        return "Stored", 200
-
-    q_age_sec = int(now - float(stats.get("q_time") or now))
-    if Q_TREND_MAX_AGE_SEC > 0 and q_age_sec > Q_TREND_MAX_AGE_SEC:
-        _set_status(last_result="Stale Q-Trend", last_result_at=time.time())
-        return "Stale Q-Trend", 200
-
-    # 合流条件（ユニークソースで最低限の合流が取れていない場合は見送り）
-    if int(stats.get("confirm_unique_sources") or 0) < MIN_OTHER_SIGNALS_FOR_ENTRY:
-        _set_status(last_result="Waiting confluence", last_result_at=time.time())
-        return "Waiting confluence", 200
-
-    # ローカルで BUY/SELL を確定（AIに決めさせない）
-    q_side = (stats.get("q_side") or normalized.get("side") or "").lower()
-    action = "BUY" if q_side == "buy" else "SELL" if q_side == "sell" else ""
-    if action not in {"BUY", "SELL"}:
-        _set_status(last_result="Invalid action", last_result_at=time.time())
-        return "Invalid action", 400
-
-    # 重複送信ガード（同じQ-Trend起点で何度もORDERを出さない）
-    # NOTE: ピラミッディング（買い増し）を許可する場合は、必要に応じて緩められる。
-    global _last_entry_q_time
-    if _last_entry_q_time is not None:
-        try:
-            if (not ALLOW_MULTI_ENTRY_SAME_QTREND) and abs(float(_last_entry_q_time) - float(stats.get("q_time") or 0.0)) < 0.0001:
-                _set_status(last_result="Duplicate", last_result_at=time.time())
-                return "Duplicate", 200
-        except Exception:
-            pass
-
-    market = get_mt5_market_data(symbol)
-    local_multiplier = _compute_entry_multiplier(
-        int(stats.get("confirm_unique_sources") or 0),
-        bool(stats.get("strong_after_q")),
+    q_time = float(stats.get("q_time") or now)
+    q_age_sec = int(now - q_time)
+    has_pending_qtrend = (Q_TREND_MAX_AGE_SEC <= 0 or q_age_sec <= Q_TREND_MAX_AGE_SEC) and (
+        ALLOW_MULTI_ENTRY_SAME_QTREND or (not _was_qtrend_executed(symbol, q_time))
     )
 
-    final_multiplier = float(local_multiplier)
-    ai_conf = None
-    ai_reason = ""
+    # Trigger conditions:
+    # - Q-Trend itself
+    # - or any supporting signal (Zones/FVG/OSGFC) arriving while a pending Q-Trend exists
+    src = (normalized.get("source") or "")
+    supporting_sources = {"FVG", "Zones", "OSGFC"}
 
-    # AIフィルター（有効時のみ）
-    if AI_ENTRY_ENABLED:
-        # Throttle AI calls to avoid rate-limit/cost spikes on repeated triggers.
-        global _last_ai_attempt_key, _last_ai_attempt_at
-        attempt_key = f"{symbol}:{action}:{float(stats.get('q_time') or 0.0):.3f}"
-        now_mono = time.time()
-        if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
-            _set_status(last_result="AI throttled", last_result_at=time.time())
-            return "AI throttled", 200
-        _last_ai_attempt_key = attempt_key
-        _last_ai_attempt_at = now_mono
+    if qtrend_trigger:
+        return _attempt_entry_from_stats(symbol, stats, normalized, now)
 
-        ai_decision = _ai_entry_filter(symbol, market, stats, action)
-        if (not ai_decision) or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
-            print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
-            # Fallback policy on AI error/invalid response
-            if (not ai_decision) and AI_ENTRY_FALLBACK == "default_allow":
-                ai_decision = {
-                    "action": "ENTRY",
-                    "confidence": int(_clamp(AI_ENTRY_DEFAULT_CONFIDENCE, 0, 100)),
-                    "multiplier": float(_clamp(AI_ENTRY_DEFAULT_MULTIPLIER, 0.5, 1.5)),
-                    "reason": "fallback_default_allow",
-                }
-            else:
-                _set_status(last_result="Blocked by AI", last_result_at=time.time())
-                return "Blocked by AI", 403
-        ai_conf = ai_decision["confidence"]
-        ai_reason = ai_decision.get("reason") or ""
-        # AIのmultiplierはローカル倍率への係数として扱う（過度に増えないよう上限を2.0に丸める）
-        final_multiplier = float(_clamp(local_multiplier * float(ai_decision["multiplier"]), 0.5, 2.0))
+    if has_pending_qtrend and src in supporting_sources:
+        # this is the key upgrade: immediate re-eval on new evidence within Q-Trend TTL
+        return _attempt_entry_from_stats(symbol, stats, normalized, now)
 
-    # ZMQでエントリー指示を送信
-    zmq_socket.send_json({
-        "type": "ORDER",
-        "action": action,
-        "symbol": symbol,
-        # EA expects `atr` to validate and calculate SL/lot sizing.
-        "atr": float(market.get("atr") or 0.0),
-        "multiplier": final_multiplier,
-        "reason": ai_reason,
-        "ai_confidence": ai_conf,
-        "ai_reason": ai_reason,
-    })
-
-    _set_status(
-        last_result="OK",
-        last_result_at=time.time(),
-        last_order={
-            "action": action,
-            "symbol": symbol,
-            "atr": float(market.get("atr") or 0.0),
-            "multiplier": final_multiplier,
-            "ai_confidence": ai_conf,
-            "ai_reason": ai_reason,
-            "q_time": float(stats.get("q_time") or now),
-        },
-    )
-
-    _last_entry_q_time = float(stats.get("q_time") or now)
-    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {final_multiplier}")
-    return "OK", 200
+    _set_status(last_result="Stored", last_result_at=time.time())
+    return "Stored", 200
 
 
 @app.route('/ping', methods=['GET'])
