@@ -259,13 +259,21 @@ def _prune_signals_cache_locked(now: float) -> None:
     has_changes = False
     
     for s in signals_cache:
-        # ソース名で保持期間を分岐
         src = (s.get("source") or "").lower()
-        # TradingViewのアラート名に合わせて調整（zones, structure, resistance, supportなど）
-        zone_keywords = ["zonesdetector", "zones", "zone", "structure", "resistance", "support"]
-        is_zone = any(k in src for k in zone_keywords)
+        event = (s.get("event") or "").lower()
         
-        limit_sec = ZONE_LOOKBACK_SEC if is_zone else SIGNAL_LOOKBACK_SEC
+        # Zone関連のキーワード
+        is_zone_source = any(k in src for k in ["zones", "structure", "support", "resistance"])
+        # 寿命の決定ロジック
+        if is_zone_source:
+            # "touch" や "retrace" は「瞬間的な出来事」なので、通常の寿命(20分)で消す
+            # "new", "confirmed", "breakout" などは「構造」なので、長く(24時間)残す
+            if any(k in event for k in ["touch", "retrace", "bounce"]):
+                limit_sec = SIGNAL_LOOKBACK_SEC  # 短い (例: 1200秒)
+            else:
+                limit_sec = ZONE_LOOKBACK_SEC    # 長い (例: 86400秒)
+        else:
+            limit_sec = SIGNAL_LOOKBACK_SEC      # 通常 (例: 1200秒)
         
         age = now - s.get("receive_time", now)
         if age < limit_sec:
@@ -693,12 +701,12 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "confidence_range": [0, 100],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
-            "note": "Return JSON only. Do not propose BUY/SELL; decide ENTRY or SKIP for the given proposed_action. multiplier is a FACTOR applied to local_multiplier, clamped to final_multiplier_max.",
+            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Do not fight against established Zones without strong confirmation.",
         },
     }
 
     return (
-        "You are a strict trading entry gate for XAUUSD/GOLD scalping. FILTER entries to maximize expected value and avoid low-quality trades.\n"
+        "You are a strict trading entry gate for XAUUSD/GOLD **day trading**. FOCUS on high-quality setups where risk-reward is favorable (Loss-cut small, Profit-target large).\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
         "- Prefer ALIGNED higher-timeframe trend_alignment and OSGFC alignment.\n"
