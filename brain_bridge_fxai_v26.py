@@ -27,21 +27,20 @@ ZMQ_PORT = int(os.getenv("ZMQ_PORT", "5555"))
 ZMQ_BIND = os.getenv("ZMQ_BIND", f"tcp://*:{ZMQ_PORT}")
 SYMBOL = os.getenv("SYMBOL", "GOLD")
 
-# --- Signal retention / freshness ---
-SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))
-SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))  # v2.6 SignalMaxAgeSec
-
 # --- v2.6 confluence params ---
 CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
+
 # --- Signal retention / freshness ---
 SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))     # 通常シグナル: 20分
 SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))
-# ★追加: Zone系シグナルの保持期間 (デフォルト24時間=86400秒)
-ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "86400"))
-# ★追加: キャッシュファイル名
-CACHE_FILE = "signals_cache.json"
+# Zone「存在/確定」情報は長く保持し、touch系イベントは短く保持する
+ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "86400"))        # デフォルト24時間
+ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", str(SIGNAL_LOOKBACK_SEC)))
+
+# Cache file name
+CACHE_FILE = os.getenv("CACHE_FILE", "signals_cache.json")
 
 # --- Debug / behavior ---
 FORCE_AI_CALL_WHEN_FLAT = os.getenv("FORCE_AI_CALL_WHEN_FLAT", "false").lower() == "true"
@@ -53,12 +52,28 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 # --- AI entry filter (v2.7 hybrid upgrade) ---
 AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "true").lower() == "true"
-AI_ENTRY_MIN_CONFIDENCE = max(75, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70")))
+AI_ENTRY_MIN_CONFIDENCE = max(0, min(100, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70"))))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
 # on AI error: "skip" (safest) or "default_allow"
 AI_ENTRY_FALLBACK = os.getenv("AI_ENTRY_FALLBACK", "skip").strip().lower()
 AI_ENTRY_DEFAULT_CONFIDENCE = int(os.getenv("AI_ENTRY_DEFAULT_CONFIDENCE", "50"))
 AI_ENTRY_DEFAULT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_MULTIPLIER", "1.0"))
+
+# --- AI close/hold management (Day Trading) ---
+AI_CLOSE_ENABLED = os.getenv("AI_CLOSE_ENABLED", "true").lower() == "true"
+AI_CLOSE_MIN_CONFIDENCE = max(0, min(100, int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "70"))))
+# Default to a conservative cadence; allow immediate evaluation on clear reversal-like signals.
+AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "60.0"))
+# on AI error: "hold" (safest) or "default_close"
+AI_CLOSE_FALLBACK = os.getenv("AI_CLOSE_FALLBACK", "hold").strip().lower()
+AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "50"))
+
+# --- Position add-on / pyramiding (optional) ---
+# If true: when positions are open, a SAME-DIRECTION Q-Trend trigger can still go through ENTRY gating.
+# Default false to preserve conservative behavior.
+ALLOW_ADD_ON_ENTRIES = os.getenv("ALLOW_ADD_ON_ENTRIES", "false").lower() == "true"
+# If true: allow multiple entries for the same qtrend anchor time (advanced; default false).
+ALLOW_MULTI_ENTRY_SAME_QTREND = os.getenv("ALLOW_MULTI_ENTRY_SAME_QTREND", "false").lower() == "true"
 
 # --- Webhook compatibility / safety ---
 # If true, an alert that only contains action=BUY/SELL (without source) is treated as Q-Trend.
@@ -79,6 +94,10 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 if AI_ENTRY_ENABLED and not client:
     print("[FXAI][WARN] AI_ENTRY_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI entry filter.")
     AI_ENTRY_ENABLED = False
+
+if AI_CLOSE_ENABLED and not client:
+    print("[FXAI][WARN] AI_CLOSE_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI close/hold management.")
+    AI_CLOSE_ENABLED = False
 
 # --- ZMQ ---
 context = zmq.Context.instance()
@@ -103,6 +122,11 @@ _last_status: Dict[str, Any] = {
     "last_result": None,  # e.g. Stored / Waiting confluence / Blocked by AI / OK
     "last_result_at": None,
     "last_order": None,
+    "last_mgmt_action": None,
+    "last_mgmt_confidence": None,
+    "last_mgmt_reason": None,
+    "last_mgmt_at": None,
+    "last_mgmt_throttled": None,
 }
 
 
@@ -139,6 +163,9 @@ def _check_port_bindable(host: str, port: int) -> Optional[str]:
 _last_entry_q_time = None
 _last_ai_attempt_key = None
 _last_ai_attempt_at = 0.0
+
+_last_close_attempt_key = None
+_last_close_attempt_at = 0.0
 
 _last_entry_ai_key = None
 _last_entry_ai_at = 0.0
@@ -254,41 +281,86 @@ def _save_cache_locked():
         print(f"[FXAI][WARN] Failed to save cache: {e}")
 
 def _prune_signals_cache_locked(now: float) -> None:
-    """期限切れシグナルを削除（Zoneは長く保持する特別ルール適用）"""
-    keep_list = []
-    has_changes = False
-    
-    for s in signals_cache:
-        src = (s.get("source") or "").lower()
-        event = (s.get("event") or "").lower()
-        
-        # Zone関連のキーワード
-        is_zone_source = any(k in src for k in ["zones", "structure", "support", "resistance"])
-        # 寿命の決定ロジック
-        if is_zone_source:
-            # "touch" や "retrace" は「瞬間的な出来事」なので、通常の寿命(20分)で消す
-            # "new", "confirmed", "breakout" などは「構造」なので、長く(24時間)残す
-            if any(k in event for k in ["touch", "retrace", "bounce"]):
-                limit_sec = SIGNAL_LOOKBACK_SEC  # 短い (例: 1200秒)
-            else:
-                limit_sec = ZONE_LOOKBACK_SEC    # 長い (例: 86400秒)
-        else:
-            limit_sec = SIGNAL_LOOKBACK_SEC      # 通常 (例: 1200秒)
-        
-        age = now - s.get("receive_time", now)
-        if age < limit_sec:
-            keep_list.append(s)
-        else:
-            has_changes = True # 削除が発生した
+    """期限切れシグナルを削除。
 
-    # リストが変化した場合のみ更新
+    Zone情報は、
+    - 「存在/構造（例: new_zone_confirmed）」は長く保持（デフォルト24h）
+    - 「接触/touch（例: zone_retrace_touch）」は短く保持（デフォルト20m）
+    に分離し、古いtouchを合流として誤認するバグを防ぐ。
+    """
+    keep_list = []
+
+    for s in signals_cache:
+        src = (s.get("source") or "").strip().lower()
+        event = (s.get("event") or "").strip().lower()
+        sig_type = (s.get("signal_type") or "").strip().lower()
+
+        is_zones = (src == "zones") or ("zone" in src)
+
+        # Zoneの「構造/存在」イベント（長期保持）
+        zone_presence_events = {
+            "new_zone_confirmed",
+            "zone_confirmed",
+            "new_zone",
+            "zone_created",
+            "zone_breakout",
+        }
+
+        # Zoneの「接触」イベント（短期保持）
+        zone_touch_markers = {
+            "zone_retrace_touch",
+            "zone_touch",
+            "touch",
+            "retrace",
+            "bounce",
+        }
+
+        if is_zones:
+            if (sig_type in {"structure", "zones", "zone"} and event in zone_presence_events) or event in zone_presence_events:
+                limit_sec = ZONE_LOOKBACK_SEC
+            elif any(m in event for m in zone_touch_markers):
+                limit_sec = ZONE_TOUCH_LOOKBACK_SEC
+            else:
+                # 不明なZonesイベントは長期保持せず、誤認を避けるため短期で消す
+                limit_sec = SIGNAL_LOOKBACK_SEC
+        else:
+            limit_sec = SIGNAL_LOOKBACK_SEC
+
+        age = now - float(s.get("receive_time", now) or now)
+        if age < float(limit_sec or SIGNAL_LOOKBACK_SEC):
+            keep_list.append(s)
+
     if len(keep_list) != len(signals_cache):
         signals_cache[:] = keep_list
-        has_changes = True
 
-    # ここでは「削除」時の保存は頻度を下げるため必須ではないが、
-    # 確実性を取るなら保存しても良い。今回は「追加時」に保存するためここはメモリ操作のみとする。
-    pass
+
+def _is_zone_presence_signal(s: dict) -> bool:
+    src = (s.get("source") or "").strip().lower()
+    event = (s.get("event") or "").strip().lower()
+    sig_type = (s.get("signal_type") or "").strip().lower()
+
+    is_zones = (src == "zones") or ("zone" in src)
+    if not is_zones:
+        return False
+
+    zone_presence_events = {
+        "new_zone_confirmed",
+        "zone_confirmed",
+        "new_zone",
+        "zone_created",
+        "zone_breakout",
+    }
+    return (event in zone_presence_events) or (sig_type == "structure" and event in zone_presence_events)
+
+
+def _is_zone_touch_signal(s: dict) -> bool:
+    src = (s.get("source") or "").strip().lower()
+    event = (s.get("event") or "").strip().lower()
+    is_zones = (src == "zones") or ("zone" in src)
+    if not is_zones:
+        return False
+    # match the canonical touch events used elsewhere
+    return event in {"zone_retrace_touch", "zone_touch"} or ("touch" in event)
 
 def _filter_fresh_signals(symbol: str, now: float) -> list:
     """v2.6の SignalMaxAgeSec 相当：signal_time が古すぎるものを落とす。"""
@@ -297,7 +369,21 @@ def _filter_fresh_signals(symbol: str, now: float) -> list:
 
     fresh = []
     for s in normalized:
-        st = float(s.get("signal_time") or 0)
+        # Zones presence signals are intentionally long-lived (structure context).
+        # Use receive_time-based retention rather than signal_time freshness.
+        if _is_zone_presence_signal(s):
+            rt = float(s.get("receive_time") or 0.0)
+            if rt > 0 and (now - rt) <= float(ZONE_LOOKBACK_SEC):
+                fresh.append(s)
+            continue
+
+        # Zones touch is a momentary event; keep it short-lived.
+        if _is_zone_touch_signal(s):
+            rt = float(s.get("receive_time") or 0.0)
+            if rt <= 0 or (now - rt) > float(ZONE_TOUCH_LOOKBACK_SEC):
+                continue
+
+        st = float(s.get("signal_time") or 0.0)
         if st <= 0:
             continue
         age = now - st
@@ -341,9 +427,18 @@ def get_qtrend_anchor_stats(target_symbol: str):
     fvg_opp = 0
     zones_touch_same = 0
     zones_touch_opp = 0
-    zones_confirmed = 0
+    zones_confirmed_after_q = 0
+    zones_confirmed_recent = 0
     weighted_confirm_score = 0.0
     weighted_oppose_score = 0.0
+
+    # Zones presence is meaningful even if it happened before Q-Trend.
+    # Count recent zone confirmations (within ZONE_LOOKBACK_SEC by receive_time).
+    for s in normalized:
+        if (s.get("source") == "Zones") and (s.get("signal_type") == "structure") and (s.get("event") == "new_zone_confirmed"):
+            rt = float(s.get("receive_time") or 0.0)
+            if rt > 0 and (now - rt) <= float(ZONE_LOOKBACK_SEC):
+                zones_confirmed_recent += 1
 
     for s in normalized:
         st = float(s.get("signal_time") or s.get("receive_time") or 0)
@@ -358,6 +453,10 @@ def get_qtrend_anchor_stats(target_symbol: str):
         sig_type = s.get("signal_type")
         confirmed = s.get("confirmed")
         w = _weight_confirmed(confirmed)
+        # touch系は「瞬間イベント」なので合流/逆行の重みを落とす（ノイズ過剰反応防止）
+        event_weight = 1.0
+        if event in {"fvg_touch", "zone_retrace_touch", "zone_touch"}:
+            event_weight = 0.7
         if src == "Q-Trend":
             continue
 
@@ -370,7 +469,7 @@ def get_qtrend_anchor_stats(target_symbol: str):
 
         # Zones: neutral confirmations (no side) indicate S/R reliability
         if src == "Zones" and sig_type == "structure" and event == "new_zone_confirmed":
-            zones_confirmed += 1
+            zones_confirmed_after_q += 1
 
         # Directional confluence buckets by source/event
         if src == "FVG" and event == "fvg_touch" and side in {"buy", "sell"}:
@@ -392,13 +491,13 @@ def get_qtrend_anchor_stats(target_symbol: str):
         if side == q_side:
             confirm_signals += 1
             confirm_unique_sources.add(src)
-            weighted_confirm_score += w
+            weighted_confirm_score += (w * event_weight)
             if s.get("strength") == "strong":
                 strong_after_q = True
         elif side in {"buy", "sell"}:
             opp_signals += 1
             opp_unique_sources.add(src)
-            weighted_oppose_score += w
+            weighted_oppose_score += (w * event_weight)
 
     return {
         "q_time": q_time,
@@ -415,7 +514,8 @@ def get_qtrend_anchor_stats(target_symbol: str):
         "fvg_touch_opp": fvg_opp,
         "zones_touch_same": zones_touch_same,
         "zones_touch_opp": zones_touch_opp,
-        "zones_confirmed": zones_confirmed,
+        "zones_confirmed_after_q": zones_confirmed_after_q,
+        "zones_confirmed_recent": zones_confirmed_recent,
         "weighted_confirm_score": round(weighted_confirm_score, 3),
         "weighted_oppose_score": round(weighted_oppose_score, 3),
     }
@@ -478,6 +578,105 @@ def get_mt5_position_state(symbol: str):
         return {"positions_open": len(positions)}
     except Exception:
         return {"positions_open": 0}
+
+
+def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
+    """MT5の保有ポジション概要（AI決済判断に必要な最小情報）を安全に返す。"""
+    try:
+        positions = mt5.positions_get(symbol=symbol)
+    except Exception:
+        positions = None
+
+    if not positions:
+        return {
+            "positions_open": 0,
+            "net_side": "flat",
+            "net_volume": 0.0,
+            "total_profit": 0.0,
+            "oldest_open_time": None,
+            "max_holding_sec": 0,
+        }
+
+    now = time.time()
+    net_volume = 0.0
+    total_profit = 0.0
+    oldest_time = None
+    max_holding = 0
+    buy_vol = 0.0
+    sell_vol = 0.0
+    buy_profit = 0.0
+    sell_profit = 0.0
+    buy_open_px_sum = 0.0
+    sell_open_px_sum = 0.0
+    buy_count = 0
+    sell_count = 0
+
+    for p in positions:
+        try:
+            vol = float(getattr(p, "volume", 0.0) or 0.0)
+        except Exception:
+            vol = 0.0
+        try:
+            open_px = float(getattr(p, "price_open", 0.0) or 0.0)
+        except Exception:
+            open_px = 0.0
+        try:
+            profit = float(getattr(p, "profit", 0.0) or 0.0)
+        except Exception:
+            profit = 0.0
+        try:
+            t_open = float(getattr(p, "time", 0.0) or 0.0)
+        except Exception:
+            t_open = 0.0
+
+        ptype = getattr(p, "type", None)
+        if ptype == mt5.POSITION_TYPE_BUY:
+            buy_vol += vol
+            net_volume += vol
+            buy_profit += profit
+            if vol > 0 and open_px > 0:
+                buy_open_px_sum += (open_px * vol)
+            buy_count += 1
+        elif ptype == mt5.POSITION_TYPE_SELL:
+            sell_vol += vol
+            net_volume -= vol
+            sell_profit += profit
+            if vol > 0 and open_px > 0:
+                sell_open_px_sum += (open_px * vol)
+            sell_count += 1
+
+        total_profit += profit
+
+        if t_open and (oldest_time is None or t_open < float(oldest_time)):
+            oldest_time = t_open
+        if t_open:
+            max_holding = max(max_holding, int(max(0.0, now - t_open)))
+
+    net_side = "flat"
+    if net_volume > 0:
+        net_side = "buy"
+    elif net_volume < 0:
+        net_side = "sell"
+
+    buy_avg_open = (buy_open_px_sum / buy_vol) if buy_vol > 0 else 0.0
+    sell_avg_open = (sell_open_px_sum / sell_vol) if sell_vol > 0 else 0.0
+
+    return {
+        "positions_open": len(positions),
+        "net_side": net_side,
+        "net_volume": round(abs(net_volume), 4),
+        "total_profit": round(total_profit, 2),
+        "oldest_open_time": oldest_time,
+        "max_holding_sec": int(max_holding),
+        "buy_volume": round(buy_vol, 4),
+        "sell_volume": round(sell_vol, 4),
+        "buy_profit": round(buy_profit, 2),
+        "sell_profit": round(sell_profit, 2),
+        "buy_count": int(buy_count),
+        "sell_count": int(sell_count),
+        "buy_avg_open": round(buy_avg_open, 6),
+        "sell_avg_open": round(sell_avg_open, 6),
+    }
 
 
 def _compute_entry_multiplier(confirm_unique_sources: int, strong_after_q: bool) -> float:
@@ -646,7 +845,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     fvg_opp = int(stats.get("fvg_touch_opp") or 0)
     zones_same = int(stats.get("zones_touch_same") or 0)
     zones_opp = int(stats.get("zones_touch_opp") or 0)
-    zones_confirmed = int(stats.get("zones_confirmed") or 0)
+    zones_confirmed_recent = int(stats.get("zones_confirmed_recent") or stats.get("zones_confirmed") or 0)
     w_confirm = float(stats.get("weighted_confirm_score") or 0.0)
     w_oppose = float(stats.get("weighted_oppose_score") or 0.0)
 
@@ -682,9 +881,10 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "fvg_touch_opp": fvg_opp,
             "zones_touch_same": zones_same,
             "zones_touch_opp": zones_opp,
-            "zones_confirmed": zones_confirmed,
+            "zones_confirmed_recent": zones_confirmed_recent,
             "osgfc_latest_side": osgfc_side,
             "osgfc_alignment": osgfc_align,
+            "note": "touch系(FVG/Zones)は瞬間イベント。Opposition評価は過剰反応せず、構造(confirmed)と区別する。",
         },
         "market": {
             "bid": market.get("bid"),
@@ -701,23 +901,146 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "confidence_range": [0, 100],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
-            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Do not fight against established Zones without strong confirmation.",
+            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed_recent' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Do not fight against established Zones without strong confirmation.",
         },
     }
 
     return (
-        "You are a strict trading entry gate for XAUUSD/GOLD **day trading**. FOCUS on high-quality setups where risk-reward is favorable (Loss-cut small, Profit-target large).\n"
+        "You are a strict trading entry gate for XAUUSD/GOLD **DAY TRADING** (not scalping).\n"
+        "Your objective is Loss-cut small / Profit-target large: avoid easy counter-trend entries; only enter/hold when evidence is strong and reward potential is meaningfully larger than risk.\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
         "- Prefer ALIGNED higher-timeframe trend_alignment and OSGFC alignment.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
-        "- Penalize opposition: higher oppose_unique_sources, higher weighted_oppose_score, fvg/zones touches against.\n"
+        "- Evaluate opposition with nuance: structural opposition (confirmed) matters most; touch-based opposition can be noise.\n"
+        "- When opposition exists, compare it against reward potential (use ATR/spread and confluence strength as a proxy). Do not over-penalize low-quality/noisy opposite signals.\n"
         "- Penalize wide spread.\n"
         "Return ONLY strict JSON schema (multiplier is a FACTOR for local_multiplier):\n"
         '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
+
+
+def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """期待するJSON: {action: "HOLD"|"CLOSE", confidence: 0-100, reason: str}"""
+    if not isinstance(decision, dict):
+        return None
+    action = decision.get("action")
+    if not isinstance(action, str):
+        return None
+    action = action.strip().upper()
+    if action not in {"HOLD", "CLOSE"}:
+        return None
+    confidence = _safe_int(decision.get("confidence"), AI_CLOSE_DEFAULT_CONFIDENCE)
+    confidence = int(_clamp(confidence, 0, 100))
+    reason = decision.get("reason")
+    if not isinstance(reason, str):
+        reason = ""
+    reason = reason.strip()
+    return {"action": action, "confidence": confidence, "reason": reason}
+
+
+def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> str:
+    """保有中のCLOSE/HOLD判断用プロンプト（Day Trading・損小利大）。"""
+    now = time.time()
+    stats = stats or {}
+
+    q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
+
+    bid = float(market.get("bid") or 0.0)
+    ask = float(market.get("ask") or 0.0)
+    mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else max(bid, ask)
+
+    net_side = (pos_summary.get("net_side") or "flat").lower()
+    net_avg_open = 0.0
+    if net_side == "buy":
+        net_avg_open = float(pos_summary.get("buy_avg_open") or 0.0)
+    elif net_side == "sell":
+        net_avg_open = float(pos_summary.get("sell_avg_open") or 0.0)
+
+    # directional price move (approx) from avg open to now, for intuition only
+    move_points = 0.0
+    if net_side == "buy" and net_avg_open > 0 and mid > 0:
+        move_points = mid - net_avg_open
+    elif net_side == "sell" and net_avg_open > 0 and mid > 0:
+        move_points = net_avg_open - mid
+
+    payload = {
+        "symbol": symbol,
+        "mode": "POSITION_MANAGEMENT",
+        "position": {
+            "positions_open": int(pos_summary.get("positions_open") or 0),
+            "net_side": pos_summary.get("net_side"),
+            "net_volume": pos_summary.get("net_volume"),
+            "total_profit": pos_summary.get("total_profit"),
+            "max_holding_sec": pos_summary.get("max_holding_sec"),
+            "buy_count": int(pos_summary.get("buy_count") or 0),
+            "sell_count": int(pos_summary.get("sell_count") or 0),
+            "buy_avg_open": pos_summary.get("buy_avg_open"),
+            "sell_avg_open": pos_summary.get("sell_avg_open"),
+            "buy_profit": pos_summary.get("buy_profit"),
+            "sell_profit": pos_summary.get("sell_profit"),
+            "net_avg_open": round(net_avg_open, 6),
+            "net_move_points_approx": round(move_points, 6),
+        },
+        "qtrend_context": {
+            "latest_q_side": stats.get("q_side"),
+            "latest_q_age_sec": q_age_sec,
+            "confirm_unique_sources": int(stats.get("confirm_unique_sources") or 0),
+            "oppose_unique_sources": int(stats.get("opp_unique_sources") or 0),
+            "weighted_confirm_score": float(stats.get("weighted_confirm_score") or 0.0),
+            "weighted_oppose_score": float(stats.get("weighted_oppose_score") or 0.0),
+            "fvg_touch_opp": int(stats.get("fvg_touch_opp") or 0),
+            "zones_touch_opp": int(stats.get("zones_touch_opp") or 0),
+            "zones_confirmed_recent": int(stats.get("zones_confirmed_recent") or stats.get("zones_confirmed") or 0),
+            "zones_confirmed_after_q": int(stats.get("zones_confirmed_after_q") or 0),
+        },
+        "market": {
+            "bid": market.get("bid"),
+            "ask": market.get("ask"),
+            "m15_sma20": market.get("m15_ma"),
+            "atr_m5_approx": market.get("atr"),
+            "spread_points": market.get("spread"),
+        },
+        "latest_signal": {
+            "source": latest_signal.get("source"),
+            "side": latest_signal.get("side"),
+            "event": latest_signal.get("event"),
+            "signal_type": latest_signal.get("signal_type"),
+            "confirmed": latest_signal.get("confirmed"),
+            "signal_time": latest_signal.get("signal_time"),
+        },
+        "notes": {
+            "opposition_handling": "Opposition signals can be noise. Prioritize confirmed/structural reversal signs (e.g., strong opposite Zones context) over single touch events.",
+            "day_trading_goal": "Loss-cut small, Profit-target large. If profit is available and reversal risk rises, take profit. If loss grows and reversal evidence increases, exit early.",
+        },
+    }
+
+    return (
+        "You are an elite XAUUSD/GOLD DAY TRADER focused on expected value (Loss-cut small / Profit-target large).\n"
+        "Decide whether to HOLD or CLOSE existing positions based on changing market conditions.\n"
+        "Avoid knee-jerk exits on noisy opposite touch events; however, if strong reversal signs appear (e.g., multiple oppositions, trend misalignment, repeated opposite zone touches), CLOSE early to protect capital.\n"
+        "Return ONLY strict JSON with this schema:\n"
+        '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "reason": "short"}\n\n'
+        "ContextJSON:\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+def _ai_close_hold_decision(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> Optional[Dict[str, Any]]:
+    if not client:
+        return None
+    prompt = _build_close_logic_prompt(symbol, market, stats, pos_summary, latest_signal)
+    decision = _call_openai_with_retry(prompt)
+    if not decision:
+        print("[FXAI][AI] No response from AI (close/hold). Using fallback.")
+        return None
+    validated = _validate_ai_close_decision(decision)
+    if not validated:
+        print("[FXAI][AI] Invalid AI response (close/hold). Using fallback.")
+        return None
+    return validated
 
 
 def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Optional[Dict[str, Any]]:
@@ -799,9 +1122,120 @@ def webhook():
 
     normalized = _normalize_signal_fields(signal)
 
+    # Determine Q-Trend trigger early (used for both management and optional add-on entries)
+    qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
+
+    # ポジションがある場合は「管理（CLOSE/HOLD）」を優先する
+    pos_summary = get_mt5_positions_summary(symbol)
+    if int(pos_summary.get("positions_open") or 0) > 0:
+        net_side = (pos_summary.get("net_side") or "flat").lower()
+
+        # Optional: allow add-on entries when SAME-DIRECTION Q-Trend arrives
+        # (e.g., pyramiding) while keeping management logic for other cases.
+        if ALLOW_ADD_ON_ENTRIES and qtrend_trigger and net_side in {"buy", "sell"} and normalized.get("side") == net_side:
+            # proceed to entry gating below (do NOT early-return here)
+            pass
+        else:
+            # 管理対象外のソースはAI呼び出しを避けて保存のみ（コスト/レート制御）
+            if (normalized.get("source") or "") not in {"Q-Trend", "FVG", "Zones", "OSGFC"}:
+                _set_status(last_result="Stored (mgmt ignored source)", last_result_at=time.time())
+                return "Stored", 200
+
+            market = get_mt5_market_data(symbol)
+            stats = get_qtrend_anchor_stats(symbol)
+
+            if AI_CLOSE_ENABLED:
+                global _last_close_attempt_key, _last_close_attempt_at
+                now_mono = time.time()
+
+                # Throttle management AI by time (not by PnL changes) to avoid high-frequency calls.
+                # Allow bypass for clear reversal-like signals against the current net_side.
+                src = (normalized.get("source") or "")
+                evt = (normalized.get("event") or "")
+                sig_side = (normalized.get("side") or "").lower()
+
+                is_reversal_like = (
+                    (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
+                    and (
+                        (src == "Q-Trend")
+                        or (src == "FVG" and evt == "fvg_touch")
+                        or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
+                    )
+                )
+
+                last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
+                if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
+                    _set_status(
+                        last_result="AI close throttled",
+                        last_result_at=time.time(),
+                        last_mgmt_throttled={
+                            "cooldown_sec": float(AI_CLOSE_THROTTLE_SEC),
+                            "since_last_call_sec": round(float(last_attempt_age), 3),
+                            "reason": "cooldown",
+                            "bypass": False,
+                            "incoming": {"source": src, "event": evt, "side": sig_side},
+                        },
+                    )
+                    return "AI close throttled", 200
+
+                attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
+                _last_close_attempt_key = attempt_key
+                _last_close_attempt_at = now_mono
+
+                ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized)
+                if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
+                    # Fallback policy on AI error/invalid response
+                    if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
+                        ai_decision = {
+                            "action": "CLOSE",
+                            "confidence": int(_clamp(AI_CLOSE_DEFAULT_CONFIDENCE, 0, 100)),
+                            "reason": "fallback_default_close",
+                        }
+                    else:
+                        # safest fallback is HOLD
+                        _set_status(
+                            last_result="HOLD (AI fallback)",
+                            last_result_at=time.time(),
+                            last_mgmt_action="HOLD",
+                            last_mgmt_confidence=None,
+                            last_mgmt_reason="ai_fallback_hold",
+                            last_mgmt_at=time.time(),
+                        )
+                        zmq_socket.send_json({"type": "HOLD", "reason": "ai_fallback_hold"})
+                        return "HOLD", 200
+
+                decision_action = ai_decision["action"]
+                decision_reason = ai_decision.get("reason") or ""
+                if decision_action == "CLOSE":
+                    zmq_socket.send_json({"type": "CLOSE", "reason": decision_reason})
+                    _set_status(
+                        last_result="CLOSE",
+                        last_result_at=time.time(),
+                        last_mgmt_action="CLOSE",
+                        last_mgmt_confidence=int(ai_decision.get("confidence") or 0),
+                        last_mgmt_reason=decision_reason,
+                        last_mgmt_at=time.time(),
+                        last_mgmt_throttled=None,
+                    )
+                    return "CLOSE", 200
+                else:
+                    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason})
+                    _set_status(
+                        last_result="HOLD",
+                        last_result_at=time.time(),
+                        last_mgmt_action="HOLD",
+                        last_mgmt_confidence=int(ai_decision.get("confidence") or 0),
+                        last_mgmt_reason=decision_reason,
+                        last_mgmt_at=time.time(),
+                        last_mgmt_throttled=None,
+                    )
+                    return "HOLD", 200
+            else:
+                _set_status(last_result="Stored (mgmt disabled)", last_result_at=time.time())
+                return "Stored", 200
+
     # エントリートリガーは Q-Trend のみ（それ以外は保存して終了）
     # sourceが空のままの場合、誤発火防止のためトリガーしない。
-    qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
     if not qtrend_trigger:
         _set_status(last_result="Stored", last_result_at=time.time())
         return "Stored", 200
@@ -829,10 +1263,11 @@ def webhook():
         return "Invalid action", 400
 
     # 重複送信ガード（同じQ-Trend起点で何度もORDERを出さない）
+    # NOTE: ピラミッディング（買い増し）を許可する場合は、必要に応じて緩められる。
     global _last_entry_q_time
     if _last_entry_q_time is not None:
         try:
-            if abs(float(_last_entry_q_time) - float(stats.get("q_time") or 0.0)) < 0.0001:
+            if (not ALLOW_MULTI_ENTRY_SAME_QTREND) and abs(float(_last_entry_q_time) - float(stats.get("q_time") or 0.0)) < 0.0001:
                 _set_status(last_result="Duplicate", last_result_at=time.time())
                 return "Duplicate", 200
         except Exception:
