@@ -246,10 +246,11 @@ def _normalize_signal_fields(signal: dict) -> dict:
     strength = (s.get("strength") or "").strip().lower()
 
     src_lower = src.lower().replace(" ", "").replace("_", "")
-    if src_lower in {"q-trend", "qtrend", "q-trendstrong", "qtrendstrong"}:
-        s["source"] = "Q-Trend"
-        if "strong" in src_lower and strength != "strong":
-            s["strength"] = "strong"
+    # Q-Trend: Strong/Normal を source として完全分離する
+    if src_lower in {"q-trend", "qtrend", "qtrendnormal", "q-trendnormal", "qtrend-normal", "q-trend-normal", "qtrendstrong", "q-trendstrong", "qtrend-strong", "q-trend-strong"}:
+        is_strong = ("strong" in src_lower) or (strength == "strong")
+        s["source"] = "Q-Trend-Strong" if is_strong else "Q-Trend-Normal"
+        s["strength"] = "strong" if is_strong else "normal"
     else:
         # Normalize common sources from your alert templates
         if src_lower in {"luxalgo_fvg", "luxalgofvg", "fvg"}:
@@ -442,20 +443,32 @@ def get_qtrend_anchor_stats(target_symbol: str):
     if not normalized:
         return None
 
+    # Q-Trend: Normal/Strong が混在する場合は Strong を優先
+    q_candidates = []
+    for s in normalized:
+        if s.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and s.get("side") in {"buy", "sell"}:
+            st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
+            is_strong = (s.get("source") == "Q-Trend-Strong") or (s.get("strength") == "strong")
+            q_candidates.append((st, 1 if is_strong else 0, s))
+
     latest_q = None
-    for s in reversed(normalized):
-        if s.get("source") == "Q-Trend" and s.get("side") in {"buy", "sell"}:
-            latest_q = s
-            break
+    if q_candidates:
+        # sort by time then strong priority
+        q_candidates.sort(key=lambda x: (x[0], x[1]))
+        latest_q = q_candidates[-1][2]
     if not latest_q:
         return None
 
     q_time = float(latest_q.get("signal_time") or latest_q.get("receive_time") or now)
     q_side = (latest_q.get("side") or "").lower()
-    q_is_strong = (latest_q.get("strength") == "strong")
+    q_source = (latest_q.get("source") or "")
+    q_is_strong = (q_source == "Q-Trend-Strong") or (latest_q.get("strength") == "strong")
+    q_trigger_type = "Strong" if q_is_strong else "Normal"
+    momentum_factor = 1.5 if q_is_strong else 1.0
+    is_strong_momentum = bool(q_is_strong)
 
-    confirm_unique_sources = set(["Q-Trend"])
-    opp_unique_sources = set(["Q-Trend"])
+    confirm_unique_sources = set([q_source or "Q-Trend-Normal"])
+    opp_unique_sources = set([q_source or "Q-Trend-Normal"])
     confirm_signals = 0
     opp_signals = 0
     strong_after_q = q_is_strong
@@ -497,7 +510,13 @@ def get_qtrend_anchor_stats(target_symbol: str):
         event_weight = 1.0
         if event in {"fvg_touch", "zone_retrace_touch", "zone_touch"}:
             event_weight = 0.7
-        if src == "Q-Trend":
+        if src in {"Q-Trend-Strong", "Q-Trend-Normal"}:
+            # 同一トレンド内で Strong が追加で来るケースを拾う（後追い含む）
+            if src == "Q-Trend-Strong":
+                strong_after_q = True
+                is_strong_momentum = True
+                q_trigger_type = "Strong"
+                momentum_factor = 1.5
             continue
 
         # OSGFC trend filter is useful even when used as a filter (strength of context)
@@ -542,7 +561,11 @@ def get_qtrend_anchor_stats(target_symbol: str):
     return {
         "q_time": q_time,
         "q_side": q_side,
+        "q_source": q_source,
         "q_is_strong": q_is_strong,
+        "q_trigger_type": q_trigger_type,
+        "momentum_factor": momentum_factor,
+        "is_strong_momentum": is_strong_momentum,
         "confirm_unique_sources": max(0, len(confirm_unique_sources) - 1),
         "confirm_signals": confirm_signals,
         "opp_unique_sources": max(0, len(opp_unique_sources) - 1),
@@ -901,7 +924,13 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     w_confirm = float(stats.get("weighted_confirm_score") or 0.0)
     w_oppose = float(stats.get("weighted_oppose_score") or 0.0)
 
-    confluence_score = (confirm_u * 2) + min(confirm_n, 6)
+    q_trigger_type = (stats.get("q_trigger_type") or ("Strong" if bool(stats.get("q_is_strong")) else "Normal"))
+    is_strong_momentum = bool(stats.get("is_strong_momentum"))
+    momentum_factor = float(stats.get("momentum_factor") or (1.5 if is_strong_momentum else 1.0))
+    strong_bonus = 2 if is_strong_momentum else 0
+
+    confluence_score_base = (confirm_u * 2) + min(confirm_n, 6)
+    confluence_score = confluence_score_base + strong_bonus
     opposition_score = (opp_u * 3) + min(opp_n, 6)
     strong_flag = bool(stats.get("strong_after_q"))
 
@@ -918,6 +947,10 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "side": stats.get("q_side"),
             "age_sec": q_age_sec,
             "is_strong": bool(stats.get("q_is_strong")),
+            "is_strong_momentum": is_strong_momentum,
+            "trigger_type": q_trigger_type,
+            "momentum_factor": momentum_factor,
+            "source": stats.get("q_source"),
             "strong_after_q": strong_flag,
         },
         "confluence": {
@@ -926,6 +959,8 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "oppose_unique_sources": opp_u,
             "oppose_signals": opp_n,
             "confluence_score": confluence_score,
+            "confluence_score_base": confluence_score_base,
+            "qtrend_strong_bonus": strong_bonus,
             "opposition_score": opposition_score,
             "weighted_confirm_score": w_confirm,
             "weighted_oppose_score": w_oppose,
@@ -955,7 +990,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "confidence_range": [0, 100],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
-            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed_recent' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Do not fight against established Zones without strong confirmation.",
+            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed_recent' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Strong momentum (trigger_type=Strong) can justify ENTRY even with some opposite touch signals if EV/space is good.",
         },
     }
 
@@ -967,6 +1002,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "- Prefer ALIGNED higher-timeframe trend_alignment and OSGFC alignment.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
         "- Evaluate opposition with nuance: confirmed/structural opposition matters most; touch-based opposition can be noise.\n"
+        "- If qtrend.trigger_type is Strong (strong momentum), treat it as higher breakout probability: be more willing to approve ENTRY even if there are some opposite touch signals (e.g., opposite FVG touch), as long as EV/space (ATR vs spread) remains attractive.\n"
         "- If some opposite FVG/Zones exist BUT trend is aligned and ATR-to-spread is healthy and confluence is decent, you MAY still approve ENTRY (EV can remain positive).\n"
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
@@ -1156,6 +1192,10 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
         "qtrend_context": {
             "latest_q_side": stats.get("q_side"),
             "latest_q_age_sec": q_age_sec,
+            "latest_q_source": stats.get("q_source"),
+            "trigger_type": stats.get("q_trigger_type"),
+            "is_strong_momentum": bool(stats.get("is_strong_momentum")),
+            "momentum_factor": stats.get("momentum_factor"),
             "confirm_unique_sources": int(stats.get("confirm_unique_sources") or 0),
             "oppose_unique_sources": int(stats.get("opp_unique_sources") or 0),
             "weighted_confirm_score": float(stats.get("weighted_confirm_score") or 0.0),
@@ -1190,6 +1230,7 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
         "You are an elite XAUUSD/GOLD DAY TRADER focused on expected value (Loss-cut small / Profit-target large).\n"
         "Decide whether to HOLD or CLOSE existing positions based on changing market conditions.\n"
         "Avoid knee-jerk exits on noisy opposite touch events; however, if strong reversal signs appear (e.g., multiple oppositions, trend misalignment, repeated opposite zone touches), CLOSE early to protect capital.\n"
+        "If the current trend shows strong momentum (qtrend_context.is_strong_momentum=true), you should be more willing to HOLD to aim for larger profits, unless clear reversal/structural opposition increases risk materially.\n"
         "Return ONLY strict JSON with this schema:\n"
         '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "reason": "short"}\n\n'
         "ContextJSON:\n"
@@ -1269,7 +1310,7 @@ def webhook():
     source_in = (data.get("source") or "").strip()
     source_for_cache = source_in
     if not source_for_cache and ASSUME_ACTION_IS_QTREND and inferred_side:
-        source_for_cache = "Q-Trend"
+        source_for_cache = "Q-Trend-Normal"
 
     signal = {
         "symbol": symbol,
@@ -1292,7 +1333,7 @@ def webhook():
     normalized = _normalize_signal_fields(signal)
 
     # Determine Q-Trend trigger early (used for both management and optional add-on entries)
-    qtrend_trigger = (normalized.get("source") == "Q-Trend" and normalized.get("side") in {"buy", "sell"})
+    qtrend_trigger = (normalized.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and normalized.get("side") in {"buy", "sell"})
 
     # --- POSITION MANAGEMENT MODE (CLOSE/HOLD) ---
     pos_summary = get_mt5_positions_summary(symbol)
