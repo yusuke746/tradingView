@@ -938,7 +938,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
 
     # スプレッドが大きすぎる局面はEVが落ちやすい（簡易目安）
     spread_points = float(market.get("spread") or 0.0)
-    spread_flag = "WIDE" if spread_points >= 40 else "NORMAL"
+    spread_flag = "WIDE" if spread_points >= 80 else "NORMAL"
 
     payload = {
         "symbol": symbol,
@@ -999,7 +999,8 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
-        "- Prefer ALIGNED higher-timeframe trend_alignment and OSGFC alignment.\n"
+        "- Prefer ALIGNED higher-timeframe trend_alignment. HOWEVER, even if MISALIGNED, you MAY approve ENTRY if qtrend.is_strong_momentum is true (viewed as high-reward mean-reversion or a new trend starting point).\n"
+        "- Prioritize current price action and momentum over simple MA position.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
         "- Evaluate opposition with nuance: confirmed/structural opposition matters most; touch-based opposition can be noise.\n"
         "- If qtrend.trigger_type is Strong (strong momentum), treat it as higher breakout probability: be more willing to approve ENTRY even if there are some opposite touch signals (e.g., opposite FVG touch), as long as EV/space (ATR vs spread) remains attractive.\n"
@@ -1143,7 +1144,13 @@ def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
     if not isinstance(reason, str):
         reason = ""
     reason = reason.strip()
-    return {"action": action, "confidence": confidence, "reason": reason}
+
+    # 追加: trail_modeの検証
+    trail_mode = decision.get("trail_mode", "NORMAL").upper()
+    if trail_mode not in {"WIDE", "NORMAL", "TIGHT"}:
+        trail_mode = "NORMAL"
+
+    return {"action": action, "confidence": confidence, "reason": reason, "trail_mode": trail_mode}  # 追加
 
 
 def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> str:
@@ -1227,14 +1234,16 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     }
 
     return (
-        "You are an elite XAUUSD/GOLD DAY TRADER focused on expected value (Loss-cut small / Profit-target large).\n"
-        "Decide whether to HOLD or CLOSE existing positions based on changing market conditions.\n"
-        "Avoid knee-jerk exits on noisy opposite touch events; however, if strong reversal signs appear (e.g., multiple oppositions, trend misalignment, repeated opposite zone touches), CLOSE early to protect capital.\n"
-        "If the current trend shows strong momentum (qtrend_context.is_strong_momentum=true), you should be more willing to HOLD to aim for larger profits, unless clear reversal/structural opposition increases risk materially.\n"
-        "Return ONLY strict JSON with this schema:\n"
-        '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "reason": "short"}\n\n'
-        "ContextJSON:\n"
-        + json.dumps(payload, ensure_ascii=False)
+    "You are an elite XAUUSD/GOLD DAY TRADER focused on maximizing run-up profits while securing gains.\n"
+    "1. Decide ACTION: HOLD or CLOSE.\n"
+    "2. Decide TRAIL_MODE (Dynamic Trailing):\n"
+    "   - 'WIDE': Momentum is VERY STRONG. Use wide trailing to catch big waves (avoid noise stop-out).\n"
+    "   - 'NORMAL': Standard trend strength.\n"
+    "   - 'TIGHT': Momentum is weakening or chopping. Tighten stop to protect profits.\n"
+    "Return ONLY strict JSON with this schema:\n"
+    '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "short"}\n\n'
+    "ContextJSON:\n"
+    + json.dumps(payload, ensure_ascii=False)
     )
 
 
@@ -1421,7 +1430,15 @@ def webhook():
                     )
                     return "CLOSE", 200
                 else:
-                    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason})
+                    # AIの決定から trail_mode を取得
+                    t_mode = ai_decision.get("trail_mode", "NORMAL")
+                    
+                    # JSONに trail_mode を含めて送信
+                    zmq_socket.send_json({
+                        "type": "CLOSE_SIGNAL", 
+                        "reason": decision_reason,
+                        "trail_mode": t_mode 
+                    })
                     _set_status(
                         last_result="HOLD",
                         last_result_at=time.time(),
@@ -1488,9 +1505,30 @@ if __name__ == '__main__':
     print(f"[FXAI] symbol: {SYMBOL}")
     # ★追加: 起動時にキャッシュを復元
     _load_cache()
-    bind_err = _check_port_bindable("0.0.0.0", int(WEBHOOK_PORT))
-    if bind_err:
-        print(f"[FXAI][FATAL] Cannot bind WEBHOOK_PORT={WEBHOOK_PORT}. OS error: {bind_err}")
-        print("[FXAI][HINT] Set WEBHOOK_PORT to an available port (e.g. 8000) or run with sufficient privileges.")
-        raise SystemExit(2)
-    app.run(host='0.0.0.0', port=WEBHOOK_PORT)
+
+    # Port pre-check behavior:
+    # - "warn"   (default): warn if port seems unavailable, but still attempt to start Flask
+    # - "strict": exit before starting when port is unavailable
+    # - "skip":  do not pre-check (useful when running behind a supervisor / reverse proxy)
+    PORT_PRECHECK_MODE = os.getenv("PORT_PRECHECK_MODE", "warn").strip().lower()
+
+    if PORT_PRECHECK_MODE != "skip":
+        bind_err = _check_port_bindable("0.0.0.0", int(WEBHOOK_PORT))
+        if bind_err:
+            msg = f"[FXAI] WEBHOOK_PORT={WEBHOOK_PORT} may be unavailable. OS error: {bind_err}"
+            if PORT_PRECHECK_MODE == "strict":
+                print("[FXAI][FATAL] " + msg)
+                print("[FXAI][HINT] On Windows, port 80 is commonly used/reserved by IIS/HTTP.SYS.")
+                print("[FXAI][HINT] Check: `netstat -ano | findstr :80` and stop the conflicting process.")
+                raise SystemExit(2)
+            else:
+                print("[FXAI][WARN] " + msg)
+                print("[FXAI][WARN] Continuing to start Flask anyway (PORT_PRECHECK_MODE=warn).")
+
+    try:
+        app.run(host='0.0.0.0', port=WEBHOOK_PORT)
+    except OSError as e:
+        print(f"[FXAI][FATAL] Failed to start web server on 0.0.0.0:{WEBHOOK_PORT}. OS error: {e}")
+        print("[FXAI][HINT] If you must use port 80, ensure nothing else is listening on it (IIS/Apache/Nginx/another Python process).")
+        print("[FXAI][HINT] Windows: `netstat -ano | findstr :80` then `tasklist /fi \"PID eq <pid>\"`.")
+        raise
