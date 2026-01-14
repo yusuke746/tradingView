@@ -30,7 +30,8 @@ SYMBOL = os.getenv("SYMBOL", "GOLD")
 # --- v2.6 confluence params ---
 CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
-MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
+# 旧EA(QTrendMinOtherAlerts)のデフォルトに合わせる: 別アラート2つでENTRY
+MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "2"))
 
 # --- Signal retention / freshness ---
 SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))     # 通常シグナル: 20分
@@ -51,7 +52,9 @@ AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 # --- AI entry filter (v2.7 hybrid upgrade) ---
-AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "true").lower() == "true"
+# 旧EAはQ-Trendトリガーエントリーをローカル(非AI)で実行していたため、
+# デフォルトはAIフィルターOFF（必要なら env でON）。
+AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "false").lower() == "true"
 AI_ENTRY_MIN_CONFIDENCE = max(0, min(100, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70"))))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
 # on AI error: "skip" (safest) or "default_allow"
@@ -110,6 +113,57 @@ if not mt5.initialize():
 
 signals_lock = Lock()
 signals_cache = []  # list[dict]
+
+# Market-data fallbacks (avoid ORDER blocked by atr=0)
+_last_atr_by_symbol: Dict[str, float] = {}
+
+
+def _extract_symbol_from_webhook(data: dict) -> str:
+    """TradingView payload variations -> MT5 symbol.
+
+    Accept keys like symbol/ticker and strip exchange prefixes (e.g. "OANDA:XAUUSD").
+    """
+    raw = None
+    for k in ("symbol", "ticker", "tv_symbol", "instrument", "pair"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            raw = v.strip()
+            break
+
+    if not raw:
+        return SYMBOL
+
+    # OANDA:XAUUSD / FX:GBPUSD
+    if ":" in raw:
+        raw = raw.split(":")[-1].strip()
+
+    return raw.upper()
+
+
+def _ensure_mt5_symbol_selected(symbol: str) -> tuple[str, bool]:
+    """Try selecting the requested symbol; fallback to default SYMBOL when unavailable."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        sym = SYMBOL
+
+    ok = False
+    try:
+        ok = bool(mt5.symbol_select(sym, True))
+    except Exception:
+        ok = False
+
+    if ok:
+        return sym, True
+
+    # fallback
+    fallback = (SYMBOL or "").strip().upper()
+    if not fallback:
+        return sym, False
+    try:
+        fb_ok = bool(mt5.symbol_select(fallback, True))
+    except Exception:
+        fb_ok = False
+    return fallback, fb_ok
 
 # --- Runtime status (for debugging / health checks) ---
 _status_lock = Lock()
@@ -473,6 +527,10 @@ def get_qtrend_anchor_stats(target_symbol: str):
     opp_signals = 0
     strong_after_q = q_is_strong
 
+    # 旧EA互換: 反対側のbar_close(=entry/structure)が来たらトリガー無効化
+    cancel_due_to_opposite_bar_close = False
+    cancel_detail = None
+
     # richer context for AI (trend filter / S-R / event quality)
     osgfc_latest_side = ""
     osgfc_latest_time = None
@@ -519,6 +577,23 @@ def get_qtrend_anchor_stats(target_symbol: str):
                 momentum_factor = 1.5
             continue
 
+        # 旧EA互換: 反対側のbar_closeが来たらキャンセル（レンジ往復ビンタ回避）
+        if (
+            (not cancel_due_to_opposite_bar_close)
+            and (confirmed or "").lower() == "bar_close"
+            and side in {"buy", "sell"}
+            and side != q_side
+            and sig_type in {"entry_trigger", "structure"}
+        ):
+            cancel_due_to_opposite_bar_close = True
+            cancel_detail = {
+                "source": src,
+                "side": side,
+                "signal_type": sig_type,
+                "event": event,
+                "signal_time": st,
+            }
+
         # OSGFC trend filter is useful even when used as a filter (strength of context)
         if src == "OSGFC" and side in {"buy", "sell"}:
             # keep latest within window
@@ -547,15 +622,26 @@ def get_qtrend_anchor_stats(target_symbol: str):
         if not src:
             continue
 
+        # 旧EA互換: 合流として数えるのは
+        # - bar_close
+        # - intrabar でも strength=strong のみ例外で許可
+        # かつ trend_filter は合流カウントから除外
+        conf_l = (confirmed or "").lower()
+        strength_l = (s.get("strength") or "").lower()
+        confluence_ok = (conf_l == "bar_close") or (conf_l == "intrabar" and strength_l == "strong")
+        is_trend_filter = (sig_type == "trend_filter")
+
         if side == q_side:
-            confirm_signals += 1
-            confirm_unique_sources.add(src)
+            if confluence_ok and (not is_trend_filter):
+                confirm_signals += 1
+                confirm_unique_sources.add(src)
             weighted_confirm_score += (w * event_weight)
             if s.get("strength") == "strong":
                 strong_after_q = True
         elif side in {"buy", "sell"}:
-            opp_signals += 1
-            opp_unique_sources.add(src)
+            if confluence_ok and (not is_trend_filter):
+                opp_signals += 1
+                opp_unique_sources.add(src)
             weighted_oppose_score += (w * event_weight)
 
     return {
@@ -570,6 +656,8 @@ def get_qtrend_anchor_stats(target_symbol: str):
         "confirm_signals": confirm_signals,
         "opp_unique_sources": max(0, len(opp_unique_sources) - 1),
         "opp_signals": opp_signals,
+        "cancel_due_to_opposite_bar_close": cancel_due_to_opposite_bar_close,
+        "cancel_detail": cancel_detail,
         "strong_after_q": strong_after_q,
         "osgfc_latest_side": osgfc_latest_side,
         "osgfc_latest_time": osgfc_latest_time,
@@ -616,12 +704,29 @@ def get_mt5_market_data(symbol: str):
     else:
         ma15 = 0.0
 
-    rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 14)
-    if rates_m5 is not None and len(rates_m5) > 0:
-        ranges = [abs(_rate_field(r, "high", 0.0) - _rate_field(r, "low", 0.0)) for r in rates_m5]
-        atr = sum(ranges) / max(1, len(ranges))
-    else:
-        atr = 0.0
+    # ATR: 旧EA(iATR)に寄せて True Range で近似
+    rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 60)
+    atr = 0.0
+    if rates_m5 is not None and len(rates_m5) >= 2:
+        period = 14
+        highs = [_rate_field(r, "high", 0.0) for r in rates_m5]
+        lows = [_rate_field(r, "low", 0.0) for r in rates_m5]
+        closes = [_rate_field(r, "close", 0.0) for r in rates_m5]
+
+        trs = []
+        for i in range(1, len(rates_m5)):
+            h = highs[i]
+            l = lows[i]
+            pc = closes[i - 1]
+            tr = max(abs(h - l), abs(h - pc), abs(l - pc))
+            if tr > 0:
+                trs.append(tr)
+        if trs:
+            atr = sum(trs[:period]) / max(1, min(period, len(trs)))
+
+    # If market data isn't available, reuse last known ATR for this symbol.
+    if atr <= 0:
+        atr = float(_last_atr_by_symbol.get(symbol, 0.0) or 0.0)
 
     info = mt5.symbol_info(symbol)
     point = float(getattr(info, "point", 0.0) or 0.0)
@@ -1019,6 +1124,12 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
 
     Returns (message, http_status).
     """
+    if bool((stats or {}).get("cancel_due_to_opposite_bar_close")):
+        detail = (stats or {}).get("cancel_detail") or {}
+        print(f"[FXAI][ENTRY] Cancel Q-Trend due to opposite bar_close: {detail}")
+        _set_status(last_result="Canceled by opposite bar_close", last_result_at=time.time())
+        return "Canceled by opposite bar_close", 200
+
     if not stats:
         _set_status(last_result="Stored (no qtrend stats)", last_result_at=time.time())
         return "Stored", 200
@@ -1036,7 +1147,9 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
         return "Duplicate", 200
 
     # confluence requirement
-    if int(stats.get("confirm_unique_sources") or 0) < MIN_OTHER_SIGNALS_FOR_ENTRY:
+    have = int(stats.get("confirm_unique_sources") or 0)
+    if have < MIN_OTHER_SIGNALS_FOR_ENTRY:
+        print(f"[FXAI][ENTRY] Waiting confluence: have={have} need={MIN_OTHER_SIGNALS_FOR_ENTRY} q_time={stats.get('q_time')} q_side={stats.get('q_side')}")
         _set_status(last_result="Waiting confluence", last_result_at=time.time())
         return "Waiting confluence", 200
 
@@ -1047,6 +1160,11 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
         return "Invalid action", 400
 
     market = get_mt5_market_data(symbol)
+    try:
+        if float(market.get("atr") or 0.0) > 0:
+            _last_atr_by_symbol[symbol] = float(market.get("atr") or 0.0)
+    except Exception:
+        pass
     local_multiplier = _compute_entry_multiplier(
         int(stats.get("confirm_unique_sources") or 0),
         bool(stats.get("strong_after_q")),
@@ -1091,16 +1209,20 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
         final_multiplier = float(_clamp(local_multiplier * float(ai_decision["multiplier"]), 0.5, 2.0))
 
     # ZMQでエントリー指示を送信
+    reason = ai_reason or f"qtrend_entry other_sources={int(stats.get('confirm_unique_sources') or 0)}"
+    payload = {
+        "type": "ORDER",
+        "action": action,
+        "symbol": symbol,
+        "atr": float(market.get("atr") or 0.0),
+        "multiplier": final_multiplier,
+        "reason": reason,
+        "ai_confidence": ai_conf,
+        "ai_reason": ai_reason,
+    }
     zmq_socket.send_json(
         {
-            "type": "ORDER",
-            "action": action,
-            "symbol": symbol,
-            "atr": float(market.get("atr") or 0.0),
-            "multiplier": final_multiplier,
-            "reason": ai_reason,
-            "ai_confidence": ai_conf,
-            "ai_reason": ai_reason,
+            **payload,
         }
     )
 
@@ -1124,7 +1246,7 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
     )
 
     _mark_qtrend_executed(symbol, q_time)
-    print(f"[FXAI][ZMQ] Order sent: {action} {symbol} with multiplier {final_multiplier}")
+    print(f"[FXAI][ZMQ] Order sent: {payload}")
     return "OK", 200
 
 
@@ -1294,7 +1416,10 @@ def webhook():
         return "Invalid data", 400
 
     now = time.time()
-    symbol = data.get("symbol", SYMBOL)
+    requested_symbol = _extract_symbol_from_webhook(data)
+    symbol, sym_ok = _ensure_mt5_symbol_selected(requested_symbol)
+    if not sym_ok:
+        print(f"[FXAI][WARN] MT5 symbol_select failed for '{requested_symbol}'. Using '{symbol}' (may still be unavailable).")
 
     _set_status(
         last_webhook_at=now,
@@ -1341,6 +1466,25 @@ def webhook():
 
     normalized = _normalize_signal_fields(signal)
 
+    print(
+        "[FXAI][WEBHOOK] recv "
+        + json.dumps(
+            {
+                "symbol": symbol,
+                "source": normalized.get("source"),
+                "side": normalized.get("side"),
+                "signal_type": normalized.get("signal_type"),
+                "event": normalized.get("event"),
+                "confirmed": normalized.get("confirmed"),
+                "strength": normalized.get("strength"),
+                "time": normalized.get("signal_time"),
+                "raw_source": source_in,
+                "raw_action": raw_action,
+            },
+            ensure_ascii=False,
+        )
+    )
+
     # Determine Q-Trend trigger early (used for both management and optional add-on entries)
     qtrend_trigger = (normalized.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and normalized.get("side") in {"buy", "sell"})
 
@@ -1352,7 +1496,8 @@ def webhook():
         # Optional: allow add-on entries when SAME-DIRECTION Q-Trend arrives
         if not (ALLOW_ADD_ON_ENTRIES and qtrend_trigger and net_side in {"buy", "sell"} and normalized.get("side") == net_side):
             # 管理対象外のソースはAI呼び出しを避けて保存のみ（コスト/レート制御）
-            if (normalized.get("source") or "") not in {"Q-Trend", "FVG", "Zones", "OSGFC"}:
+            # NOTE: 正規化後のQ-Trendは Q-Trend-Strong/Normal
+            if (normalized.get("source") or "") not in {"Q-Trend-Strong", "Q-Trend-Normal", "FVG", "Zones", "OSGFC"}:
                 _set_status(last_result="Stored (mgmt ignored source)", last_result_at=time.time())
                 return "Stored", 200
 
@@ -1370,7 +1515,7 @@ def webhook():
                 is_reversal_like = (
                     (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
                     and (
-                        (src == "Q-Trend")
+                        (src in {"Q-Trend-Strong", "Q-Trend-Normal"})
                         or (src == "FVG" and evt == "fvg_touch")
                         or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
                     )
@@ -1434,11 +1579,7 @@ def webhook():
                     t_mode = ai_decision.get("trail_mode", "NORMAL")
                     
                     # JSONに trail_mode を含めて送信
-                    zmq_socket.send_json({
-                        "type": "CLOSE_SIGNAL", 
-                        "reason": decision_reason,
-                        "trail_mode": t_mode 
-                    })
+                    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": t_mode})
                     _set_status(
                         last_result="HOLD",
                         last_result_at=time.time(),
@@ -1460,6 +1601,28 @@ def webhook():
     if not stats:
         _set_status(last_result="Stored", last_result_at=time.time())
         return "Stored", 200
+
+    # Debug summary for entry decision
+    try:
+        print(
+            "[FXAI][ENTRY] stats "
+            + json.dumps(
+                {
+                    "q_time": stats.get("q_time"),
+                    "q_side": stats.get("q_side"),
+                    "q_source": stats.get("q_source"),
+                    "q_age_sec": int(now - float(stats.get("q_time") or now)),
+                    "confirm_unique_sources": stats.get("confirm_unique_sources"),
+                    "confirm_signals": stats.get("confirm_signals"),
+                    "opp_unique_sources": stats.get("opp_unique_sources"),
+                    "opp_signals": stats.get("opp_signals"),
+                    "cancel_due_to_opposite_bar_close": stats.get("cancel_due_to_opposite_bar_close"),
+                },
+                ensure_ascii=False,
+            )
+        )
+    except Exception:
+        pass
 
     q_time = float(stats.get("q_time") or now)
     q_age_sec = int(now - q_time)
