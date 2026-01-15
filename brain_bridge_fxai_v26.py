@@ -29,9 +29,15 @@ SYMBOL = os.getenv("SYMBOL", "GOLD")
 
 # --- v2.6 confluence params ---
 CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
+# Q-Trendの直前シグナルも合流として拾う（Touch -> Bounce -> Trigger を取りこぼさない）
+CONFLUENCE_PRE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_PRE_LOOKBACK_SEC", "300"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
 # 旧EA(QTrendMinOtherAlerts)のデフォルトに合わせる: 別アラート2つでENTRY
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "2"))
+
+# --- Debug (optional) ---
+CONFLUENCE_DEBUG = os.getenv("CONFLUENCE_DEBUG", "false").lower() == "true"
+CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 
 # --- Signal retention / freshness ---
 SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))     # 通常シグナル: 20分
@@ -543,6 +549,8 @@ def get_qtrend_anchor_stats(target_symbol: str):
     weighted_confirm_score = 0.0
     weighted_oppose_score = 0.0
 
+    dbg_rows = [] if CONFLUENCE_DEBUG else None
+
     # Zones presence is meaningful even if it happened before Q-Trend.
     # Count recent zone confirmations (within ZONE_LOOKBACK_SEC by receive_time).
     for s in normalized:
@@ -553,9 +561,37 @@ def get_qtrend_anchor_stats(target_symbol: str):
 
     for s in normalized:
         st = float(s.get("signal_time") or s.get("receive_time") or 0)
-        if st < q_time:
+        # Q-Trendの前後ウィンドウで合流を集計する
+        # - 過去方向: q_time - CONFLUENCE_PRE_LOOKBACK_SEC まで拾う（直前のタッチ→反発→Qトリガーを拾う）
+        # - 未来方向: 既存の CONFLUENCE_LOOKBACK_SEC を維持
+        pre_lb = max(0, int(CONFLUENCE_PRE_LOOKBACK_SEC or 0))
+        if st < (q_time - pre_lb):
+            if dbg_rows is not None:
+                dbg_rows.append({
+                    "st": st,
+                    "src": s.get("source"),
+                    "side": s.get("side"),
+                    "evt": s.get("event"),
+                    "conf": s.get("confirmed"),
+                    "sig_type": s.get("signal_type"),
+                    "counted": False,
+                    "bucket": "SKIP",
+                    "reason": "before_pre_window",
+                })
             continue
         if CONFLUENCE_LOOKBACK_SEC > 0 and st > (q_time + CONFLUENCE_LOOKBACK_SEC):
+            if dbg_rows is not None:
+                dbg_rows.append({
+                    "st": st,
+                    "src": s.get("source"),
+                    "side": s.get("side"),
+                    "evt": s.get("event"),
+                    "conf": s.get("confirmed"),
+                    "sig_type": s.get("signal_type"),
+                    "counted": False,
+                    "bucket": "SKIP",
+                    "reason": "after_post_window",
+                })
             continue
 
         src = s.get("source")
@@ -580,6 +616,7 @@ def get_qtrend_anchor_stats(target_symbol: str):
         # 旧EA互換: 反対側のbar_closeが来たらキャンセル（レンジ往復ビンタ回避）
         if (
             (not cancel_due_to_opposite_bar_close)
+            and st >= q_time
             and (confirmed or "").lower() == "bar_close"
             and side in {"buy", "sell"}
             and side != q_side
@@ -620,29 +657,112 @@ def get_qtrend_anchor_stats(target_symbol: str):
 
         # Ignore unnamed sources to avoid counting malformed alerts as confluence.
         if not src:
+            if dbg_rows is not None:
+                dbg_rows.append({
+                    "st": st,
+                    "src": src,
+                    "side": side,
+                    "evt": event,
+                    "conf": confirmed,
+                    "sig_type": sig_type,
+                    "counted": False,
+                    "bucket": "SKIP",
+                    "reason": "missing_source",
+                })
             continue
 
-        # 旧EA互換: 合流として数えるのは
-        # - bar_close
-        # - intrabar でも strength=strong のみ例外で許可
-        # かつ trend_filter は合流カウントから除外
+        # 合流カウント
+        # - bar_close は常に合流OK
+        # - intrabar は原則 strength=strong のみ
+        #   ただし「Zones/FVGのtouch系」は normal でも合流として数える（直近タッチ→反発→Qトリガーの再現）
+        # - trend_filter は原則除外。ただし OSGFC は「1票」として合流に含める
         conf_l = (confirmed or "").lower()
         strength_l = (s.get("strength") or "").lower()
-        confluence_ok = (conf_l == "bar_close") or (conf_l == "intrabar" and strength_l == "strong")
-        is_trend_filter = (sig_type == "trend_filter")
+        is_touch_event = (event in {"fvg_touch", "zone_retrace_touch", "zone_touch"})
+        is_zone_or_fvg_touch = (src in {"Zones", "FVG"}) and is_touch_event
+        intrabar_ok = (conf_l == "intrabar") and (strength_l == "strong" or is_zone_or_fvg_touch)
+        confluence_ok = (conf_l == "bar_close") or intrabar_ok
+        exclude_from_confluence_count = (sig_type == "trend_filter") and (src != "OSGFC")
+
+        counted = False
+        bucket = "SKIP"
+        reason = ""
 
         if side == q_side:
-            if confluence_ok and (not is_trend_filter):
+            if confluence_ok and (not exclude_from_confluence_count):
                 confirm_signals += 1
                 confirm_unique_sources.add(src)
+                counted = True
+                bucket = "CONFIRM"
+                reason = "counted"
             weighted_confirm_score += (w * event_weight)
             if s.get("strength") == "strong":
                 strong_after_q = True
+            if dbg_rows is not None and (not counted):
+                if exclude_from_confluence_count:
+                    reason = "excluded_trend_filter"
+                elif not confluence_ok:
+                    reason = "not_confluence_ok"
+                else:
+                    reason = "same_side_not_counted"
         elif side in {"buy", "sell"}:
-            if confluence_ok and (not is_trend_filter):
+            if confluence_ok and (not exclude_from_confluence_count):
                 opp_signals += 1
                 opp_unique_sources.add(src)
+                counted = True
+                bucket = "OPPOSE"
+                reason = "counted"
             weighted_oppose_score += (w * event_weight)
+            if dbg_rows is not None and (not counted):
+                if exclude_from_confluence_count:
+                    reason = "excluded_trend_filter"
+                elif not confluence_ok:
+                    reason = "not_confluence_ok"
+                else:
+                    reason = "opp_side_not_counted"
+        else:
+            if dbg_rows is not None:
+                reason = "no_side"
+
+        if dbg_rows is not None:
+            dbg_rows.append({
+                "st": st,
+                "src": src,
+                "side": side,
+                "evt": event,
+                "conf": confirmed,
+                "sig_type": sig_type,
+                "strength": s.get("strength"),
+                "counted": bool(counted),
+                "bucket": bucket,
+                "reason": reason,
+            })
+
+    if dbg_rows is not None:
+        try:
+            dbg_rows_sorted = sorted(dbg_rows, key=lambda r: float(r.get("st") or 0.0))
+        except Exception:
+            dbg_rows_sorted = dbg_rows
+        print(
+            "[FXAI][CONFLUENCE][DBG] "
+            + json.dumps(
+                {
+                    "symbol": target_symbol,
+                    "q_time": q_time,
+                    "q_side": q_side,
+                    "pre_window_sec": int(CONFLUENCE_PRE_LOOKBACK_SEC or 0),
+                    "post_window_sec": int(CONFLUENCE_LOOKBACK_SEC or 0),
+                    "min_other_needed": int(MIN_OTHER_SIGNALS_FOR_ENTRY or 0),
+                    "confirm_unique_sources": max(0, len(confirm_unique_sources) - 1),
+                    "confirm_signals": confirm_signals,
+                    "opp_unique_sources": max(0, len(opp_unique_sources) - 1),
+                    "opp_signals": opp_signals,
+                    "lines": dbg_rows_sorted[: max(1, int(CONFLUENCE_DEBUG_MAX_LINES or 80))],
+                    "truncated": len(dbg_rows_sorted) > max(1, int(CONFLUENCE_DEBUG_MAX_LINES or 80)),
+                },
+                ensure_ascii=False,
+            )
+        )
 
     return {
         "q_time": q_time,
