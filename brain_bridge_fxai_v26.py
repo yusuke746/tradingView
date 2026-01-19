@@ -2,8 +2,8 @@ import os
 import json
 import time
 import socket
-from datetime import datetime, timezone
-from threading import Lock
+from datetime import datetime, timezone, timedelta
+from threading import Lock, Thread
 from typing import Optional, Dict, Any
 
 import zmq
@@ -25,12 +25,29 @@ load_dotenv()
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "80"))
 ZMQ_PORT = int(os.getenv("ZMQ_PORT", "5555"))
 ZMQ_BIND = os.getenv("ZMQ_BIND", f"tcp://*:{ZMQ_PORT}")
+
+# --- ZMQ Heartbeat (EA -> Python) ---
+ZMQ_HEARTBEAT_ENABLED = os.getenv("ZMQ_HEARTBEAT_ENABLED", "true").lower() == "true"
+ZMQ_HEARTBEAT_PORT = int(os.getenv("ZMQ_HEARTBEAT_PORT", "5556"))
+ZMQ_HEARTBEAT_BIND = os.getenv("ZMQ_HEARTBEAT_BIND", f"tcp://*:{ZMQ_HEARTBEAT_PORT}")
+ZMQ_HEARTBEAT_TIMEOUT_SEC = float(os.getenv("ZMQ_HEARTBEAT_TIMEOUT_SEC", "5.0"))
+
+# Heartbeat stale policy
+# - freeze: block both ENTRY and management (HOLD/CLOSE) when heartbeat is stale
+HEARTBEAT_STALE_MODE = os.getenv("HEARTBEAT_STALE_MODE", "freeze").strip().lower()
+
+# Optional: discretionary close before weekend
+WEEKEND_CLOSE_ENABLED = os.getenv("WEEKEND_CLOSE_ENABLED", "false").lower() == "true"
+WEEKEND_CLOSE_TZ = os.getenv("WEEKEND_CLOSE_TZ", "local").strip().lower()  # local|utc|broker
+WEEKEND_CLOSE_WEEKDAY = int(os.getenv("WEEKEND_CLOSE_WEEKDAY", "4"))  # 0=Mon ... 4=Fri
+WEEKEND_CLOSE_HOUR = int(os.getenv("WEEKEND_CLOSE_HOUR", "23"))
+WEEKEND_CLOSE_MINUTE = int(os.getenv("WEEKEND_CLOSE_MINUTE", "50"))
+WEEKEND_CLOSE_WINDOW_MIN = int(os.getenv("WEEKEND_CLOSE_WINDOW_MIN", "20"))
+WEEKEND_CLOSE_POLL_SEC = float(os.getenv("WEEKEND_CLOSE_POLL_SEC", "5.0"))
 SYMBOL = os.getenv("SYMBOL", "GOLD")
 
-# --- v2.6 confluence params ---
-CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
-# Q-Trendの直前シグナルも合流として拾う（Touch -> Bounce -> Trigger を取りこぼさない）
-CONFLUENCE_PRE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_PRE_LOOKBACK_SEC", "300"))
+# --- Confluence params (Source of Truth: Q-Trend ±5 minutes) ---
+CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "300"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
 # 旧EA(QTrendMinOtherAlerts)のデフォルトに合わせる: 別アラート2つでENTRY
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "2"))
@@ -46,6 +63,10 @@ SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))
 ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "86400"))        # デフォルト24時間
 ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", str(SIGNAL_LOOKBACK_SEC)))
 
+# Signal (Q-Trend/FVG/OSGFC/ZoneDetector etc) retention around Q-Trend anchor.
+# New spec: keep signals within +/- 5 minutes of Q-Trend.
+SIGNAL_QTREND_WINDOW_SEC = int(os.getenv("SIGNAL_QTREND_WINDOW_SEC", "300"))
+
 # Cache file name
 CACHE_FILE = os.getenv("CACHE_FILE", "signals_cache.json")
 
@@ -57,16 +78,19 @@ AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
 # If set, require the token to match either header `X-Webhook-Token` or JSON field `token`.
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
-# --- AI entry filter (v2.7 hybrid upgrade) ---
-# 旧EAはQ-Trendトリガーエントリーをローカル(非AI)で実行していたため、
-# デフォルトはAIフィルターOFF（必要なら env でON）。
-AI_ENTRY_ENABLED = os.getenv("AI_ENTRY_ENABLED", "false").lower() == "true"
-AI_ENTRY_MIN_CONFIDENCE = max(0, min(100, int(os.getenv("AI_ENTRY_MIN_CONFIDENCE", "70"))))
+# --- AI entry scoring (Source of Truth) ---
+# - Call OpenAI ONLY when local confluence exists
+# - Execute only if Confluence Score >= 70
+AI_ENTRY_MIN_SCORE = max(1, min(100, int(os.getenv("AI_ENTRY_MIN_SCORE", "70"))))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
-# on AI error: "skip" (safest) or "default_allow"
-AI_ENTRY_FALLBACK = os.getenv("AI_ENTRY_FALLBACK", "skip").strip().lower()
-AI_ENTRY_DEFAULT_CONFIDENCE = int(os.getenv("AI_ENTRY_DEFAULT_CONFIDENCE", "50"))
-AI_ENTRY_DEFAULT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_MULTIPLIER", "1.0"))
+# on AI error: always safest = do not enter
+AI_ENTRY_FALLBACK = "skip"
+AI_ENTRY_DEFAULT_SCORE = int(os.getenv("AI_ENTRY_DEFAULT_SCORE", "50"))
+AI_ENTRY_DEFAULT_LOT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_LOT_MULTIPLIER", "1.0"))
+
+# Add-on (pyramiding) behavior
+ALLOW_ADD_ON_ENTRIES = os.getenv("ALLOW_ADD_ON_ENTRIES", "true").lower() == "true"
+ADDON_MAX_ENTRIES_PER_QTREND = max(1, int(os.getenv("ADDON_MAX_ENTRIES_PER_QTREND", "2")))
 
 # --- AI close/hold management (Day Trading) ---
 AI_CLOSE_ENABLED = os.getenv("AI_CLOSE_ENABLED", "true").lower() == "true"
@@ -77,11 +101,7 @@ AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "60.0"))
 AI_CLOSE_FALLBACK = os.getenv("AI_CLOSE_FALLBACK", "hold").strip().lower()
 AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "50"))
 
-# --- Position add-on / pyramiding (optional) ---
-# If true: when positions are open, a SAME-DIRECTION Q-Trend trigger can still go through ENTRY gating.
-# Default false to preserve conservative behavior.
-ALLOW_ADD_ON_ENTRIES = os.getenv("ALLOW_ADD_ON_ENTRIES", "false").lower() == "true"
-# If true: allow multiple entries for the same qtrend anchor time (advanced; default false).
+# If true: allow multiple entries for the same qtrend anchor time (advanced).
 ALLOW_MULTI_ENTRY_SAME_QTREND = os.getenv("ALLOW_MULTI_ENTRY_SAME_QTREND", "false").lower() == "true"
 
 # --- Webhook compatibility / safety ---
@@ -98,11 +118,10 @@ API_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "7.0"))
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# If no OpenAI client is available, AI-entry gating cannot run.
-# In that case, disable AI_ENTRY to avoid blocking entries unexpectedly.
-if AI_ENTRY_ENABLED and not client:
-    print("[FXAI][WARN] AI_ENTRY_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI entry filter.")
-    AI_ENTRY_ENABLED = False
+# Entry scoring is mandatory under the new spec. If no OpenAI client is available,
+# the safest behavior is to never enter (we still run the server for visibility).
+if not client:
+    print("[FXAI][WARN] OPENAI_API_KEY is missing. ENTRY scoring is disabled -> entries will be blocked (safety).")
 
 if AI_CLOSE_ENABLED and not client:
     print("[FXAI][WARN] AI_CLOSE_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI close/hold management.")
@@ -187,6 +206,12 @@ _last_status: Dict[str, Any] = {
     "last_mgmt_reason": None,
     "last_mgmt_at": None,
     "last_mgmt_throttled": None,
+
+    # Heartbeat (EA -> Python)
+    "heartbeat_enabled": bool(ZMQ_HEARTBEAT_ENABLED),
+    "heartbeat_timeout_sec": float(ZMQ_HEARTBEAT_TIMEOUT_SEC),
+    "last_heartbeat_at": None,
+    "last_heartbeat_payload": None,
 }
 
 
@@ -201,6 +226,17 @@ def _get_status_snapshot() -> Dict[str, Any]:
     # add lightweight cache stats without holding status lock
     with signals_lock:
         snap["signals_cache_len"] = len(signals_cache)
+
+    if bool(snap.get("heartbeat_enabled")):
+        last_hb = snap.get("last_heartbeat_at")
+        now = time.time()
+        age = None
+        fresh = False
+        if isinstance(last_hb, (int, float)) and float(last_hb) > 0:
+            age = float(now - float(last_hb))
+            fresh = age <= float(snap.get("heartbeat_timeout_sec") or ZMQ_HEARTBEAT_TIMEOUT_SEC)
+        snap["heartbeat_age_sec"] = age
+        snap["heartbeat_fresh"] = fresh
     return snap
 
 
@@ -219,8 +255,172 @@ def _check_port_bindable(host: str, port: int) -> Optional[str]:
         except Exception:
             pass
 
+
+def _heartbeat_is_fresh(now_ts: Optional[float] = None) -> bool:
+    """Return True if EA heartbeat is fresh (or heartbeat is disabled)."""
+    if not ZMQ_HEARTBEAT_ENABLED:
+        return True
+    if now_ts is None:
+        now_ts = time.time()
+    with _status_lock:
+        last_hb = _last_status.get("last_heartbeat_at")
+    if not isinstance(last_hb, (int, float)):
+        return False
+    if float(last_hb) <= 0:
+        return False
+    return (float(now_ts) - float(last_hb)) <= float(ZMQ_HEARTBEAT_TIMEOUT_SEC)
+
+
+def _summarize_heartbeat_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        keep = {}
+        for k in (
+            "type",
+            "ts",
+            "trade_server_ts",
+            "gmt_ts",
+            "server_gmt_offset_sec",
+            "symbol",
+            "account",
+            "login",
+            "server",
+            "ok",
+            "equity",
+            "balance",
+            "positions",
+            "net_side",
+            "halt",
+            "magic",
+        ):
+            if k in payload:
+                keep[k] = payload.get(k)
+        if keep:
+            return keep
+        return {"keys": list(payload.keys())[:20]}
+    if isinstance(payload, str):
+        return payload[:200]
+    return payload
+
+
+_weekend_close_last_sent_week_by_symbol: Dict[str, str] = {}
+
+
+def _now_for_weekend_close() -> datetime:
+    if WEEKEND_CLOSE_TZ == "broker":
+        with _status_lock:
+            payload = _last_status.get("last_heartbeat_payload")
+        if isinstance(payload, dict):
+            ts = payload.get("trade_server_ts") or payload.get("ts")
+            try:
+                ts_f = float(ts)
+                if ts_f > 0:
+                    # Interpret broker's "server time" epoch as UTC for weekday/hour matching.
+                    return datetime.fromtimestamp(ts_f, tz=timezone.utc)
+            except Exception:
+                pass
+        # Fallback: local timezone
+        return datetime.now().astimezone()
+    if WEEKEND_CLOSE_TZ == "utc":
+        return datetime.now(timezone.utc)
+    return datetime.now().astimezone()
+
+
+def _week_key(dt: datetime) -> str:
+    iso = dt.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def _is_within_weekend_close_window(dt: datetime) -> bool:
+    if not WEEKEND_CLOSE_ENABLED:
+        return False
+    if int(dt.weekday()) != int(WEEKEND_CLOSE_WEEKDAY):
+        return False
+    close_dt = dt.replace(hour=int(WEEKEND_CLOSE_HOUR), minute=int(WEEKEND_CLOSE_MINUTE), second=0, microsecond=0)
+    window_sec = max(0, int(WEEKEND_CLOSE_WINDOW_MIN)) * 60
+    start_dt = close_dt - timedelta(seconds=window_sec)
+    return start_dt <= dt <= close_dt
+
+
+def _weekend_close_loop() -> None:
+    """Optionally closes positions shortly before weekend (best-effort)."""
+    if not WEEKEND_CLOSE_ENABLED:
+        return
+
+    while True:
+        try:
+            dt = _now_for_weekend_close()
+            if not _is_within_weekend_close_window(dt):
+                time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+                continue
+
+            wk = _week_key(dt)
+            sym = (SYMBOL or "").strip().upper() or "GOLD"
+            last = _weekend_close_last_sent_week_by_symbol.get(sym)
+            if last == wk:
+                time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+                continue
+
+            # Need fresh heartbeat so EA can actually receive CLOSE.
+            if not _heartbeat_is_fresh(now_ts=time.time()):
+                _set_status(last_result="Weekend close pending (heartbeat stale)", last_result_at=time.time())
+                time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+                continue
+
+            pos_summary = get_mt5_positions_summary(sym)
+            if int((pos_summary or {}).get("positions_open") or 0) <= 0:
+                _weekend_close_last_sent_week_by_symbol[sym] = wk
+                _set_status(last_result="Weekend close skipped (no positions)", last_result_at=time.time())
+                time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+                continue
+
+            zmq_socket.send_json({"type": "CLOSE", "reason": "weekend_discretionary_close"})
+            _weekend_close_last_sent_week_by_symbol[sym] = wk
+            _set_status(
+                last_result="Weekend CLOSE sent",
+                last_result_at=time.time(),
+                last_mgmt_action="CLOSE",
+                last_mgmt_confidence=None,
+                last_mgmt_reason="weekend_discretionary_close",
+                last_mgmt_at=time.time(),
+                last_mgmt_throttled=None,
+            )
+            time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+        except Exception as e:
+            _set_status(last_result=f"Weekend close loop error: {e}", last_result_at=time.time())
+            time.sleep(max(1.0, float(WEEKEND_CLOSE_POLL_SEC)))
+
+
+def _heartbeat_receiver_loop() -> None:
+    """Blocking loop that receives heartbeat messages from EA via ZMQ."""
+    if not ZMQ_HEARTBEAT_ENABLED:
+        return
+
+    hb = context.socket(zmq.PULL)
+    hb.bind(ZMQ_HEARTBEAT_BIND)
+    hb.setsockopt(zmq.RCVTIMEO, 1000)  # 1s
+
+    while True:
+        try:
+            msg = hb.recv_string()
+        except zmq.error.Again:
+            continue
+        except Exception as e:
+            _set_status(last_result=f"Heartbeat recv error: {e}", last_result_at=time.time())
+            continue
+
+        try:
+            payload = json.loads(msg)
+        except Exception:
+            payload = {"raw": msg}
+
+        _set_status(
+            last_heartbeat_at=time.time(),
+            last_heartbeat_payload=_summarize_heartbeat_payload(payload),
+        )
+
 # --- De-dupe / throttle ---
 _executed_qtrend_times_by_symbol: Dict[str, list] = {}
+_executed_qtrend_entry_counts_by_symbol: Dict[str, Dict[float, int]] = {}
 EXECUTED_QTREND_RETENTION_SEC = int(os.getenv("EXECUTED_QTREND_RETENTION_SEC", "86400"))
 
 _last_ai_attempt_key = None
@@ -241,11 +441,19 @@ def _qtime_equal(a: float, b: float, eps: float = 1e-4) -> bool:
 
 
 def _was_qtrend_executed(symbol: str, q_time: float) -> bool:
-    arr = _executed_qtrend_times_by_symbol.get(symbol, [])
-    for t in arr:
-        if _qtime_equal(t, q_time):
+    m = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
+    for t, c in m.items():
+        if c > 0 and _qtime_equal(t, q_time):
             return True
     return False
+
+
+def _qtrend_entry_count(symbol: str, q_time: float) -> int:
+    m = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
+    for t, c in m.items():
+        if _qtime_equal(t, q_time):
+            return int(c or 0)
+    return 0
 
 
 def _mark_qtrend_executed(symbol: str, q_time: float) -> None:
@@ -266,9 +474,102 @@ def _mark_qtrend_executed(symbol: str, q_time: float) -> None:
 
     _executed_qtrend_times_by_symbol[symbol] = keep
 
+    # maintain per-qtrend entry counts
+    counts = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
+    # prune counts that are no longer in keep
+    keep_set = set()
+    for t in keep:
+        try:
+            keep_set.add(float(t))
+        except Exception:
+            continue
+    pruned = {}
+    for t, c in counts.items():
+        try:
+            tt = float(t)
+            if any(_qtime_equal(tt, k) for k in keep_set):
+                pruned[tt] = int(c or 0)
+        except Exception:
+            continue
+
+    # increment this q_time
+    qt = float(q_time)
+    found_key = None
+    for t in pruned.keys():
+        if _qtime_equal(t, qt):
+            found_key = t
+            break
+    if found_key is None:
+        found_key = qt
+    pruned[found_key] = int(pruned.get(found_key, 0) or 0) + 1
+    _executed_qtrend_entry_counts_by_symbol[symbol] = pruned
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _stable_round_time(t: Optional[float], resolution_sec: float = 1.0) -> Optional[float]:
+    try:
+        if t is None:
+            return None
+        tt = float(t)
+        if resolution_sec <= 0:
+            return tt
+        return round(tt / float(resolution_sec)) * float(resolution_sec)
+    except Exception:
+        return None
+
+
+def _signal_dedupe_key(s: Dict[str, Any]) -> str:
+    """Create a stable de-duplication key from a (preferably normalized) signal."""
+    symbol = (s.get("symbol") or "").strip().upper()
+    source = (s.get("source") or "").strip()
+    event = (s.get("event") or "").strip().lower()
+    sig_type = (s.get("signal_type") or "").strip().lower()
+    confirmed = (s.get("confirmed") or "").strip().lower()
+    side = (s.get("side") or "").strip().lower()
+
+    # Prefer signal_time when present, fallback to receive_time.
+    t = s.get("signal_time")
+    if t is None:
+        t = s.get("receive_time")
+    t_rounded = _stable_round_time(t, 1.0)
+    if t_rounded is None:
+        t_rounded = 0.0
+
+    # Key includes fields that define the economic meaning of an alert.
+    return f"{symbol}|{source}|{event}|{sig_type}|{confirmed}|{side}|{t_rounded:.0f}"
+
+
+def _append_signal_dedup_locked(signal: Dict[str, Any], dedupe_window_sec: float = 120.0) -> bool:
+    """Append a signal into cache with de-duplication.
+
+    Returns True if appended, False if treated as a duplicate.
+    """
+    if not isinstance(signal, dict):
+        return False
+
+    now = time.time()
+    key = _signal_dedupe_key(signal)
+
+    # Fast scan from the end (most recent first).
+    for prev in reversed(signals_cache):
+        try:
+            prev_key = _signal_dedupe_key(prev)
+            if prev_key != key:
+                continue
+            # If same key seen recently, treat as duplicate.
+            prt = float(prev.get("receive_time") or 0.0)
+            if prt > 0 and (now - prt) <= float(dedupe_window_sec or 0.0):
+                return False
+            # Same key regardless of age is also a duplicate in practice.
+            return False
+        except Exception:
+            continue
+
+    signals_cache.append(signal)
+    return True
 
 
 def _parse_signal_time_to_epoch(value):
@@ -362,18 +663,37 @@ def _load_cache():
         with open(CACHE_FILE, 'r') as f:
             data = json.load(f)
             if isinstance(data, list):
+                recovered = 0
                 with signals_lock:
-                    signals_cache.extend(data)
-                print(f"[FXAI] Cache loaded: {len(data)} signals recovered.")
+                    for raw in data:
+                        if not isinstance(raw, dict):
+                            continue
+                        # Ensure minimal fields
+                        if not raw.get("receive_time"):
+                            raw = dict(raw)
+                            raw["receive_time"] = time.time()
+                        if raw.get("symbol"):
+                            raw = dict(raw)
+                            raw["symbol"] = str(raw.get("symbol") or "").strip().upper()
+                        normalized = _normalize_signal_fields(raw)
+                        if _append_signal_dedup_locked(normalized):
+                            recovered += 1
+
+                    # prune immediately on boot to avoid stale context
+                    _prune_signals_cache_locked(time.time())
+
+                print(f"[FXAI] Cache loaded: {recovered} signals recovered.")
     except Exception as e:
         print(f"[FXAI][WARN] Failed to load cache: {e}")
 
 def _save_cache_locked():
     """シグナルキャッシュをファイルに保存する (Lock保持中に呼ぶこと)"""
     try:
-        # アトミック書き込みが理想だが、簡易的に上書き
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(signals_cache, f)
+        # Atomic-ish write: write temp then replace.
+        tmp = f"{CACHE_FILE}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(signals_cache, f, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)
     except Exception as e:
         print(f"[FXAI][WARN] Failed to save cache: {e}")
 
@@ -386,6 +706,19 @@ def _prune_signals_cache_locked(now: float) -> None:
     に分離し、古いtouchを合流として誤認するバグを防ぐ。
     """
     keep_list = []
+
+    # Collect Q-Trend anchors currently in cache (for Signal retention rule).
+    qtrend_times = []
+    for s in signals_cache:
+        try:
+            src = (s.get("source") or "").strip()
+            side = (s.get("side") or "").strip().lower()
+            if src in {"Q-Trend-Strong", "Q-Trend-Normal"} and side in {"buy", "sell"}:
+                st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
+                if st > 0:
+                    qtrend_times.append(st)
+        except Exception:
+            continue
 
     for s in signals_cache:
         src_raw = (s.get("source") or "").strip().lower()
@@ -414,20 +747,57 @@ def _prune_signals_cache_locked(now: float) -> None:
             "bounce",
         }
 
+        rt = float(s.get("receive_time", now) or now)
+        age = now - rt
+
         if is_zones:
             if (sig_type in {"structure", "zones", "zone"} and event in zone_presence_events) or event in zone_presence_events:
                 limit_sec = ZONE_LOOKBACK_SEC
-            elif any(m in event for m in zone_touch_markers):
+                if age < float(limit_sec or ZONE_LOOKBACK_SEC):
+                    keep_list.append(s)
+                continue
+            if any(m in event for m in zone_touch_markers):
                 limit_sec = ZONE_TOUCH_LOOKBACK_SEC
-            else:
-                # 不明なZonesイベントは長期保持せず、誤認を避けるため短期で消す
-                limit_sec = SIGNAL_LOOKBACK_SEC
-        else:
-            limit_sec = SIGNAL_LOOKBACK_SEC
+                if age < float(limit_sec or ZONE_TOUCH_LOOKBACK_SEC):
+                    keep_list.append(s)
+                continue
 
-        age = now - float(s.get("receive_time", now) or now)
-        if age < float(limit_sec or SIGNAL_LOOKBACK_SEC):
-            keep_list.append(s)
+            # Unknown Zones-like events: keep short to avoid false confluence.
+            limit_sec = SIGNAL_LOOKBACK_SEC
+            if age < float(limit_sec or SIGNAL_LOOKBACK_SEC):
+                keep_list.append(s)
+            continue
+
+        # Non-Zones: apply stricter Signal retention around Q-Trend.
+        src_raw2 = (s.get("source") or "").strip()
+        side2 = (s.get("side") or "").strip().lower()
+        is_qtrend = (src_raw2 in {"Q-Trend-Strong", "Q-Trend-Normal"} and side2 in {"buy", "sell"})
+
+        if is_qtrend:
+            # Keep Q-Trend itself for a short period so add-on evidence can arrive.
+            limit_sec = SIGNAL_LOOKBACK_SEC
+            if age < float(limit_sec or SIGNAL_LOOKBACK_SEC):
+                keep_list.append(s)
+            continue
+
+        # Other signals: keep only if they are within +/-5min of any cached Q-Trend.
+        st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
+        if st <= 0:
+            continue
+
+        # Hard cap to avoid unbounded growth.
+        if age >= float(SIGNAL_LOOKBACK_SEC or 1200):
+            continue
+
+        window = float(SIGNAL_QTREND_WINDOW_SEC or 300)
+        if qtrend_times:
+            keep = any(abs(st - qt) <= window for qt in qtrend_times)
+            if keep:
+                keep_list.append(s)
+        else:
+            # No Q-Trend anchor yet: keep briefly to allow pre-window evidence.
+            if (now - st) <= window:
+                keep_list.append(s)
 
     if len(keep_list) != len(signals_cache):
         signals_cache[:] = keep_list
@@ -503,6 +873,12 @@ def get_qtrend_anchor_stats(target_symbol: str):
     if not normalized:
         return None
 
+    # Allowed evidence sources under the new spec.
+    # NOTE: Q-Trend itself is an anchor, not a confluence evidence.
+    # Primary: normalized names used by _normalize_signal_fields.
+    # Compatibility: keep older/raw template names to avoid accidental drops.
+    allowed_evidence_sources = {"Zones", "FVG", "OSGFC", "ZonesDetector", "LuxAlgo_FVG"}
+
     # Q-Trend: Normal/Strong が混在する場合は Strong を優先
     q_candidates = []
     for s in normalized:
@@ -559,13 +935,11 @@ def get_qtrend_anchor_stats(target_symbol: str):
             if rt > 0 and (now - rt) <= float(ZONE_LOOKBACK_SEC):
                 zones_confirmed_recent += 1
 
+    window = max(0, int(CONFLUENCE_WINDOW_SEC or 300))
     for s in normalized:
         st = float(s.get("signal_time") or s.get("receive_time") or 0)
-        # Q-Trendの前後ウィンドウで合流を集計する
-        # - 過去方向: q_time - CONFLUENCE_PRE_LOOKBACK_SEC まで拾う（直前のタッチ→反発→Qトリガーを拾う）
-        # - 未来方向: 既存の CONFLUENCE_LOOKBACK_SEC を維持
-        pre_lb = max(0, int(CONFLUENCE_PRE_LOOKBACK_SEC or 0))
-        if st < (q_time - pre_lb):
+        # Source of Truth: Q-Trend ± 5 minutes
+        if st < (q_time - window):
             if dbg_rows is not None:
                 dbg_rows.append({
                     "st": st,
@@ -579,7 +953,7 @@ def get_qtrend_anchor_stats(target_symbol: str):
                     "reason": "before_pre_window",
                 })
             continue
-        if CONFLUENCE_LOOKBACK_SEC > 0 and st > (q_time + CONFLUENCE_LOOKBACK_SEC):
+        if st > (q_time + window):
             if dbg_rows is not None:
                 dbg_rows.append({
                     "st": st,
@@ -611,6 +985,23 @@ def get_qtrend_anchor_stats(target_symbol: str):
                 is_strong_momentum = True
                 q_trigger_type = "Strong"
                 momentum_factor = 1.5
+            continue
+
+        # Allowlist: ignore unknown sources to avoid unintended confluence votes.
+        if src not in allowed_evidence_sources:
+            if dbg_rows is not None:
+                dbg_rows.append({
+                    "st": st,
+                    "src": src,
+                    "side": side,
+                    "evt": event,
+                    "conf": confirmed,
+                    "sig_type": sig_type,
+                    "strength": s.get("strength"),
+                    "counted": False,
+                    "bucket": "SKIP",
+                    "reason": "source_not_allowed",
+                })
             continue
 
         # 旧EA互換: 反対側のbar_closeが来たらキャンセル（レンジ往復ビンタ回避）
@@ -750,8 +1141,7 @@ def get_qtrend_anchor_stats(target_symbol: str):
                     "symbol": target_symbol,
                     "q_time": q_time,
                     "q_side": q_side,
-                    "pre_window_sec": int(CONFLUENCE_PRE_LOOKBACK_SEC or 0),
-                    "post_window_sec": int(CONFLUENCE_LOOKBACK_SEC or 0),
+                    "window_sec": int(window),
                     "min_other_needed": int(MIN_OTHER_SIGNALS_FOR_ENTRY or 0),
                     "confirm_unique_sources": max(0, len(confirm_unique_sources) - 1),
                     "confirm_signals": confirm_signals,
@@ -1040,42 +1430,37 @@ def _call_openai_with_retry(prompt: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _validate_ai_entry_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """期待するJSON: {action: "ENTRY"|"SKIP", confidence: 0-100, multiplier: 0.5-1.5, reason: str}。
-
-    NOTE: multiplier は "local_multiplier に掛ける係数"（0.5-1.5）として扱う。
-    """
+def _validate_ai_entry_score(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """期待するJSON: {confluence_score: 1-100, lot_multiplier: 0.5-2.0, reason: str(optional)}"""
     if not isinstance(decision, dict):
         return None
 
-    action = decision.get("action")
-    if not isinstance(action, str):
-        return None
-    action = action.strip().upper()
-    if action not in {"ENTRY", "SKIP"}:
-        return None
+    # accept multiple field names to be robust
+    score = decision.get("confluence_score")
+    if score is None:
+        score = decision.get("score")
+    if score is None:
+        score = decision.get("confidence")
+    score = _safe_int(score, AI_ENTRY_DEFAULT_SCORE)
+    score = int(_clamp(score, 1, 100))
 
-    confidence = _safe_int(decision.get("confidence"), AI_ENTRY_DEFAULT_CONFIDENCE)
-    confidence = int(_clamp(confidence, 0, 100))
-
-    # multiplier must be explicitly present
-    if "multiplier" not in decision:
-        return None
-    multiplier = _safe_float(decision.get("multiplier"), AI_ENTRY_DEFAULT_MULTIPLIER)
-    multiplier = float(_clamp(multiplier, 0.5, 1.5))
+    lot_mult = decision.get("lot_multiplier")
+    if lot_mult is None:
+        lot_mult = decision.get("multiplier")
+    lot_mult = _safe_float(lot_mult, AI_ENTRY_DEFAULT_LOT_MULTIPLIER)
+    lot_mult = float(_clamp(lot_mult, 0.5, 2.0))
 
     reason = decision.get("reason")
     if not isinstance(reason, str):
         reason = ""
     reason = reason.strip()
 
-    return {"action": action, "confidence": confidence, "multiplier": multiplier, "reason": reason}
+    return {"confluence_score": score, "lot_multiplier": lot_mult, "reason": reason}
 
 
 def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
-    """Q-Trend発生時の環境を渡し、AIに ENTRY/SKIP と倍率を判断させる専用プロンプト。"""
+    """Q-Trend発生時の環境を渡し、AIに Confluence Score(1-100) と Lot Multiplier を出させる。"""
 
-    # statsが無い（まだQ-Trendを保持していない/鮮度で弾かれた）場合でも500にしない。
     if not stats:
         minimal_payload = {
             "symbol": symbol,
@@ -1087,24 +1472,21 @@ def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: st
                 "atr_m5_approx": market.get("atr"),
                 "spread_points": market.get("spread"),
             },
-            "note": "No Q-Trend stats available yet. Be conservative.",
+            "note": "No Q-Trend stats available yet. Score conservatively.",
         }
         return (
-            "You are a strict trading entry decision engine.\n"
-            "Decide if the proposed entry should be executed now.\n"
+            "You are a strict confluence scoring engine for algorithmic trading.\n"
             "Return ONLY strict JSON with this schema:\n"
-            '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+            '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
             "ContextJSON:\n"
             + json.dumps(minimal_payload, ensure_ascii=False)
         )
 
-    # 既存のコンテキスト構築を流用しつつ、出力スキーマだけ仕様に合わせる
     base = _build_entry_filter_prompt(symbol, market, stats, action)
     return (
-        "You are a strict trading entry decision engine.\n"
-        "Decide if the proposed entry should be executed now.\n"
-        "Return ONLY strict JSON with this schema:\n"
-        '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+        "You are a strict confluence scoring engine for algorithmic trading.\n"
+        "Given the technical context, output ONLY strict JSON with this schema:\n"
+        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
         "--- CONTEXT BELOW (do not output it) ---\n"
         + base
     )
@@ -1211,11 +1593,11 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
             "spread_flag": spread_flag,
         },
         "constraints": {
-            "multiplier_factor_range": [0.5, 1.5],
-            "confidence_range": [0, 100],
+            "confluence_score_range": [1, 100],
+            "lot_multiplier_range": [0.5, 2.0],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
-            "note": "Return JSON only. IMPORTANT: If 'zones_confirmed_recent' > 0 (HTF Structure exists) but 'confluence_score' is low, strictly reduce confidence. Strong momentum (trigger_type=Strong) can justify ENTRY even with some opposite touch signals if EV/space is good.",
+            "note": "Return JSON only. Score 70+ only when confluence is truly strong AND market conditions (ATR vs spread, trend alignment) are acceptable. Be conservative on uncertainty.",
         },
     }
 
@@ -1232,14 +1614,20 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         "- If some opposite FVG/Zones exist BUT trend is aligned and ATR-to-spread is healthy and confluence is decent, you MAY still approve ENTRY (EV can remain positive).\n"
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
-        "Return ONLY strict JSON schema (multiplier is a FACTOR for local_multiplier):\n"
-        '{"action": "ENTRY"|"SKIP", "confidence": 0-100, "multiplier": 0.5-1.5, "reason": "short"}\n\n'
+        "Return ONLY strict JSON schema:\n"
+        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
 
 
-def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict, now: float) -> tuple[str, int]:
+def _attempt_entry_from_stats(
+    symbol: str,
+    stats: dict,
+    normalized_trigger: dict,
+    now: float,
+    pos_summary: Optional[dict] = None,
+) -> tuple[str, int]:
     """Try to place an order based on latest Q-Trend stats.
 
     Returns (message, http_status).
@@ -1261,12 +1649,27 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
         _set_status(last_result="Stale Q-Trend", last_result_at=time.time())
         return "Stale Q-Trend", 200
 
-    # strict duplicate prevention for the same q_time
-    if (not ALLOW_MULTI_ENTRY_SAME_QTREND) and _was_qtrend_executed(symbol, q_time):
+    # strict duplicate / add-on control per q_time
+    entry_count = _qtrend_entry_count(symbol, q_time)
+    positions_open = int((pos_summary or {}).get("positions_open") or 0)
+    net_side = ((pos_summary or {}).get("net_side") or "flat").lower()
+
+    # Determine max entries allowed for this q_time
+    max_entries = 1
+    if positions_open > 0 and ALLOW_ADD_ON_ENTRIES and net_side in {"buy", "sell"}:
+        # add-on only for same direction
+        if net_side == ((stats.get("q_side") or "").lower()):
+            max_entries = int(ADDON_MAX_ENTRIES_PER_QTREND or 2)
+
+    if ALLOW_MULTI_ENTRY_SAME_QTREND:
+        # still keep a sane upper bound if configured; default is handled above
+        max_entries = max(max_entries, int(ADDON_MAX_ENTRIES_PER_QTREND or 2))
+
+    if entry_count >= int(max_entries):
         _set_status(last_result="Duplicate", last_result_at=time.time())
         return "Duplicate", 200
 
-    # confluence requirement
+    # confluence requirement (local)
     have = int(stats.get("confirm_unique_sources") or 0)
     if have < MIN_OTHER_SIGNALS_FOR_ENTRY:
         print(f"[FXAI][ENTRY] Waiting confluence: have={have} need={MIN_OTHER_SIGNALS_FOR_ENTRY} q_time={stats.get('q_time')} q_side={stats.get('q_side')}")
@@ -1278,6 +1681,11 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
     if action not in {"BUY", "SELL"}:
         _set_status(last_result="Invalid action", last_result_at=time.time())
         return "Invalid action", 400
+
+    # Safety: block entries when EA heartbeat is stale/missing.
+    if not _heartbeat_is_fresh(now_ts=now):
+        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
+        return "Blocked by heartbeat", 503
 
     market = get_mt5_market_data(symbol)
     try:
@@ -1291,42 +1699,44 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
     )
 
     final_multiplier = float(local_multiplier)
-    ai_conf = None
+    ai_score = None
     ai_reason = ""
 
-    # AIフィルター（有効時のみ）
-    if AI_ENTRY_ENABLED:
-        # Throttle AI calls but allow re-eval when a NEW supporting signal arrives.
-        global _last_ai_attempt_key, _last_ai_attempt_at
-        trig_src = (normalized_trigger.get("source") or "")
-        trig_evt = (normalized_trigger.get("event") or "")
-        trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
-        attempt_key = f"{symbol}:{action}:{q_time:.3f}:{trig_src}:{trig_evt}:{trig_st:.3f}"
+    # AI scoring is mandatory once local confluence exists.
+    # Throttle AI calls but allow re-eval when NEW supporting signal arrives.
+    global _last_ai_attempt_key, _last_ai_attempt_at
+    trig_src = (normalized_trigger.get("source") or "")
+    trig_evt = (normalized_trigger.get("event") or "")
+    trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
+    attempt_key = f"{symbol}:{action}:{q_time:.3f}:{trig_src}:{trig_evt}:{trig_st:.3f}"
 
-        now_mono = time.time()
-        if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
-            _set_status(last_result="AI throttled", last_result_at=time.time())
-            return "AI throttled", 200
-        _last_ai_attempt_key = attempt_key
-        _last_ai_attempt_at = now_mono
+    now_mono = time.time()
+    if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+        _set_status(last_result="AI throttled", last_result_at=time.time())
+        return "AI throttled", 200
+    _last_ai_attempt_key = attempt_key
+    _last_ai_attempt_at = now_mono
 
-        ai_decision = _ai_entry_filter(symbol, market, stats, action)
-        if (not ai_decision) or ai_decision["action"] != "ENTRY" or ai_decision["confidence"] < AI_ENTRY_MIN_CONFIDENCE:
-            print(f"[FXAI][AI] Entry blocked by AI. Decision: {ai_decision}")
-            if (not ai_decision) and AI_ENTRY_FALLBACK == "default_allow":
-                ai_decision = {
-                    "action": "ENTRY",
-                    "confidence": int(_clamp(AI_ENTRY_DEFAULT_CONFIDENCE, 0, 100)),
-                    "multiplier": float(_clamp(AI_ENTRY_DEFAULT_MULTIPLIER, 0.5, 1.5)),
-                    "reason": "fallback_default_allow",
-                }
-            else:
-                _set_status(last_result="Blocked by AI", last_result_at=time.time())
-                return "Blocked by AI", 403
+    ai_decision = _ai_entry_score(symbol, market, stats, action)
+    if not ai_decision:
+        # Safety: do not enter on AI error.
+        _set_status(last_result="Blocked by AI (no score)", last_result_at=time.time())
+        return "Blocked by AI", 503
 
-        ai_conf = ai_decision["confidence"]
-        ai_reason = ai_decision.get("reason") or ""
-        final_multiplier = float(_clamp(local_multiplier * float(ai_decision["multiplier"]), 0.5, 2.0))
+    ai_score = int(ai_decision.get("confluence_score") or 0)
+    ai_reason = ai_decision.get("reason") or ""
+    lot_mult = float(ai_decision.get("lot_multiplier") or 1.0)
+
+    if ai_score < AI_ENTRY_MIN_SCORE:
+        _set_status(last_result="Blocked by AI", last_result_at=time.time())
+        return "Blocked by AI", 403
+
+    final_multiplier = float(_clamp(local_multiplier * lot_mult, 0.5, 2.0))
+
+    # Re-check heartbeat just before sending the order (avoid race).
+    if not _heartbeat_is_fresh(now_ts=time.time()):
+        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
+        return "Blocked by heartbeat", 503
 
     # ZMQでエントリー指示を送信
     reason = ai_reason or f"qtrend_entry other_sources={int(stats.get('confirm_unique_sources') or 0)}"
@@ -1337,7 +1747,7 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
         "atr": float(market.get("atr") or 0.0),
         "multiplier": final_multiplier,
         "reason": reason,
-        "ai_confidence": ai_conf,
+        "ai_confidence": ai_score,
         "ai_reason": ai_reason,
     }
     zmq_socket.send_json(
@@ -1354,7 +1764,7 @@ def _attempt_entry_from_stats(symbol: str, stats: dict, normalized_trigger: dict
             "symbol": symbol,
             "atr": float(market.get("atr") or 0.0),
             "multiplier": final_multiplier,
-            "ai_confidence": ai_conf,
+            "ai_confidence": ai_score,
             "ai_reason": ai_reason,
             "q_time": q_time,
             "trigger": {
@@ -1504,20 +1914,22 @@ def _ai_close_hold_decision(symbol: str, market: dict, stats: Optional[dict], po
     return validated
 
 
-def _ai_entry_filter(symbol: str, market: dict, stats: dict, action: str) -> Optional[Dict[str, Any]]:
-    """AIにエントリーの許可を求めるフィルター。"""
+def _ai_entry_score(symbol: str, market: dict, stats: dict, action: str) -> Optional[Dict[str, Any]]:
+    """AIに Confluence Score(1-100) と Lot Multiplier を出させる。"""
+    if not client:
+        return None
     prompt = _build_entry_logic_prompt(symbol, market, stats, action)
     decision = _call_openai_with_retry(prompt)
     if not decision:
-        print("[FXAI][AI] No response from AI. Using fallback.")
+        print("[FXAI][AI] No response from AI (entry score).")
         return None
 
-    validated_decision = _validate_ai_entry_decision(decision)
-    if not validated_decision:
-        print("[FXAI][AI] Invalid AI response. Using fallback.")
+    validated = _validate_ai_entry_score(decision)
+    if not validated:
+        print("[FXAI][AI] Invalid AI response (entry score).")
         return None
 
-    return validated_decision
+    return validated
 
 
 @app.route('/webhook', methods=['POST'])
@@ -1579,12 +1991,16 @@ def webhook():
         "receive_time": now,
     }
 
-    with signals_lock:
-        signals_cache.append(signal)
-        _prune_signals_cache_locked(now)
-        _save_cache_locked()  # ★追加: 更新されたキャッシュをファイルに保存
-
     normalized = _normalize_signal_fields(signal)
+
+    with signals_lock:
+        appended = _append_signal_dedup_locked(normalized)
+        _prune_signals_cache_locked(now)
+        _save_cache_locked()
+
+    if not appended:
+        _set_status(last_result="Duplicate webhook", last_result_at=time.time())
+        return "Duplicate", 200
 
     print(
         "[FXAI][WEBHOOK] recv "
@@ -1608,54 +2024,51 @@ def webhook():
     # Determine Q-Trend trigger early (used for both management and optional add-on entries)
     qtrend_trigger = (normalized.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and normalized.get("side") in {"buy", "sell"})
 
+    # --- HEARTBEAT STALE POLICY ---
+    # Under freeze mode: do not send any management (HOLD/CLOSE) nor entries while heartbeat is stale.
+    if (HEARTBEAT_STALE_MODE == "freeze") and (not _heartbeat_is_fresh(now_ts=now)):
+        _set_status(last_result="Frozen by heartbeat", last_result_at=time.time())
+        return "Frozen by heartbeat", 200
+
     # --- POSITION MANAGEMENT MODE (CLOSE/HOLD) ---
     pos_summary = get_mt5_positions_summary(symbol)
     if int(pos_summary.get("positions_open") or 0) > 0:
         net_side = (pos_summary.get("net_side") or "flat").lower()
+        market = get_mt5_market_data(symbol)
+        stats = get_qtrend_anchor_stats(symbol)
 
-        # Optional: allow add-on entries when SAME-DIRECTION Q-Trend arrives
-        if not (ALLOW_ADD_ON_ENTRIES and qtrend_trigger and net_side in {"buy", "sell"} and normalized.get("side") == net_side):
-            # 管理対象外のソースはAI呼び出しを避けて保存のみ（コスト/レート制御）
-            # NOTE: 正規化後のQ-Trendは Q-Trend-Strong/Normal
-            if (normalized.get("source") or "") not in {"Q-Trend-Strong", "Q-Trend-Normal", "FVG", "Zones", "OSGFC"}:
-                _set_status(last_result="Stored (mgmt ignored source)", last_result_at=time.time())
-                return "Stored", 200
+        # Always attempt management AI when positions are open (recommended timing, cost not a concern).
+        if AI_CLOSE_ENABLED:
+            global _last_close_attempt_key, _last_close_attempt_at
+            now_mono = time.time()
 
-            market = get_mt5_market_data(symbol)
-            stats = get_qtrend_anchor_stats(symbol)
+            src = (normalized.get("source") or "")
+            evt = (normalized.get("event") or "")
+            sig_side = (normalized.get("side") or "").lower()
 
-            if AI_CLOSE_ENABLED:
-                global _last_close_attempt_key, _last_close_attempt_at
-                now_mono = time.time()
-
-                src = (normalized.get("source") or "")
-                evt = (normalized.get("event") or "")
-                sig_side = (normalized.get("side") or "").lower()
-
-                is_reversal_like = (
-                    (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
-                    and (
-                        (src in {"Q-Trend-Strong", "Q-Trend-Normal"})
-                        or (src == "FVG" and evt == "fvg_touch")
-                        or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
-                    )
+            is_reversal_like = (
+                (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
+                and (
+                    (src in {"Q-Trend-Strong", "Q-Trend-Normal"})
+                    or (src == "FVG" and evt == "fvg_touch")
+                    or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
                 )
+            )
 
-                last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
-                if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
-                    _set_status(
-                        last_result="AI close throttled",
-                        last_result_at=time.time(),
-                        last_mgmt_throttled={
-                            "cooldown_sec": float(AI_CLOSE_THROTTLE_SEC),
-                            "since_last_call_sec": round(float(last_attempt_age), 3),
-                            "reason": "cooldown",
-                            "bypass": False,
-                            "incoming": {"source": src, "event": evt, "side": sig_side},
-                        },
-                    )
-                    return "AI close throttled", 200
-
+            last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
+            if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
+                _set_status(
+                    last_result="AI close throttled",
+                    last_result_at=time.time(),
+                    last_mgmt_throttled={
+                        "cooldown_sec": float(AI_CLOSE_THROTTLE_SEC),
+                        "since_last_call_sec": round(float(last_attempt_age), 3),
+                        "reason": "cooldown",
+                        "bypass": False,
+                        "incoming": {"source": src, "event": evt, "side": sig_side},
+                    },
+                )
+            else:
                 attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
                 _last_close_attempt_key = attempt_key
                 _last_close_attempt_at = now_mono
@@ -1678,43 +2091,37 @@ def webhook():
                             last_mgmt_at=time.time(),
                         )
                         zmq_socket.send_json({"type": "HOLD", "reason": "ai_fallback_hold"})
-                        return "HOLD", 200
+                        # even on fallback HOLD, we can still consider add-on entries below
+                        ai_decision = {"action": "HOLD", "confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
 
-                decision_action = ai_decision["action"]
-                decision_reason = ai_decision.get("reason") or ""
+                decision_action = (ai_decision or {}).get("action")
+                decision_reason = (ai_decision or {}).get("reason") or ""
                 if decision_action == "CLOSE":
                     zmq_socket.send_json({"type": "CLOSE", "reason": decision_reason})
                     _set_status(
                         last_result="CLOSE",
                         last_result_at=time.time(),
                         last_mgmt_action="CLOSE",
-                        last_mgmt_confidence=int(ai_decision.get("confidence") or 0),
+                        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
                         last_mgmt_reason=decision_reason,
                         last_mgmt_at=time.time(),
                         last_mgmt_throttled=None,
                     )
                     return "CLOSE", 200
                 else:
-                    # AIの決定から trail_mode を取得
-                    t_mode = ai_decision.get("trail_mode", "NORMAL")
-                    
-                    # JSONに trail_mode を含めて送信
+                    t_mode = (ai_decision or {}).get("trail_mode", "NORMAL")
                     zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": t_mode})
                     _set_status(
                         last_result="HOLD",
                         last_result_at=time.time(),
                         last_mgmt_action="HOLD",
-                        last_mgmt_confidence=int(ai_decision.get("confidence") or 0),
+                        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
                         last_mgmt_reason=decision_reason,
                         last_mgmt_at=time.time(),
                         last_mgmt_throttled=None,
                     )
-                    return "HOLD", 200
-            else:
-                _set_status(last_result="Stored (mgmt disabled)", last_result_at=time.time())
-                return "Stored", 200
 
-        # if add-on entries allowed, fall through to entry section
+        # After management decision (unless CLOSED), allow add-on entries by falling through to ENTRY section.
 
     # --- ENTRY MODE (Q-Trend reservation + follow-up entry) ---
     stats = get_qtrend_anchor_stats(symbol)
@@ -1757,11 +2164,11 @@ def webhook():
     supporting_sources = {"FVG", "Zones", "OSGFC"}
 
     if qtrend_trigger:
-        return _attempt_entry_from_stats(symbol, stats, normalized, now)
+        return _attempt_entry_from_stats(symbol, stats, normalized, now, pos_summary)
 
     if has_pending_qtrend and src in supporting_sources:
         # this is the key upgrade: immediate re-eval on new evidence within Q-Trend TTL
-        return _attempt_entry_from_stats(symbol, stats, normalized, now)
+        return _attempt_entry_from_stats(symbol, stats, normalized, now, pos_summary)
 
     _set_status(last_result="Stored", last_result_at=time.time())
     return "Stored", 200
@@ -1785,9 +2192,23 @@ def status():
 if __name__ == '__main__':
     print(f"[FXAI] webhook http://0.0.0.0:{WEBHOOK_PORT}/webhook")
     print(f"[FXAI] ZMQ bind: {ZMQ_BIND}")
+    if ZMQ_HEARTBEAT_ENABLED:
+        print(f"[FXAI] ZMQ heartbeat bind: {ZMQ_HEARTBEAT_BIND} (timeout={ZMQ_HEARTBEAT_TIMEOUT_SEC}s)")
+    print(f"[FXAI] heartbeat stale mode: {HEARTBEAT_STALE_MODE}")
+    if WEEKEND_CLOSE_ENABLED:
+        print(
+            f"[FXAI] weekend close enabled: tz={WEEKEND_CLOSE_TZ} "
+            f"weekday={WEEKEND_CLOSE_WEEKDAY} time={WEEKEND_CLOSE_HOUR:02d}:{WEEKEND_CLOSE_MINUTE:02d} "
+            f"window_min={WEEKEND_CLOSE_WINDOW_MIN} poll_sec={WEEKEND_CLOSE_POLL_SEC}"
+        )
     print(f"[FXAI] symbol: {SYMBOL}")
     # ★追加: 起動時にキャッシュを復元
     _load_cache()
+
+    if ZMQ_HEARTBEAT_ENABLED:
+        Thread(target=_heartbeat_receiver_loop, daemon=True).start()
+    if WEEKEND_CLOSE_ENABLED:
+        Thread(target=_weekend_close_loop, daemon=True).start()
 
     # Port pre-check behavior:
     # - "warn"   (default): warn if port seems unavailable, but still attempt to start Flask
