@@ -310,11 +310,20 @@ def _now_for_weekend_close() -> datetime:
         with _status_lock:
             payload = _last_status.get("last_heartbeat_payload")
         if isinstance(payload, dict):
-            ts = payload.get("trade_server_ts") or payload.get("ts")
             try:
+                gmt_ts = payload.get("gmt_ts")
+                offset = payload.get("server_gmt_offset_sec")
+                if gmt_ts is not None and offset is not None:
+                    # Convert UTC epoch to broker's server wall-clock by applying the offset.
+                    base = float(gmt_ts)
+                    off = float(offset)
+                    if base > 0:
+                        return datetime.fromtimestamp(base + off, tz=timezone.utc)
+
+                ts = payload.get("trade_server_ts") or payload.get("ts")
                 ts_f = float(ts)
                 if ts_f > 0:
-                    # Interpret broker's "server time" epoch as UTC for weekday/hour matching.
+                    # Fallback: treat the provided epoch as already in broker wall-clock.
                     return datetime.fromtimestamp(ts_f, tz=timezone.utc)
             except Exception:
                 pass
