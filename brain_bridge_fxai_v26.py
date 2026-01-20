@@ -4,7 +4,7 @@ import time
 import socket
 from datetime import datetime, timezone, timedelta
 from threading import Lock, Thread
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import zmq
 import MetaTrader5 as mt5
@@ -12,157 +12,256 @@ from flask import Flask, request
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# fxChartAI v2.6思想寄せ：
-# - エントリーは「Q-Trendトリガー + 合流」をローカルで決定（AIにBUY/SELLをさせない）
-# - AIは基本「管理（CLOSE/HOLD）」用途。BUY/SELLは無視。
-# - v2.6相当の期待値改善（鮮度・重複送信）をPython側で実装
-# - 日次損失/最大ポジなどのハードガードは MT5(EA) 側で最終判断
-
 app = Flask(__name__)
+
+# Load .env early
 load_dotenv()
 
-# --- Basic settings ---
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    v = os.getenv(name, default)
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# --- Core config ---
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "80"))
-ZMQ_PORT = int(os.getenv("ZMQ_PORT", "5555"))
-ZMQ_BIND = os.getenv("ZMQ_BIND", f"tcp://*:{ZMQ_PORT}")
+WEBHOOK_TOKEN = str(os.getenv("WEBHOOK_TOKEN", "") or "").strip()
 
-# --- ZMQ Heartbeat (EA -> Python) ---
-ZMQ_HEARTBEAT_ENABLED = os.getenv("ZMQ_HEARTBEAT_ENABLED", "true").lower() == "true"
-ZMQ_HEARTBEAT_PORT = int(os.getenv("ZMQ_HEARTBEAT_PORT", "5556"))
-ZMQ_HEARTBEAT_BIND = os.getenv("ZMQ_HEARTBEAT_BIND", f"tcp://*:{ZMQ_HEARTBEAT_PORT}")
-ZMQ_HEARTBEAT_TIMEOUT_SEC = float(os.getenv("ZMQ_HEARTBEAT_TIMEOUT_SEC", "5.0"))
+SYMBOL = (os.getenv("SYMBOL", "GOLD") or "GOLD").strip().upper()
 
-# Heartbeat stale policy
-# - freeze: block both ENTRY and management (HOLD/CLOSE) when heartbeat is stale
-HEARTBEAT_STALE_MODE = os.getenv("HEARTBEAT_STALE_MODE", "freeze").strip().lower()
+ZMQ_PORT = str(os.getenv("ZMQ_PORT", "5555") or "5555").strip()
+ZMQ_BIND = str(os.getenv("ZMQ_BIND", "") or "").strip() or f"tcp://*:{ZMQ_PORT}"
 
-# Optional: discretionary close before weekend
-WEEKEND_CLOSE_ENABLED = os.getenv("WEEKEND_CLOSE_ENABLED", "false").lower() == "true"
-WEEKEND_CLOSE_TZ = os.getenv("WEEKEND_CLOSE_TZ", "local").strip().lower()  # local|utc|broker
-WEEKEND_CLOSE_WEEKDAY = int(os.getenv("WEEKEND_CLOSE_WEEKDAY", "4"))  # 0=Mon ... 4=Fri
-WEEKEND_CLOSE_HOUR = int(os.getenv("WEEKEND_CLOSE_HOUR", "23"))
-WEEKEND_CLOSE_MINUTE = int(os.getenv("WEEKEND_CLOSE_MINUTE", "50"))
-WEEKEND_CLOSE_WINDOW_MIN = int(os.getenv("WEEKEND_CLOSE_WINDOW_MIN", "20"))
-WEEKEND_CLOSE_POLL_SEC = float(os.getenv("WEEKEND_CLOSE_POLL_SEC", "5.0"))
-SYMBOL = os.getenv("SYMBOL", "GOLD")
+ZMQ_HEARTBEAT_ENABLED = _env_bool("ZMQ_HEARTBEAT_ENABLED", "1")
+ZMQ_HEARTBEAT_PORT = str(os.getenv("ZMQ_HEARTBEAT_PORT", "5556") or "5556").strip()
+ZMQ_HEARTBEAT_BIND = str(os.getenv("ZMQ_HEARTBEAT_BIND", "") or "").strip() or f"tcp://*:{ZMQ_HEARTBEAT_PORT}"
+ZMQ_HEARTBEAT_TIMEOUT_SEC = float(os.getenv("ZMQ_HEARTBEAT_TIMEOUT_SEC", "10"))
 
-# --- Confluence params (Source of Truth: Q-Trend ±5 minutes) ---
-CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "300"))
+HEARTBEAT_STALE_MODE = str(os.getenv("HEARTBEAT_STALE_MODE", "freeze") or "freeze").strip().lower()
+
+
+# --- Signal cache ---
+CACHE_FILE = str(os.getenv("CACHE_FILE", "signals_cache.json") or "signals_cache.json").strip()
+SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))
+SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", str(SIGNAL_LOOKBACK_SEC)))
+
+CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")
+CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "2.0"))
+# Force flush even if signals keep arriving frequently
+CACHE_FLUSH_FORCE_SEC = float(os.getenv("CACHE_FLUSH_FORCE_SEC", "10.0"))
+
+CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
-# 旧EA(QTrendMinOtherAlerts)のデフォルトに合わせる: 別アラート2つでENTRY
-MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "2"))
 
-# --- Debug (optional) ---
-CONFLUENCE_DEBUG = os.getenv("CONFLUENCE_DEBUG", "false").lower() == "true"
-CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
+ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "1200"))
+ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", "1200"))
 
-# --- Signal retention / freshness ---
-SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))     # 通常シグナル: 20分
-SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", "300"))
-# Zone「存在/確定」情報は長く保持し、touch系イベントは短く保持する
-ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "86400"))        # デフォルト24時間
-ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", str(SIGNAL_LOOKBACK_SEC)))
 
-# Signal (Q-Trend/FVG/OSGFC/ZoneDetector etc) retention around Q-Trend anchor.
-# New spec: keep signals within +/- 5 minutes of Q-Trend.
-SIGNAL_QTREND_WINDOW_SEC = int(os.getenv("SIGNAL_QTREND_WINDOW_SEC", "300"))
+# --- Behavior toggles ---
+ASSUME_ACTION_IS_QTREND = _env_bool("ASSUME_ACTION_IS_QTREND", "0")
+ALLOW_ADD_ON_ENTRIES = _env_bool("ALLOW_ADD_ON_ENTRIES", "1")
+ALLOW_MULTI_ENTRY_SAME_QTREND = _env_bool("ALLOW_MULTI_ENTRY_SAME_QTREND", "0")
+ADDON_MAX_ENTRIES_PER_QTREND = int(os.getenv("ADDON_MAX_ENTRIES_PER_QTREND", "2"))
+ADDON_MAX_ENTRIES_PER_POSITION = int(os.getenv("ADDON_MAX_ENTRIES_PER_POSITION", "5"))
 
-# Cache file name
-CACHE_FILE = os.getenv("CACHE_FILE", "signals_cache.json")
 
-# --- Debug / behavior ---
-FORCE_AI_CALL_WHEN_FLAT = os.getenv("FORCE_AI_CALL_WHEN_FLAT", "false").lower() == "true"
-AI_THROTTLE_SEC = int(os.getenv("AI_THROTTLE_SEC", "10"))
+# --- AI config ---
+OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
+MODEL = str(os.getenv("OPENAI_MODEL", os.getenv("MODEL", "gpt-4o-mini")) or "gpt-4o-mini").strip()
+OPENAI_MODEL = MODEL
 
-# --- Webhook auth (optional) ---
-# If set, require the token to match either header `X-Webhook-Token` or JSON field `token`.
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+API_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "20"))
+API_RETRY_COUNT = int(os.getenv("API_RETRY_COUNT", "3"))
+API_RETRY_WAIT_SEC = float(os.getenv("API_RETRY_WAIT_SEC", "1.5"))
 
-# --- AI entry scoring (Source of Truth) ---
-# - Call OpenAI ONLY when local confluence exists
-# - Execute only if Confluence Score >= 70
-AI_ENTRY_MIN_SCORE = max(1, min(100, int(os.getenv("AI_ENTRY_MIN_SCORE", "70"))))
-AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "4.0"))
-# on AI error: always safest = do not enter
-AI_ENTRY_FALLBACK = "skip"
 AI_ENTRY_DEFAULT_SCORE = int(os.getenv("AI_ENTRY_DEFAULT_SCORE", "50"))
 AI_ENTRY_DEFAULT_LOT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_LOT_MULTIPLIER", "1.0"))
+AI_ENTRY_MIN_SCORE = int(os.getenv("AI_ENTRY_MIN_SCORE", "70"))
+AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "15"))
+ADDON_MIN_AI_SCORE = int(os.getenv("ADDON_MIN_AI_SCORE", str(AI_ENTRY_MIN_SCORE)))
 
-# Add-on (pyramiding) behavior
-ALLOW_ADD_ON_ENTRIES = os.getenv("ALLOW_ADD_ON_ENTRIES", "true").lower() == "true"
-ADDON_MAX_ENTRIES_PER_QTREND = max(1, int(os.getenv("ADDON_MAX_ENTRIES_PER_QTREND", "2")))
+MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
 
-# --- AI close/hold management (Day Trading) ---
-AI_CLOSE_ENABLED = os.getenv("AI_CLOSE_ENABLED", "true").lower() == "true"
-AI_CLOSE_MIN_CONFIDENCE = max(0, min(100, int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "70"))))
-# Default to a conservative cadence; allow immediate evaluation on clear reversal-like signals.
-AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "60.0"))
-# on AI error: "hold" (safest) or "default_close"
-AI_CLOSE_FALLBACK = os.getenv("AI_CLOSE_FALLBACK", "hold").strip().lower()
-AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "50"))
+CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "300"))
+CONFLUENCE_DEBUG = _env_bool("CONFLUENCE_DEBUG", "0")
+CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 
-# If true: allow multiple entries for the same qtrend anchor time (advanced).
-ALLOW_MULTI_ENTRY_SAME_QTREND = os.getenv("ALLOW_MULTI_ENTRY_SAME_QTREND", "false").lower() == "true"
+AI_CLOSE_ENABLED = _env_bool("AI_CLOSE_ENABLED", "1")
+AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "20"))
+AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "55"))
+AI_CLOSE_FALLBACK = str(os.getenv("AI_CLOSE_FALLBACK", "hold") or "hold").strip().lower()
+AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "60"))
 
-# --- Webhook compatibility / safety ---
-# If true, an alert that only contains action=BUY/SELL (without source) is treated as Q-Trend.
-# Default false to avoid accidental Q-Trend triggers.
-ASSUME_ACTION_IS_QTREND = os.getenv("ASSUME_ACTION_IS_QTREND", "false").lower() == "true"
 
-# --- OpenAI ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", os.getenv("MODEL", "gpt-4o-mini"))
-API_RETRY_COUNT = int(os.getenv("API_RETRY_COUNT", "3"))
-API_RETRY_WAIT_SEC = float(os.getenv("API_RETRY_WAIT_SEC", "1.0"))
-API_TIMEOUT_SEC = float(os.getenv("API_TIMEOUT_SEC", "7.0"))
+# --- Local entry safety guards (professional defaults) ---
+# Gold day-trading (M5/M15) tends to suffer when spread is wide or ATR is too small.
+ENTRY_MAX_SPREAD_POINTS = float(os.getenv("ENTRY_MAX_SPREAD_POINTS", "90"))
+ENTRY_MIN_ATR_TO_SPREAD = float(os.getenv("ENTRY_MIN_ATR_TO_SPREAD", "3.0"))
+ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "25"))
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Entry scoring is mandatory under the new spec. If no OpenAI client is available,
-# the safest behavior is to never enter (we still run the server for visibility).
-if not client:
-    print("[FXAI][WARN] OPENAI_API_KEY is missing. ENTRY scoring is disabled -> entries will be blocked (safety).")
+# --- Weekend discretionary close ---
+WEEKEND_CLOSE_ENABLED = _env_bool("WEEKEND_CLOSE_ENABLED", "0")
+WEEKEND_CLOSE_TZ = str(os.getenv("WEEKEND_CLOSE_TZ", "utc") or "utc").strip().lower()
+WEEKEND_CLOSE_WEEKDAY = int(os.getenv("WEEKEND_CLOSE_WEEKDAY", "4"))
+WEEKEND_CLOSE_HOUR = int(os.getenv("WEEKEND_CLOSE_HOUR", "21"))
+WEEKEND_CLOSE_MINUTE = int(os.getenv("WEEKEND_CLOSE_MINUTE", "55"))
+WEEKEND_CLOSE_WINDOW_MIN = int(os.getenv("WEEKEND_CLOSE_WINDOW_MIN", "5"))
+WEEKEND_CLOSE_POLL_SEC = float(os.getenv("WEEKEND_CLOSE_POLL_SEC", "30"))
 
-if AI_CLOSE_ENABLED and not client:
-    print("[FXAI][WARN] AI_CLOSE_ENABLED=true but OPENAI_API_KEY is missing. Disabling AI close/hold management.")
-    AI_CLOSE_ENABLED = False
 
-# --- ZMQ ---
-context = zmq.Context.instance()
-zmq_socket = context.socket(zmq.PUSH)
-zmq_socket.bind(ZMQ_BIND)
+# --- Init external clients ---
+client = None
+context = None
+zmq_socket = None
+_mt5_ready = False
 
-# --- MT5 ---
-if not mt5.initialize():
-    raise SystemExit("MT5初期化失敗")
+_runtime_lock = Lock()
+_runtime_initialized = False
+_runtime_init_error: Optional[str] = None
 
 signals_lock = Lock()
-signals_cache = []  # list[dict]
+signals_cache: List[Dict[str, Any]] = []
 
-# Market-data fallbacks (avoid ORDER blocked by atr=0)
+_cache_dirty = False
+_cache_last_save_at = 0.0
+_cache_last_dirty_at = 0.0
+_cache_flush_thread_started = False
+
+_qtrend_lock = Lock()
+_qtrend_state_by_symbol: Dict[str, Dict[str, Any]] = {}
+
 _last_atr_by_symbol: Dict[str, float] = {}
 
+_addon_lock = Lock()
+_addon_state_by_symbol: Dict[str, Dict[str, Any]] = {}
 
-def _extract_symbol_from_webhook(data: dict) -> str:
-    """TradingView payload variations -> MT5 symbol.
+_entry_lock = Lock()
+_last_order_sent_at_by_symbol: Dict[str, float] = {}
 
-    Accept keys like symbol/ticker and strip exchange prefixes (e.g. "OANDA:XAUUSD").
+# fxChartAI v2.6思想寄せ：
+
+
+def _validate_config() -> List[str]:
+    issues: List[str] = []
+
+    if not ZMQ_BIND:
+        issues.append("ZMQ_BIND is empty")
+    if not WEBHOOK_PORT or int(WEBHOOK_PORT) <= 0:
+        issues.append("WEBHOOK_PORT is invalid")
+
+    if ZMQ_HEARTBEAT_ENABLED and (not ZMQ_HEARTBEAT_BIND):
+        issues.append("ZMQ_HEARTBEAT_ENABLED but ZMQ_HEARTBEAT_BIND is empty")
+
+    if not SYMBOL:
+        issues.append("SYMBOL is empty")
+
+    if not OPENAI_API_KEY:
+        issues.append("OPENAI_API_KEY missing (AI features will be disabled)")
+
+    return issues
+
+
+def init_runtime() -> bool:
+    """Initialize external dependencies.
+
+    IMPORTANT: This is intentionally NOT executed at import-time.
+    It is safe to call multiple times.
     """
-    raw = None
-    for k in ("symbol", "ticker", "tv_symbol", "instrument", "pair"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            raw = v.strip()
-            break
+    global client, context, zmq_socket, _mt5_ready, _runtime_initialized, _runtime_init_error, _cache_flush_thread_started
 
-    if not raw:
-        return SYMBOL
+    with _runtime_lock:
+        if _runtime_initialized:
+            return True
 
-    # OANDA:XAUUSD / FX:GBPUSD
+        issues = _validate_config()
+        for msg in issues:
+            print(f"[FXAI][WARN] {msg}")
+
+        # OpenAI
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+        except Exception as e:
+            client = None
+            print(f"[FXAI][WARN] OpenAI init failed: {e}")
+
+        # ZMQ
+        try:
+            context = zmq.Context()
+            zmq_socket = context.socket(zmq.PUSH)
+            zmq_socket.bind(ZMQ_BIND)
+        except Exception as e:
+            _runtime_init_error = f"ZMQ init failed: {e}"
+            print(f"[FXAI][FATAL] {_runtime_init_error}")
+            return False
+
+        # MT5
+        try:
+            _mt5_ready = bool(mt5.initialize())
+        except Exception as e:
+            _mt5_ready = False
+            _runtime_init_error = f"MT5 init exception: {e}"
+            print(f"[FXAI][FATAL] {_runtime_init_error}")
+            return False
+
+        if not _mt5_ready:
+            _runtime_init_error = "MT5 initialization failed"
+            print(f"[FXAI][FATAL] {_runtime_init_error}")
+            return False
+
+        # Restore cache
+        try:
+            _load_cache()
+        except Exception as e:
+            print(f"[FXAI][WARN] Cache load failed: {e}")
+
+        # Start background loops
+        if ZMQ_HEARTBEAT_ENABLED:
+            Thread(target=_heartbeat_receiver_loop, daemon=True).start()
+        if WEEKEND_CLOSE_ENABLED:
+            Thread(target=_weekend_close_loop, daemon=True).start()
+        if CACHE_ASYNC_FLUSH_ENABLED and (not _cache_flush_thread_started):
+            Thread(target=_cache_flush_loop, daemon=True).start()
+            _cache_flush_thread_started = True
+
+        _runtime_initialized = True
+        _runtime_init_error = None
+        return True
+
+
+def ensure_runtime_initialized() -> bool:
+    """Ensure external dependencies are initialized (for WSGI / first request)."""
+    ok = init_runtime()
+    if not ok:
+        _set_status(last_result="Init failed", last_result_at=time.time(), last_init_error=_runtime_init_error)
+    return ok
+
+
+def _extract_symbol_from_webhook(data: Dict[str, Any]) -> str:
+    """Extract symbol from a TradingView webhook payload.
+
+    Accepts multiple common field names and normalizes like "OANDA:XAUUSD" -> "XAUUSD".
+    """
+    if not isinstance(data, dict):
+        return (SYMBOL or "").strip().upper()
+
+    raw = (
+        data.get("symbol")
+        or data.get("ticker")
+        or data.get("instrument")
+        or data.get("market")
+        or data.get("pair")
+        or ""
+    )
+
+    if raw is None:
+        raw = ""
+    raw = str(raw).strip()
     if ":" in raw:
         raw = raw.split(":")[-1].strip()
-
-    return raw.upper()
+    return raw.upper() if raw else (SYMBOL or "").strip().upper()
 
 
 def _ensure_mt5_symbol_selected(symbol: str) -> tuple[str, bool]:
@@ -428,90 +527,12 @@ def _heartbeat_receiver_loop() -> None:
         )
 
 # --- De-dupe / throttle ---
-_executed_qtrend_times_by_symbol: Dict[str, list] = {}
-_executed_qtrend_entry_counts_by_symbol: Dict[str, Dict[float, int]] = {}
-EXECUTED_QTREND_RETENTION_SEC = int(os.getenv("EXECUTED_QTREND_RETENTION_SEC", "86400"))
-
 _last_ai_attempt_key = None
 _last_ai_attempt_at = 0.0
 
 _last_close_attempt_key = None
 _last_close_attempt_at = 0.0
 
-_last_entry_ai_key = None
-_last_entry_ai_at = 0.0
-
-
-def _qtime_equal(a: float, b: float, eps: float = 1e-4) -> bool:
-    try:
-        return abs(float(a) - float(b)) < float(eps)
-    except Exception:
-        return False
-
-
-def _was_qtrend_executed(symbol: str, q_time: float) -> bool:
-    m = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
-    for t, c in m.items():
-        if c > 0 and _qtime_equal(t, q_time):
-            return True
-    return False
-
-
-def _qtrend_entry_count(symbol: str, q_time: float) -> int:
-    m = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
-    for t, c in m.items():
-        if _qtime_equal(t, q_time):
-            return int(c or 0)
-    return 0
-
-
-def _mark_qtrend_executed(symbol: str, q_time: float) -> None:
-    now = time.time()
-    arr = _executed_qtrend_times_by_symbol.get(symbol, [])
-
-    # prune old
-    keep = []
-    for t in arr:
-        try:
-            if (now - float(t)) <= float(EXECUTED_QTREND_RETENTION_SEC):
-                keep.append(float(t))
-        except Exception:
-            continue
-
-    if not any(_qtime_equal(t, q_time) for t in keep):
-        keep.append(float(q_time))
-
-    _executed_qtrend_times_by_symbol[symbol] = keep
-
-    # maintain per-qtrend entry counts
-    counts = _executed_qtrend_entry_counts_by_symbol.get(symbol, {})
-    # prune counts that are no longer in keep
-    keep_set = set()
-    for t in keep:
-        try:
-            keep_set.add(float(t))
-        except Exception:
-            continue
-    pruned = {}
-    for t, c in counts.items():
-        try:
-            tt = float(t)
-            if any(_qtime_equal(tt, k) for k in keep_set):
-                pruned[tt] = int(c or 0)
-        except Exception:
-            continue
-
-    # increment this q_time
-    qt = float(q_time)
-    found_key = None
-    for t in pruned.keys():
-        if _qtime_equal(t, qt):
-            found_key = t
-            break
-    if found_key is None:
-        found_key = qt
-    pruned[found_key] = int(pruned.get(found_key, 0) or 0) + 1
-    _executed_qtrend_entry_counts_by_symbol[symbol] = pruned
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -616,11 +637,43 @@ def _normalize_signal_fields(signal: dict) -> dict:
     strength = (s.get("strength") or "").strip().lower()
 
     src_lower = src.lower().replace(" ", "").replace("_", "")
-    # Q-Trend: Strong/Normal を source として完全分離する
-    if src_lower in {"q-trend", "qtrend", "qtrendnormal", "q-trendnormal", "qtrend-normal", "q-trend-normal", "qtrendstrong", "q-trendstrong", "qtrend-strong", "q-trend-strong"}:
+    # Q-Trend: accept both legacy names and the new spec strings.
+    # New spec:
+    #   - source: "Q-Trend" (Normal)
+    #   - source: "Q-Trend Strong" (Strong)
+    # Legacy internal:
+    #   - "Q-Trend-Normal" / "Q-Trend-Strong"
+    if src_lower in {
+        "q-trend",
+        "qtrend",
+        "qtrendnormal",
+        "q-trendnormal",
+        "qtrend-normal",
+        "q-trend-normal",
+        "qtrendstrong",
+        "q-trendstrong",
+        "qtrend-strong",
+        "q-trend-strong",
+        "qtrendstrongbuy",
+        "qtrendstrongsell",
+    }:
         is_strong = ("strong" in src_lower) or (strength == "strong")
-        s["source"] = "Q-Trend-Strong" if is_strong else "Q-Trend-Normal"
+        # Keep the new source strings as canonical going forward.
+        s["source"] = "Q-Trend Strong" if is_strong else "Q-Trend"
         s["strength"] = "strong" if is_strong else "normal"
+    elif src_lower in {"qtrendstrong", "qtrend strong".replace(" ", ""), "q-trendstrong"}:
+        s["source"] = "Q-Trend Strong"
+        s["strength"] = "strong"
+    elif src_lower in {"qtrend", "q-trend"}:
+        s["source"] = "Q-Trend"
+        if not s.get("strength"):
+            s["strength"] = "normal"
+    elif src_lower in {"qtrend-normal", "q-trend-normal", "qtrendnormal"}:
+        s["source"] = "Q-Trend"
+        s["strength"] = "normal"
+    elif src_lower in {"qtrend-strong", "q-trend-strong", "qtrendstrong"}:
+        s["source"] = "Q-Trend Strong"
+        s["strength"] = "strong"
     else:
         # Normalize common sources from your alert templates
         if src_lower in {"luxalgo_fvg", "luxalgofvg", "fvg"}:
@@ -652,6 +705,302 @@ def _normalize_signal_fields(signal: dict) -> dict:
         s["signal_time"] = s.get("receive_time")
 
     return s
+
+
+def _is_qtrend_source(source: str) -> bool:
+    src = (source or "").strip().lower().replace("_", "")
+    if not src:
+        return False
+    # Accept both new spec strings and older internal ones.
+    return src in {
+        "q-trend",
+        "qtrend",
+        "q-trendstrong",
+        "qtrendstrong",
+        "q-trend-normal",
+        "qtrend-normal",
+        "q-trend-strong",
+        "qtrend-strong",
+        "q-trendnormal",
+        "qtrendnormal",
+        "qtrendnormalbuy",
+        "qtrendnormalsell",
+        "qtrendstrongbuy",
+        "qtrendstrongsell",
+        "q-trendstrongbuy",
+        "q-trendstrongsell",
+        # canonical outputs from _normalize_signal_fields
+        "q-trendstrong".replace("-", ""),
+        "qtrendstrong".replace("-", ""),
+    } or ("qtrend" in src) or ("q-trend" in src)
+
+
+def _update_qtrend_context_from_signal(normalized: Dict[str, Any]) -> None:
+    """Update in-memory Q-Trend state.
+
+    New spec: Q-Trend is context only; always stored here for the latest environment.
+    Direction uses side (buy/sell) as UP/DOWN equivalent.
+    """
+    if not isinstance(normalized, dict):
+        return
+    symbol = (normalized.get("symbol") or "").strip().upper()
+    if not symbol:
+        return
+
+    side = (normalized.get("side") or "").strip().lower()
+    if side not in {"buy", "sell"}:
+        return
+
+    strength = (normalized.get("strength") or "normal").strip().lower()
+    strength = "strong" if strength == "strong" else "normal"
+
+    now = float(normalized.get("receive_time") or time.time())
+    with _qtrend_lock:
+        _qtrend_state_by_symbol[symbol] = {
+            "side": side,
+            "strength": strength,
+            "updated_at": now,
+            "tf": normalized.get("tf"),
+            "price": normalized.get("price"),
+            "confirmed": normalized.get("confirmed"),
+            "event": normalized.get("event"),
+            "source": normalized.get("source"),
+        }
+
+
+def _get_qtrend_context(symbol: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    if now is None:
+        now = time.time()
+    with _qtrend_lock:
+        st = _qtrend_state_by_symbol.get(sym)
+    if not st:
+        return None
+    updated_at = float(st.get("updated_at") or 0.0)
+    if updated_at <= 0:
+        return None
+
+    # Reuse the existing max age config (originally used for Q-Trend trigger freshness).
+    max_age = float(Q_TREND_MAX_AGE_SEC or 300)
+    if max_age > 0 and (float(now) - updated_at) > max_age:
+        return None
+    return dict(st)
+
+
+def _dir_from_side(side: str) -> str:
+    s = (side or "").strip().lower()
+    if s == "buy":
+        return "UP"
+    if s == "sell":
+        return "DOWN"
+    return "UNKNOWN"
+
+
+def _collect_recent_context_signals(symbol: str, now: float) -> Dict[str, Any]:
+    """Collect recent Zones/FVG context for AI.
+
+    Keeps the payload compact: mainly latest touches and recent confirmed zones.
+    """
+    normalized = _filter_fresh_signals(symbol, now)
+    zones_confirmed_recent = 0
+    latest_zone_touch = None
+    latest_fvg_touch = None
+
+    # We also keep a small list of recent context events for transparency/debugging.
+    recent_events = []
+    for s in sorted(normalized, key=lambda x: float(x.get("signal_time") or x.get("receive_time") or 0.0), reverse=True):
+        src = s.get("source")
+        evt = s.get("event")
+        side = s.get("side")
+        st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
+
+        if src == "Zones" and (s.get("signal_type") == "structure") and (evt == "new_zone_confirmed"):
+            rt = float(s.get("receive_time") or 0.0)
+            if rt > 0 and (now - rt) <= float(ZONE_LOOKBACK_SEC):
+                zones_confirmed_recent += 1
+
+        if src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"} and side in {"buy", "sell"}:
+            if latest_zone_touch is None or st > float(latest_zone_touch.get("signal_time") or 0.0):
+                latest_zone_touch = {
+                    "side": side,
+                    "event": evt,
+                    "signal_time": st,
+                    "confirmed": s.get("confirmed"),
+                    "strength": s.get("strength"),
+                }
+
+        if src == "FVG" and evt == "fvg_touch" and side in {"buy", "sell"}:
+            if latest_fvg_touch is None or st > float(latest_fvg_touch.get("signal_time") or 0.0):
+                latest_fvg_touch = {
+                    "side": side,
+                    "event": evt,
+                    "signal_time": st,
+                    "confirmed": s.get("confirmed"),
+                    "strength": s.get("strength"),
+                }
+
+        if len(recent_events) < 12:
+            if src in {"Zones", "FVG"}:
+                recent_events.append(
+                    {
+                        "source": src,
+                        "event": evt,
+                        "side": side,
+                        "signal_time": st,
+                        "confirmed": s.get("confirmed"),
+                        "strength": s.get("strength"),
+                        "signal_type": s.get("signal_type"),
+                    }
+                )
+
+    return {
+        "zones_confirmed_recent": int(zones_confirmed_recent),
+        "latest_zone_touch": latest_zone_touch,
+        "latest_fvg_touch": latest_fvg_touch,
+        "recent_events": list(recent_events),
+    }
+
+
+def _collect_window_signals_around_trigger(
+    symbol: str,
+    center_ts: float,
+    trigger_side: str,
+    window_sec: float = 300.0,
+) -> Dict[str, Any]:
+    """Collect signals within ±window_sec of the trigger time.
+
+    User requirement: When Lorentzian fires, include cached signals in the same
+    direction within a ±5min window (plus other window signals for transparency).
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return {"center_ts": float(center_ts or 0.0), "window_sec": float(window_sec or 0.0), "aligned": [], "opposed": [], "neutral": []}
+
+    try:
+        center = float(center_ts)
+    except Exception:
+        center = time.time()
+
+    try:
+        w = float(window_sec)
+    except Exception:
+        w = 300.0
+    if w <= 0:
+        w = 300.0
+
+    trig_side = (trigger_side or "").strip().lower()
+
+    with signals_lock:
+        snapshot = [dict(s) for s in signals_cache if isinstance(s, dict)]
+
+    def _sig_ts(s: Dict[str, Any]) -> float:
+        try:
+            return float(s.get("signal_time") or s.get("receive_time") or 0.0)
+        except Exception:
+            return 0.0
+
+    window_raw: List[Dict[str, Any]] = []
+    for s in snapshot:
+        if (s.get("symbol") or "").strip().upper() != sym:
+            continue
+        st = _sig_ts(s)
+        if st <= 0:
+            continue
+        if abs(st - center) > w:
+            continue
+        window_raw.append(s)
+
+    window_raw.sort(key=_sig_ts)
+
+    # Strict allow-listing to keep the window payload high-signal.
+    # User requirement: include Q-Trend (context) in the ±5min window.
+    allowed_sources = {"Q-Trend", "Q-Trend Strong", "Zones", "FVG"}
+    allowed_events_by_source = {
+        # Q-Trend context may not have a strong event taxonomy; allow any.
+        "Q-Trend": None,
+        "Q-Trend Strong": None,
+        # Zones: keep only key touch/structure events.
+        "Zones": {
+            "zone_retrace_touch",
+            "zone_touch",
+            "new_zone_confirmed",
+            "zone_confirmed",
+        },
+        # FVG: keep touch only.
+        "FVG": {"fvg_touch"},
+    }
+
+    # De-duplicate by (source,event,side) keeping the latest by time.
+    best_by_key: Dict[tuple, Dict[str, Any]] = {}
+
+    for s in window_raw:
+        src = (s.get("source") or "")
+        evt = (s.get("event") or "")
+        side = (s.get("side") or "").strip().lower()
+        st = _sig_ts(s)
+
+        if not src:
+            continue
+
+        # Normalize Q-Trend variants that might slip in.
+        if _is_qtrend_source(src):
+            src = "Q-Trend Strong" if (str(s.get("strength") or "").lower() == "strong" or "strong" in str(src).lower()) else "Q-Trend"
+
+        if src not in allowed_sources:
+            continue
+
+        allowed_events = allowed_events_by_source.get(src)
+        if isinstance(allowed_events, set):
+            if (evt or "").strip().lower() not in allowed_events:
+                continue
+
+        # Avoid duplicating the Lorentzian trigger itself in the window list.
+        if src == "Lorentzian" and side == trig_side and abs(st - center) <= 1.0:
+            continue
+
+        compact = {
+            "source": src,
+            "event": evt,
+            "side": side or None,
+            "signal_type": s.get("signal_type"),
+            "strength": s.get("strength"),
+            "confirmed": s.get("confirmed"),
+            "signal_time": st,
+        }
+
+        key = (compact.get("source"), compact.get("event"), compact.get("side"))
+        prev = best_by_key.get(key)
+        if (prev is None) or (float(compact.get("signal_time") or 0.0) >= float(prev.get("signal_time") or 0.0)):
+            best_by_key[key] = compact
+
+    # Split into aligned/opposed/neutral after de-dup.
+    aligned: List[Dict[str, Any]] = []
+    opposed: List[Dict[str, Any]] = []
+    neutral: List[Dict[str, Any]] = []
+
+    for compact in sorted(best_by_key.values(), key=lambda x: float(x.get("signal_time") or 0.0)):
+        side = (compact.get("side") or "")
+        if side in {"buy", "sell"} and trig_side in {"buy", "sell"}:
+            (aligned if side == trig_side else opposed).append(compact)
+        else:
+            neutral.append(compact)
+
+    # Hard cap payload sizes to keep prompts stable.
+    aligned = aligned[-30:]
+    opposed = opposed[-30:]
+    neutral = neutral[-20:]
+
+    return {
+        "center_ts": float(center),
+        "window_sec": float(w),
+        "trigger_side": trig_side,
+        "aligned": aligned,
+        "opposed": opposed,
+        "neutral": neutral,
+        "counts": {"aligned": len(aligned), "opposed": len(opposed), "neutral": len(neutral)},
+    }
 
 
 def _weight_confirmed(confirmed: str) -> float:
@@ -695,6 +1044,57 @@ def _load_cache():
     except Exception as e:
         print(f"[FXAI][WARN] Failed to load cache: {e}")
 
+    # After loading, treat cache as clean.
+    global _cache_dirty, _cache_last_save_at, _cache_last_dirty_at
+    _cache_dirty = False
+    _cache_last_save_at = time.time()
+    _cache_last_dirty_at = 0.0
+
+
+def _mark_cache_dirty_locked(now: Optional[float] = None) -> None:
+    """Mark cache as dirty (must be called with signals_lock held)."""
+    global _cache_dirty, _cache_last_dirty_at
+    if now is None:
+        now = time.time()
+    _cache_dirty = True
+    _cache_last_dirty_at = float(now)
+
+
+def _cache_flush_loop() -> None:
+    """Background loop to flush cache to disk at a controlled interval."""
+    global _cache_last_save_at, _cache_dirty
+    # small sleep to avoid hot loop; ensure >= 0.5s
+    sleep_sec = max(0.5, float(CACHE_FLUSH_INTERVAL_SEC or 2.0))
+    while True:
+        time.sleep(sleep_sec)
+        if not CACHE_ASYNC_FLUSH_ENABLED:
+            continue
+
+        try:
+            now = time.time()
+            with signals_lock:
+                if not _cache_dirty:
+                    continue
+
+                last_save = float(_cache_last_save_at or 0.0)
+                last_dirty = float(_cache_last_dirty_at or 0.0)
+
+                # Flush if we've been dirty long enough OR if a force window passed.
+                should_flush = False
+                if last_dirty > 0 and (now - last_dirty) >= float(CACHE_FLUSH_INTERVAL_SEC or 2.0):
+                    should_flush = True
+                if (now - last_save) >= float(CACHE_FLUSH_FORCE_SEC or 10.0):
+                    should_flush = True
+
+                if not should_flush:
+                    continue
+
+                _save_cache_locked()
+                _cache_last_save_at = now
+                _cache_dirty = False
+        except Exception as e:
+            print(f"[FXAI][WARN] Cache flush loop error: {e}")
+
 def _save_cache_locked():
     """シグナルキャッシュをファイルに保存する (Lock保持中に呼ぶこと)"""
     try:
@@ -715,19 +1115,6 @@ def _prune_signals_cache_locked(now: float) -> None:
     に分離し、古いtouchを合流として誤認するバグを防ぐ。
     """
     keep_list = []
-
-    # Collect Q-Trend anchors currently in cache (for Signal retention rule).
-    qtrend_times = []
-    for s in signals_cache:
-        try:
-            src = (s.get("source") or "").strip()
-            side = (s.get("side") or "").strip().lower()
-            if src in {"Q-Trend-Strong", "Q-Trend-Normal"} and side in {"buy", "sell"}:
-                st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
-                if st > 0:
-                    qtrend_times.append(st)
-        except Exception:
-            continue
 
     for s in signals_cache:
         src_raw = (s.get("source") or "").strip().lower()
@@ -777,36 +1164,11 @@ def _prune_signals_cache_locked(now: float) -> None:
                 keep_list.append(s)
             continue
 
-        # Non-Zones: apply stricter Signal retention around Q-Trend.
-        src_raw2 = (s.get("source") or "").strip()
-        side2 = (s.get("side") or "").strip().lower()
-        is_qtrend = (src_raw2 in {"Q-Trend-Strong", "Q-Trend-Normal"} and side2 in {"buy", "sell"})
-
-        if is_qtrend:
-            # Keep Q-Trend itself for a short period so add-on evidence can arrive.
-            limit_sec = SIGNAL_LOOKBACK_SEC
-            if age < float(limit_sec or SIGNAL_LOOKBACK_SEC):
-                keep_list.append(s)
-            continue
-
-        # Other signals: keep only if they are within +/-5min of any cached Q-Trend.
-        st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
-        if st <= 0:
-            continue
-
-        # Hard cap to avoid unbounded growth.
-        if age >= float(SIGNAL_LOOKBACK_SEC or 1200):
-            continue
-
-        window = float(SIGNAL_QTREND_WINDOW_SEC or 300)
-        if qtrend_times:
-            keep = any(abs(st - qt) <= window for qt in qtrend_times)
-            if keep:
-                keep_list.append(s)
-        else:
-            # No Q-Trend anchor yet: keep briefly to allow pre-window evidence.
-            if (now - st) <= window:
-                keep_list.append(s)
+        # Non-Zones: simple time-based retention (no Q-Trend anchoring).
+        # We keep recent evidence so Lorentzian triggers can reference it.
+        limit_sec = float(SIGNAL_LOOKBACK_SEC or 1200)
+        if age < limit_sec:
+            keep_list.append(s)
 
     if len(keep_list) != len(signals_cache):
         signals_cache[:] = keep_list
@@ -891,9 +1253,9 @@ def get_qtrend_anchor_stats(target_symbol: str):
     # Q-Trend: Normal/Strong が混在する場合は Strong を優先
     q_candidates = []
     for s in normalized:
-        if s.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and s.get("side") in {"buy", "sell"}:
+        if s.get("source") in {"Q-Trend Strong", "Q-Trend", "Q-Trend-Strong", "Q-Trend-Normal"} and s.get("side") in {"buy", "sell"}:
             st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
-            is_strong = (s.get("source") == "Q-Trend-Strong") or (s.get("strength") == "strong")
+            is_strong = (s.get("source") in {"Q-Trend Strong", "Q-Trend-Strong"}) or (s.get("strength") == "strong")
             q_candidates.append((st, 1 if is_strong else 0, s))
 
     latest_q = None
@@ -907,13 +1269,13 @@ def get_qtrend_anchor_stats(target_symbol: str):
     q_time = float(latest_q.get("signal_time") or latest_q.get("receive_time") or now)
     q_side = (latest_q.get("side") or "").lower()
     q_source = (latest_q.get("source") or "")
-    q_is_strong = (q_source == "Q-Trend-Strong") or (latest_q.get("strength") == "strong")
+    q_is_strong = (q_source in {"Q-Trend Strong", "Q-Trend-Strong"}) or (latest_q.get("strength") == "strong")
     q_trigger_type = "Strong" if q_is_strong else "Normal"
     momentum_factor = 1.5 if q_is_strong else 1.0
     is_strong_momentum = bool(q_is_strong)
 
-    confirm_unique_sources = set([q_source or "Q-Trend-Normal"])
-    opp_unique_sources = set([q_source or "Q-Trend-Normal"])
+    confirm_unique_sources = set([q_source or "Q-Trend"])
+    opp_unique_sources = set([q_source or "Q-Trend"])
     confirm_signals = 0
     opp_signals = 0
     strong_after_q = q_is_strong
@@ -987,9 +1349,9 @@ def get_qtrend_anchor_stats(target_symbol: str):
         event_weight = 1.0
         if event in {"fvg_touch", "zone_retrace_touch", "zone_touch"}:
             event_weight = 0.7
-        if src in {"Q-Trend-Strong", "Q-Trend-Normal"}:
+        if src in {"Q-Trend Strong", "Q-Trend", "Q-Trend-Strong", "Q-Trend-Normal"}:
             # 同一トレンド内で Strong が追加で来るケースを拾う（後追い含む）
-            if src == "Q-Trend-Strong":
+            if src in {"Q-Trend Strong", "Q-Trend-Strong"}:
                 strong_after_q = True
                 is_strong_momentum = True
                 q_trigger_type = "Strong"
@@ -1467,13 +1829,36 @@ def _validate_ai_entry_score(decision: Dict[str, Any]) -> Optional[Dict[str, Any
     return {"confluence_score": score, "lot_multiplier": lot_mult, "reason": reason}
 
 
-def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
-    """Q-Trend発生時の環境を渡し、AIに Confluence Score(1-100) と Lot Multiplier を出させる。"""
+def _build_entry_logic_prompt(
+    symbol: str,
+    market: dict,
+    stats: dict,
+    action: str,
+    normalized_trigger: Optional[Dict[str, Any]] = None,
+    qtrend_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Entry context prompt (new spec).
+
+    - Entry is triggered by Lorentzian (entry_trigger).
+    - Q-Trend is environment context only (direction + strength).
+    - Zones/FVG are additional evidence context.
+    """
 
     if not stats:
         minimal_payload = {
             "symbol": symbol,
             "proposed_action": action,
+            "trigger": {
+                "source": (normalized_trigger or {}).get("source"),
+                "side": (normalized_trigger or {}).get("side"),
+                "signal_type": (normalized_trigger or {}).get("signal_type"),
+                "event": (normalized_trigger or {}).get("event"),
+                "confirmed": (normalized_trigger or {}).get("confirmed"),
+                "signal_time": (normalized_trigger or {}).get("signal_time"),
+            },
+            "qtrend_context": qtrend_context,
+            "mt5_positions_summary": (stats or {}).get("mt5_positions_summary"),
+            "signals_window": (stats or {}).get("window_signals"),
             "market": {
                 "bid": market.get("bid"),
                 "ask": market.get("ask"),
@@ -1481,17 +1866,19 @@ def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: st
                 "atr_m5_approx": market.get("atr"),
                 "spread_points": market.get("spread"),
             },
-            "note": "No Q-Trend stats available yet. Score conservatively.",
+            "note": "No aggregated evidence stats available yet. Score conservatively.",
         }
         return (
             "You are a strict confluence scoring engine for algorithmic trading.\n"
+            "Trigger: Lorentzian fired the proposed_action.\n"
+            "Environment: Q-Trend provides direction/strength context only (not a trigger).\n"
             "Return ONLY strict JSON with this schema:\n"
             '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
             "ContextJSON:\n"
             + json.dumps(minimal_payload, ensure_ascii=False)
         )
 
-    base = _build_entry_filter_prompt(symbol, market, stats, action)
+    base = _build_entry_filter_prompt(symbol, market, stats, action, normalized_trigger=normalized_trigger, qtrend_context=qtrend_context)
     return (
         "You are a strict confluence scoring engine for algorithmic trading.\n"
         "Given the technical context, output ONLY strict JSON with this schema:\n"
@@ -1501,7 +1888,14 @@ def _build_entry_logic_prompt(symbol: str, market: dict, stats: dict, action: st
     )
 
 
-def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: str) -> str:
+def _build_entry_filter_prompt(
+    symbol: str,
+    market: dict,
+    stats: dict,
+    action: str,
+    normalized_trigger: Optional[Dict[str, Any]] = None,
+    qtrend_context: Optional[Dict[str, Any]] = None,
+) -> str:
     """ENTRY最終判断のためのコンテキストを構築。
 
     - BUY/SELL自体はローカルで確定済み（action）。
@@ -1510,6 +1904,7 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     now = time.time()
     stats = stats or {}
 
+    # New spec does not anchor on Q-Trend time; keep legacy stats if present.
     q_age_sec = int(now - stats.get("q_time", 0)) if stats.get("q_time") else -1
 
     bid = float(market.get("bid") or 0.0)
@@ -1540,10 +1935,21 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     w_confirm = float(stats.get("weighted_confirm_score") or 0.0)
     w_oppose = float(stats.get("weighted_oppose_score") or 0.0)
 
-    q_trigger_type = (stats.get("q_trigger_type") or ("Strong" if bool(stats.get("q_is_strong")) else "Normal"))
-    is_strong_momentum = bool(stats.get("is_strong_momentum"))
-    momentum_factor = float(stats.get("momentum_factor") or (1.5 if is_strong_momentum else 1.0))
+    # In the new spec, Q-Trend strength is taken from qtrend_context (Normal/Strong).
+    qt_side = (qtrend_context or {}).get("side")
+    qt_strength = (qtrend_context or {}).get("strength")
+    qt_dir = _dir_from_side(str(qt_side or ""))
+    qt_strength_norm = "Strong" if str(qt_strength or "").lower() == "strong" else "Normal" if qt_side else "Unknown"
+    trigger_side = ((normalized_trigger or {}).get("side") or "").lower()
+    trigger_dir = _dir_from_side(trigger_side)
+    alignment = "UNKNOWN"
+    if trigger_dir in {"UP", "DOWN"} and qt_dir in {"UP", "DOWN"}:
+        alignment = "ALIGNED" if trigger_dir == qt_dir else "MISALIGNED"
+
+    is_strong_momentum = (qt_strength_norm == "Strong")
+    momentum_factor = 1.5 if is_strong_momentum else 1.0
     strong_bonus = 2 if is_strong_momentum else 0
+    q_trigger_type = qt_strength_norm
 
     confluence_score_base = (confirm_u * 2) + min(confirm_n, 6)
     confluence_score = confluence_score_base + strong_bonus
@@ -1559,14 +1965,31 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     payload = {
         "symbol": symbol,
         "proposed_action": action,
+        "trigger": {
+            "source": (normalized_trigger or {}).get("source"),
+            "side": (normalized_trigger or {}).get("side"),
+            "signal_type": (normalized_trigger or {}).get("signal_type"),
+            "event": (normalized_trigger or {}).get("event"),
+            "confirmed": (normalized_trigger or {}).get("confirmed"),
+            "signal_time": (normalized_trigger or {}).get("signal_time"),
+        },
+        "signals_window": stats.get("window_signals"),
+        "mt5_positions_summary": stats.get("mt5_positions_summary"),
+        "qtrend_context": {
+            "side": qt_side,
+            "direction": qt_dir,
+            "strength": qt_strength_norm,
+            "age_sec": int(now - float((qtrend_context or {}).get("updated_at") or 0.0)) if (qtrend_context or {}).get("updated_at") else None,
+            "alignment_vs_trigger": alignment,
+        },
         "qtrend": {
-            "side": stats.get("q_side"),
+            "side": qt_side,
             "age_sec": q_age_sec,
-            "is_strong": bool(stats.get("q_is_strong")),
+            "is_strong": bool(is_strong_momentum),
             "is_strong_momentum": is_strong_momentum,
             "trigger_type": q_trigger_type,
             "momentum_factor": momentum_factor,
-            "source": stats.get("q_source"),
+            "source": (qtrend_context or {}).get("source"),
             "strong_after_q": strong_flag,
         },
         "confluence": {
@@ -1613,13 +2036,18 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
     return (
         "You are a strict XAUUSD/GOLD DAY TRADING entry gate (not scalping).\n"
         "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
+        "Trigger: Lorentzian fired the proposed_action (entry_trigger).\n"
+        "Environment: Q-Trend is context only (direction+strength), NOT a trigger.\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
-        "- Prefer ALIGNED higher-timeframe trend_alignment. HOWEVER, even if MISALIGNED, you MAY approve ENTRY if qtrend.is_strong_momentum is true (viewed as high-reward mean-reversion or a new trend starting point).\n"
+        "- Prefer Q-Trend ALIGNED with Lorentzian trigger direction (trend-following).\n"
+        "- If Q-Trend strength is Strong, rate ALIGNED entries even higher; be more willing to approve.\n"
+        "- If MISALIGNED, treat it as counter-trend: require strong structural evidence (Zones confirmations, clean space/EV). If evidence is weak, score low/skip.\n"
+        "- Also consider higher-timeframe trend_alignment from M15 as a secondary filter.\n"
         "- Prioritize current price action and momentum over simple MA position.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
         "- Evaluate opposition with nuance: confirmed/structural opposition matters most; touch-based opposition can be noise.\n"
-        "- If qtrend.trigger_type is Strong (strong momentum), treat it as higher breakout probability: be more willing to approve ENTRY even if there are some opposite touch signals (e.g., opposite FVG touch), as long as EV/space (ATR vs spread) remains attractive.\n"
+        "- If Q-Trend strength is Strong, treat it as higher breakout/trend-continuation probability: tolerate some opposite touch noise if EV/space (ATR vs spread) remains attractive.\n"
         "- If some opposite FVG/Zones exist BUT trend is aligned and ATR-to-spread is healthy and confluence is decent, you MAY still approve ENTRY (EV can remain positive).\n"
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
@@ -1629,164 +2057,6 @@ def _build_entry_filter_prompt(symbol: str, market: dict, stats: dict, action: s
         + json.dumps(payload, ensure_ascii=False)
     )
 
-
-def _attempt_entry_from_stats(
-    symbol: str,
-    stats: dict,
-    normalized_trigger: dict,
-    now: float,
-    pos_summary: Optional[dict] = None,
-) -> tuple[str, int]:
-    """Try to place an order based on latest Q-Trend stats.
-
-    Returns (message, http_status).
-    """
-    if bool((stats or {}).get("cancel_due_to_opposite_bar_close")):
-        detail = (stats or {}).get("cancel_detail") or {}
-        print(f"[FXAI][ENTRY] Cancel Q-Trend due to opposite bar_close: {detail}")
-        _set_status(last_result="Canceled by opposite bar_close", last_result_at=time.time())
-        return "Canceled by opposite bar_close", 200
-
-    if not stats:
-        _set_status(last_result="Stored (no qtrend stats)", last_result_at=time.time())
-        return "Stored", 200
-
-    q_time = float(stats.get("q_time") or now)
-    q_age_sec = int(now - q_time)
-
-    if Q_TREND_MAX_AGE_SEC > 0 and q_age_sec > Q_TREND_MAX_AGE_SEC:
-        _set_status(last_result="Stale Q-Trend", last_result_at=time.time())
-        return "Stale Q-Trend", 200
-
-    # strict duplicate / add-on control per q_time
-    entry_count = _qtrend_entry_count(symbol, q_time)
-    positions_open = int((pos_summary or {}).get("positions_open") or 0)
-    net_side = ((pos_summary or {}).get("net_side") or "flat").lower()
-
-    # Determine max entries allowed for this q_time
-    max_entries = 1
-    if positions_open > 0 and ALLOW_ADD_ON_ENTRIES and net_side in {"buy", "sell"}:
-        # add-on only for same direction
-        if net_side == ((stats.get("q_side") or "").lower()):
-            max_entries = int(ADDON_MAX_ENTRIES_PER_QTREND or 2)
-
-    if ALLOW_MULTI_ENTRY_SAME_QTREND:
-        # still keep a sane upper bound if configured; default is handled above
-        max_entries = max(max_entries, int(ADDON_MAX_ENTRIES_PER_QTREND or 2))
-
-    if entry_count >= int(max_entries):
-        _set_status(last_result="Duplicate", last_result_at=time.time())
-        return "Duplicate", 200
-
-    # confluence requirement (local)
-    have = int(stats.get("confirm_unique_sources") or 0)
-    if have < MIN_OTHER_SIGNALS_FOR_ENTRY:
-        print(f"[FXAI][ENTRY] Waiting confluence: have={have} need={MIN_OTHER_SIGNALS_FOR_ENTRY} q_time={stats.get('q_time')} q_side={stats.get('q_side')}")
-        _set_status(last_result="Waiting confluence", last_result_at=time.time())
-        return "Waiting confluence", 200
-
-    q_side = (stats.get("q_side") or "").lower()
-    action = "BUY" if q_side == "buy" else "SELL" if q_side == "sell" else ""
-    if action not in {"BUY", "SELL"}:
-        _set_status(last_result="Invalid action", last_result_at=time.time())
-        return "Invalid action", 400
-
-    # Safety: block entries when EA heartbeat is stale/missing.
-    if not _heartbeat_is_fresh(now_ts=now):
-        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
-        return "Blocked by heartbeat", 503
-
-    market = get_mt5_market_data(symbol)
-    try:
-        if float(market.get("atr") or 0.0) > 0:
-            _last_atr_by_symbol[symbol] = float(market.get("atr") or 0.0)
-    except Exception:
-        pass
-    local_multiplier = _compute_entry_multiplier(
-        int(stats.get("confirm_unique_sources") or 0),
-        bool(stats.get("strong_after_q")),
-    )
-
-    final_multiplier = float(local_multiplier)
-    ai_score = None
-    ai_reason = ""
-
-    # AI scoring is mandatory once local confluence exists.
-    # Throttle AI calls but allow re-eval when NEW supporting signal arrives.
-    global _last_ai_attempt_key, _last_ai_attempt_at
-    trig_src = (normalized_trigger.get("source") or "")
-    trig_evt = (normalized_trigger.get("event") or "")
-    trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
-    attempt_key = f"{symbol}:{action}:{q_time:.3f}:{trig_src}:{trig_evt}:{trig_st:.3f}"
-
-    now_mono = time.time()
-    if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
-        _set_status(last_result="AI throttled", last_result_at=time.time())
-        return "AI throttled", 200
-    _last_ai_attempt_key = attempt_key
-    _last_ai_attempt_at = now_mono
-
-    ai_decision = _ai_entry_score(symbol, market, stats, action)
-    if not ai_decision:
-        # Safety: do not enter on AI error.
-        _set_status(last_result="Blocked by AI (no score)", last_result_at=time.time())
-        return "Blocked by AI", 503
-
-    ai_score = int(ai_decision.get("confluence_score") or 0)
-    ai_reason = ai_decision.get("reason") or ""
-    lot_mult = float(ai_decision.get("lot_multiplier") or 1.0)
-
-    if ai_score < AI_ENTRY_MIN_SCORE:
-        _set_status(last_result="Blocked by AI", last_result_at=time.time())
-        return "Blocked by AI", 403
-
-    final_multiplier = float(_clamp(local_multiplier * lot_mult, 0.5, 2.0))
-
-    # Re-check heartbeat just before sending the order (avoid race).
-    if not _heartbeat_is_fresh(now_ts=time.time()):
-        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
-        return "Blocked by heartbeat", 503
-
-    # ZMQでエントリー指示を送信
-    reason = ai_reason or f"qtrend_entry other_sources={int(stats.get('confirm_unique_sources') or 0)}"
-    payload = {
-        "type": "ORDER",
-        "action": action,
-        "symbol": symbol,
-        "atr": float(market.get("atr") or 0.0),
-        "multiplier": final_multiplier,
-        "reason": reason,
-        "ai_confidence": ai_score,
-        "ai_reason": ai_reason,
-    }
-    zmq_socket.send_json(
-        {
-            **payload,
-        }
-    )
-
-    _set_status(
-        last_result="OK",
-        last_result_at=time.time(),
-        last_order={
-            "action": action,
-            "symbol": symbol,
-            "atr": float(market.get("atr") or 0.0),
-            "multiplier": final_multiplier,
-            "ai_confidence": ai_score,
-            "ai_reason": ai_reason,
-            "q_time": q_time,
-            "trigger": {
-                "source": normalized_trigger.get("source"),
-                "event": normalized_trigger.get("event"),
-                "signal_time": normalized_trigger.get("signal_time"),
-            },
-        },
-    )
-
-    _mark_qtrend_executed(symbol, q_time)
-    print(f"[FXAI][ZMQ] Order sent: {payload}")
-    return "OK", 200
 
 
 def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1923,11 +2193,25 @@ def _ai_close_hold_decision(symbol: str, market: dict, stats: Optional[dict], po
     return validated
 
 
-def _ai_entry_score(symbol: str, market: dict, stats: dict, action: str) -> Optional[Dict[str, Any]]:
+def _ai_entry_score(
+    symbol: str,
+    market: dict,
+    stats: dict,
+    action: str,
+    normalized_trigger: Optional[Dict[str, Any]] = None,
+    qtrend_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """AIに Confluence Score(1-100) と Lot Multiplier を出させる。"""
     if not client:
         return None
-    prompt = _build_entry_logic_prompt(symbol, market, stats, action)
+    prompt = _build_entry_logic_prompt(
+        symbol,
+        market,
+        stats,
+        action,
+        normalized_trigger=normalized_trigger,
+        qtrend_context=qtrend_context,
+    )
     decision = _call_openai_with_retry(prompt)
     if not decision:
         print("[FXAI][AI] No response from AI (entry score).")
@@ -1939,6 +2223,267 @@ def _ai_entry_score(symbol: str, market: dict, stats: dict, action: str) -> Opti
         return None
 
     return validated
+
+
+def _attempt_entry_from_lorentzian(
+    symbol: str,
+    normalized_trigger: dict,
+    now: float,
+    pos_summary: Optional[dict] = None,
+) -> tuple[str, int]:
+    """New spec entry flow.
+
+    - Triggered ONLY by Lorentzian entry_trigger.
+    - Q-Trend is context-only and read from in-memory cache.
+    - Zones/FVG context read from signals_cache.
+    """
+    trig_side = (normalized_trigger.get("side") or "").strip().lower()
+    action = "BUY" if trig_side == "buy" else "SELL" if trig_side == "sell" else ""
+    if action not in {"BUY", "SELL"}:
+        _set_status(last_result="Invalid Lorentzian side", last_result_at=time.time())
+        return "Invalid trigger", 400
+
+    # Safety: block entries when EA heartbeat is stale/missing.
+    if not _heartbeat_is_fresh(now_ts=now):
+        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
+        return "Blocked by heartbeat", 503
+
+    positions_open = int((pos_summary or {}).get("positions_open") or 0)
+    net_side = ((pos_summary or {}).get("net_side") or "flat").lower()
+
+    is_addon = False
+
+    # Add-on policy (user requirement): allow add-ons ONLY when position side == trigger side,
+    # and cap total entries per open-position session.
+    if positions_open <= 0:
+        # reset session tracking when flat
+        with _addon_lock:
+            _addon_state_by_symbol.pop(symbol, None)
+    else:
+        # When holding positions, add-ons are strictly controlled.
+        if net_side not in {"buy", "sell"}:
+            _set_status(last_result="Skip entry (net_side unknown)", last_result_at=time.time())
+            return "Skip (net_side unknown)", 200
+
+        if (not ALLOW_ADD_ON_ENTRIES) or (net_side != trig_side):
+            _set_status(last_result="Skip entry (position open)", last_result_at=time.time())
+            return "Skip (position open)", 200
+
+        is_addon = True
+
+        max_entries = max(1, int(ADDON_MAX_ENTRIES_PER_POSITION or 5))
+        with _addon_lock:
+            st = _addon_state_by_symbol.get(symbol)
+            # start/refresh session if side changed (safety)
+            if not st or (st.get("side") != net_side):
+                st = {"side": net_side, "count": 0, "updated_at": now}
+            count = int(st.get("count") or 0)
+            if count >= max_entries:
+                _addon_state_by_symbol[symbol] = st
+                _set_status(
+                    last_result="Skip entry (add-on limit)",
+                    last_result_at=time.time(),
+                    last_addon_limit={"max": max_entries, "count": count, "side": net_side},
+                )
+                return "Skip (add-on limit)", 200
+            _addon_state_by_symbol[symbol] = st
+
+    market = get_mt5_market_data(symbol)
+    try:
+        if float(market.get("atr") or 0.0) > 0:
+            _last_atr_by_symbol[symbol] = float(market.get("atr") or 0.0)
+    except Exception:
+        pass
+
+    # --- Local safety guards (do not rely on AI for these) ---
+    spread_points = float(market.get("spread") or 0.0)
+    atr_to_spread = market.get("atr_to_spread")
+    try:
+        atr_to_spread_v = float(atr_to_spread) if atr_to_spread is not None else None
+    except Exception:
+        atr_to_spread_v = None
+
+    if spread_points <= 0:
+        _set_status(last_result="Blocked (no spread)", last_result_at=time.time())
+        return "Blocked (no spread)", 503
+
+    if float(ENTRY_MAX_SPREAD_POINTS or 0.0) > 0 and spread_points >= float(ENTRY_MAX_SPREAD_POINTS):
+        _set_status(
+            last_result="Blocked (spread too wide)",
+            last_result_at=time.time(),
+            last_entry_guard={"spread_points": spread_points, "max": float(ENTRY_MAX_SPREAD_POINTS)},
+        )
+        return "Blocked (spread too wide)", 200
+
+    if float(ENTRY_MIN_ATR_TO_SPREAD or 0.0) > 0 and (atr_to_spread_v is not None):
+        if atr_to_spread_v < float(ENTRY_MIN_ATR_TO_SPREAD):
+            _set_status(
+                last_result="Blocked (ATR too small vs spread)",
+                last_result_at=time.time(),
+                last_entry_guard={"atr_to_spread": atr_to_spread_v, "min": float(ENTRY_MIN_ATR_TO_SPREAD)},
+            )
+            return "Blocked (ATR too small vs spread)", 200
+
+    if float(ENTRY_COOLDOWN_SEC or 0.0) > 0:
+        with _entry_lock:
+            last_sent = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
+        if last_sent > 0 and (now - last_sent) < float(ENTRY_COOLDOWN_SEC):
+            _set_status(
+                last_result="Blocked (cooldown)",
+                last_result_at=time.time(),
+                last_entry_guard={
+                    "cooldown_sec": float(ENTRY_COOLDOWN_SEC),
+                    "since_last_order_sec": round(float(now - last_sent), 3),
+                },
+            )
+            return "Blocked (cooldown)", 200
+
+    qtrend_ctx = _get_qtrend_context(symbol, now=now)
+
+    trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
+    window_signals = _collect_window_signals_around_trigger(symbol, trig_st, trig_side, window_sec=300.0)
+    evidence_ctx = _collect_recent_context_signals(symbol, now)
+
+    # Assemble a compact stats dict for the existing prompt structure.
+    # Keep legacy keys used in the prompt where they still add value.
+    stats = {
+        "q_time": None,
+        "q_side": (qtrend_ctx or {}).get("side"),
+        "q_source": (qtrend_ctx or {}).get("source"),
+        "q_is_strong": (qtrend_ctx or {}).get("strength") == "strong",
+        "q_trigger_type": "Strong" if (qtrend_ctx or {}).get("strength") == "strong" else "Normal",
+        "is_strong_momentum": (qtrend_ctx or {}).get("strength") == "strong",
+        "momentum_factor": 1.5 if (qtrend_ctx or {}).get("strength") == "strong" else 1.0,
+        "strong_after_q": (qtrend_ctx or {}).get("strength") == "strong",
+        "zones_confirmed_recent": int((evidence_ctx or {}).get("zones_confirmed_recent") or 0),
+        "window_signals": window_signals,
+        "mt5_positions_summary": pos_summary,
+    }
+
+    # Optional: light-weight derived confluence counts for AI context.
+    # We do not hard-gate by these counts under the new spec.
+    aligned = (window_signals or {}).get("aligned") or []
+    opposed = (window_signals or {}).get("opposed") or []
+
+    confirm_sources = {ev.get("source") for ev in aligned if ev.get("source")}
+    oppose_sources = {ev.get("source") for ev in opposed if ev.get("source")}
+    stats["confirm_unique_sources"] = int(len(confirm_sources))
+    stats["opp_unique_sources"] = int(len(oppose_sources))
+    stats["confirm_signals"] = int(len(aligned))
+    stats["opp_signals"] = int(len(opposed))
+
+    # AI scoring is mandatory; throttle identical attempts.
+    global _last_ai_attempt_key, _last_ai_attempt_at
+    trig_src = (normalized_trigger.get("source") or "")
+    trig_evt = (normalized_trigger.get("event") or "")
+    attempt_key = f"LZ:{symbol}:{action}:{trig_src}:{trig_evt}:{trig_st:.3f}"
+
+    now_mono = time.time()
+    if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+        _set_status(last_result="AI throttled", last_result_at=time.time())
+        return "AI throttled", 200
+    _last_ai_attempt_key = attempt_key
+    _last_ai_attempt_at = now_mono
+
+    ai_decision = _ai_entry_score(
+        symbol,
+        market,
+        stats,
+        action,
+        normalized_trigger=normalized_trigger,
+        qtrend_context=qtrend_ctx,
+    )
+    if not ai_decision:
+        _set_status(last_result="Blocked by AI (no score)", last_result_at=time.time())
+        return "Blocked by AI", 503
+
+    ai_score = int(ai_decision.get("confluence_score") or 0)
+    ai_reason = (ai_decision.get("reason") or "").strip()
+    lot_mult = float(ai_decision.get("lot_multiplier") or 1.0)
+
+    if is_addon:
+        min_addon_score = int(ADDON_MIN_AI_SCORE or AI_ENTRY_MIN_SCORE)
+        if ai_score < min_addon_score:
+            _set_status(
+                last_result="Blocked add-on by AI",
+                last_result_at=time.time(),
+                last_entry_guard={"addon": True, "ai_score": ai_score, "min_required": min_addon_score},
+            )
+            return "Blocked add-on by AI", 403
+    else:
+        if ai_score < AI_ENTRY_MIN_SCORE:
+            _set_status(last_result="Blocked by AI", last_result_at=time.time())
+            return "Blocked by AI", 403
+
+    # Final multiplier: start from 1.0, modulate by AI.
+    final_multiplier = float(_clamp(1.0 * lot_mult, 0.5, 2.0))
+
+    # Re-check heartbeat just before sending the order (avoid race).
+    if not _heartbeat_is_fresh(now_ts=time.time()):
+        _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
+        return "Blocked by heartbeat", 503
+
+    reason = ai_reason or "lorentzian_entry"
+    payload = {
+        "type": "ORDER",
+        "action": action,
+        "symbol": symbol,
+        "atr": float(market.get("atr") or 0.0),
+        "multiplier": final_multiplier,
+        "reason": reason,
+        "ai_confidence": ai_score,
+        "ai_reason": ai_reason,
+    }
+    zmq_socket.send_json({**payload})
+
+    # Local cooldown timestamp
+    try:
+        with _entry_lock:
+            _last_order_sent_at_by_symbol[symbol] = float(time.time())
+    except Exception:
+        pass
+
+    # Update add-on session counter after successful send.
+    try:
+        with _addon_lock:
+            st = _addon_state_by_symbol.get(symbol)
+            if not st or (st.get("side") != trig_side):
+                st = {"side": trig_side, "count": 0}
+            st["count"] = int(st.get("count") or 0) + 1
+            st["updated_at"] = time.time()
+            _addon_state_by_symbol[symbol] = st
+    except Exception:
+        pass
+
+    _set_status(
+        last_result="OK",
+        last_result_at=time.time(),
+        last_order={
+            "action": action,
+            "symbol": symbol,
+            "atr": float(market.get("atr") or 0.0),
+            "multiplier": final_multiplier,
+            "ai_confidence": ai_score,
+            "ai_reason": ai_reason,
+            "trigger": {
+                "source": normalized_trigger.get("source"),
+                "event": normalized_trigger.get("event"),
+                "signal_time": normalized_trigger.get("signal_time"),
+                "side": normalized_trigger.get("side"),
+                "signal_type": normalized_trigger.get("signal_type"),
+            },
+            "qtrend_context": qtrend_ctx,
+            "evidence": {
+                "zones_confirmed_recent": stats.get("zones_confirmed_recent"),
+                "latest_zone_touch": (evidence_ctx or {}).get("latest_zone_touch"),
+                "latest_fvg_touch": (evidence_ctx or {}).get("latest_fvg_touch"),
+                "window_signals": window_signals,
+            },
+        },
+    )
+
+    print(f"[FXAI][ZMQ] Order sent: {payload}")
+    return "OK", 200
 
 
 @app.route('/webhook', methods=['POST'])
@@ -1957,6 +2502,11 @@ def webhook():
         return "Invalid data", 400
 
     now = time.time()
+
+    # Lazy init (for WSGI / import-time safety)
+    if not ensure_runtime_initialized():
+        return "Runtime init failed", 503
+
     requested_symbol = _extract_symbol_from_webhook(data)
     symbol, sym_ok = _ensure_mt5_symbol_selected(requested_symbol)
     if not sym_ok:
@@ -1985,7 +2535,7 @@ def webhook():
     source_in = (data.get("source") or "").strip()
     source_for_cache = source_in
     if not source_for_cache and ASSUME_ACTION_IS_QTREND and inferred_side:
-        source_for_cache = "Q-Trend-Normal"
+        source_for_cache = "Q-Trend"
 
     signal = {
         "symbol": symbol,
@@ -2005,7 +2555,9 @@ def webhook():
     with signals_lock:
         appended = _append_signal_dedup_locked(normalized)
         _prune_signals_cache_locked(now)
-        _save_cache_locked()
+        _mark_cache_dirty_locked(now)
+        if not CACHE_ASYNC_FLUSH_ENABLED:
+            _save_cache_locked()
 
     if not appended:
         _set_status(last_result="Duplicate webhook", last_result_at=time.time())
@@ -2030,8 +2582,30 @@ def webhook():
         )
     )
 
-    # Determine Q-Trend trigger early (used for both management and optional add-on entries)
-    qtrend_trigger = (normalized.get("source") in {"Q-Trend-Strong", "Q-Trend-Normal"} and normalized.get("side") in {"buy", "sell"})
+    # Determine routing by signal_type
+    sig_type = (normalized.get("signal_type") or "").strip().lower()
+
+    pending_entry_trigger = False
+    normalized_trigger: Optional[Dict[str, Any]] = None
+
+    # Context-only signals (Q-Trend): always update in-memory context.
+    # IMPORTANT: Do not early-return here because if we are holding positions we still
+    # want to run position management AI on any incoming signal (user requirement).
+    if sig_type == "context":
+        if _is_qtrend_source(str(normalized.get("source") or "")):
+            _update_qtrend_context_from_signal(normalized)
+
+    # Entry trigger: Lorentzian starts the AI decision flow, but we may still run
+    # management first if positions are open.
+    if sig_type == "entry_trigger":
+        src = (normalized.get("source") or "").strip()
+        if src == "Lorentzian":
+            pending_entry_trigger = True
+            normalized_trigger = dict(normalized)
+        else:
+            # Unknown entry_trigger: store for audit only.
+            _set_status(last_result="Stored (unknown entry_trigger)", last_result_at=time.time())
+            return "Stored", 200
 
     # --- HEARTBEAT STALE POLICY ---
     # Under freeze mode: do not send any management (HOLD/CLOSE) nor entries while heartbeat is stale.
@@ -2058,7 +2632,7 @@ def webhook():
             is_reversal_like = (
                 (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
                 and (
-                    (src in {"Q-Trend-Strong", "Q-Trend-Normal"})
+                    (src in {"Q-Trend Strong", "Q-Trend", "Q-Trend-Strong", "Q-Trend-Normal"})
                     or (src == "FVG" and evt == "fvg_touch")
                     or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
                 )
@@ -2132,52 +2706,13 @@ def webhook():
 
         # After management decision (unless CLOSED), allow add-on entries by falling through to ENTRY section.
 
-    # --- ENTRY MODE (Q-Trend reservation + follow-up entry) ---
-    stats = get_qtrend_anchor_stats(symbol)
-    if not stats:
-        _set_status(last_result="Stored", last_result_at=time.time())
-        return "Stored", 200
+    # --- ENTRY (Lorentzian) ---
+    if pending_entry_trigger and normalized_trigger:
+        return _attempt_entry_from_lorentzian(symbol, normalized_trigger, now, pos_summary=pos_summary)
 
-    # Debug summary for entry decision
-    try:
-        print(
-            "[FXAI][ENTRY] stats "
-            + json.dumps(
-                {
-                    "q_time": stats.get("q_time"),
-                    "q_side": stats.get("q_side"),
-                    "q_source": stats.get("q_source"),
-                    "q_age_sec": int(now - float(stats.get("q_time") or now)),
-                    "confirm_unique_sources": stats.get("confirm_unique_sources"),
-                    "confirm_signals": stats.get("confirm_signals"),
-                    "opp_unique_sources": stats.get("opp_unique_sources"),
-                    "opp_signals": stats.get("opp_signals"),
-                    "cancel_due_to_opposite_bar_close": stats.get("cancel_due_to_opposite_bar_close"),
-                },
-                ensure_ascii=False,
-            )
-        )
-    except Exception:
-        pass
-
-    q_time = float(stats.get("q_time") or now)
-    q_age_sec = int(now - q_time)
-    has_pending_qtrend = (Q_TREND_MAX_AGE_SEC <= 0 or q_age_sec <= Q_TREND_MAX_AGE_SEC) and (
-        ALLOW_MULTI_ENTRY_SAME_QTREND or (not _was_qtrend_executed(symbol, q_time))
-    )
-
-    # Trigger conditions:
-    # - Q-Trend itself
-    # - or any supporting signal (Zones/FVG/OSGFC) arriving while a pending Q-Trend exists
-    src = (normalized.get("source") or "")
-    supporting_sources = {"FVG", "Zones", "OSGFC"}
-
-    if qtrend_trigger:
-        return _attempt_entry_from_stats(symbol, stats, normalized, now, pos_summary)
-
-    if has_pending_qtrend and src in supporting_sources:
-        # this is the key upgrade: immediate re-eval on new evidence within Q-Trend TTL
-        return _attempt_entry_from_stats(symbol, stats, normalized, now, pos_summary)
+    if sig_type == "context":
+        _set_status(last_result="Context stored", last_result_at=time.time())
+        return "Context stored", 200
 
     _set_status(last_result="Stored", last_result_at=time.time())
     return "Stored", 200
@@ -2211,13 +2746,11 @@ if __name__ == '__main__':
             f"window_min={WEEKEND_CLOSE_WINDOW_MIN} poll_sec={WEEKEND_CLOSE_POLL_SEC}"
         )
     print(f"[FXAI] symbol: {SYMBOL}")
-    # ★追加: 起動時にキャッシュを復元
-    _load_cache()
 
-    if ZMQ_HEARTBEAT_ENABLED:
-        Thread(target=_heartbeat_receiver_loop, daemon=True).start()
-    if WEEKEND_CLOSE_ENABLED:
-        Thread(target=_weekend_close_loop, daemon=True).start()
+    # Initialize external dependencies once at startup
+    if not init_runtime():
+        print(f"[FXAI][FATAL] Runtime init failed: {_runtime_init_error}")
+        raise SystemExit(1)
 
     # Port pre-check behavior:
     # - "warn"   (default): warn if port seems unavailable, but still attempt to start Flask
