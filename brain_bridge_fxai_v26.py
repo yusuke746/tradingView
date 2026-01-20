@@ -2408,16 +2408,48 @@ def _attempt_entry_from_lorentzian(
     if is_addon:
         min_addon_score = int(ADDON_MIN_AI_SCORE or AI_ENTRY_MIN_SCORE)
         if ai_score < min_addon_score:
+            reason_snip = ai_reason[:160] if ai_reason else ""
             _set_status(
                 last_result="Blocked add-on by AI",
                 last_result_at=time.time(),
-                last_entry_guard={"addon": True, "ai_score": ai_score, "min_required": min_addon_score},
+                last_entry_guard={
+                    "addon": True,
+                    "ai_score": ai_score,
+                    "min_required": min_addon_score,
+                    "ai_reason": reason_snip,
+                    "qtrend": {
+                        "available": bool(qtrend_ctx),
+                        "side": (qtrend_ctx or {}).get("side"),
+                        "strength": (qtrend_ctx or {}).get("strength"),
+                    },
+                    "window_counts": (window_signals or {}).get("counts"),
+                    "zones_confirmed_recent": int(stats.get("zones_confirmed_recent") or 0),
+                },
             )
+            print(f"[FXAI][ENTRY] Blocked add-on by AI: score={ai_score} min={min_addon_score} reason={reason_snip}")
             return "Blocked add-on by AI", 403
     else:
         if ai_score < AI_ENTRY_MIN_SCORE:
-            _set_status(last_result="Blocked by AI", last_result_at=time.time())
-            return f"Blocked by AI (score={ai_score})", 403
+            reason_snip = ai_reason[:160] if ai_reason else ""
+            _set_status(
+                last_result="Blocked by AI",
+                last_result_at=time.time(),
+                last_entry_guard={
+                    "addon": False,
+                    "ai_score": ai_score,
+                    "min_required": int(AI_ENTRY_MIN_SCORE),
+                    "ai_reason": reason_snip,
+                    "qtrend": {
+                        "available": bool(qtrend_ctx),
+                        "side": (qtrend_ctx or {}).get("side"),
+                        "strength": (qtrend_ctx or {}).get("strength"),
+                    },
+                    "window_counts": (window_signals or {}).get("counts"),
+                    "zones_confirmed_recent": int(stats.get("zones_confirmed_recent") or 0),
+                },
+            )
+            print(f"[FXAI][ENTRY] Blocked by AI: score={ai_score} min={int(AI_ENTRY_MIN_SCORE)} reason={reason_snip}")
+            return f"Blocked by AI (score={ai_score}, reason={reason_snip})", 403
 
     # Final multiplier: start from 1.0, modulate by AI.
     final_multiplier = float(_clamp(1.0 * lot_mult, 0.5, 2.0))
