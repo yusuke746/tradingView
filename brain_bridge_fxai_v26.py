@@ -1872,6 +1872,7 @@ def _build_entry_logic_prompt(
             "You are a strict confluence scoring engine for algorithmic trading.\n"
             "Trigger: Lorentzian fired the proposed_action.\n"
             "Environment: Q-Trend provides direction/strength context only (not a trigger).\n"
+            "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
             "Return ONLY strict JSON with this schema:\n"
             '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
             "ContextJSON:\n"
@@ -1976,6 +1977,7 @@ def _build_entry_filter_prompt(
         "signals_window": stats.get("window_signals"),
         "mt5_positions_summary": stats.get("mt5_positions_summary"),
         "qtrend_context": {
+            "available": bool(qt_side),
             "side": qt_side,
             "direction": qt_dir,
             "strength": qt_strength_norm,
@@ -2038,11 +2040,13 @@ def _build_entry_filter_prompt(
         "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
         "Trigger: Lorentzian fired the proposed_action (entry_trigger).\n"
         "Environment: Q-Trend is context only (direction+strength), NOT a trigger.\n"
+        "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
         "You MUST NOT suggest BUY/SELL; the proposed_action is already decided locally.\n"
         "Use these decision principles:\n"
         "- Prefer Q-Trend ALIGNED with Lorentzian trigger direction (trend-following).\n"
         "- If Q-Trend strength is Strong, rate ALIGNED entries even higher; be more willing to approve.\n"
         "- If MISALIGNED, treat it as counter-trend: require strong structural evidence (Zones confirmations, clean space/EV). If evidence is weak, score low/skip.\n"
+        "- If Q-Trend is UNKNOWN, do not assume misalignment; rely more on Zones/FVG window evidence and market EV (ATR vs spread, trend_alignment).\n"
         "- Also consider higher-timeframe trend_alignment from M15 as a secondary filter.\n"
         "- Prioritize current price action and momentum over simple MA position.\n"
         "- Prefer stronger confluence: higher confirm_unique_sources, higher weighted_confirm_score.\n"
@@ -2413,7 +2417,7 @@ def _attempt_entry_from_lorentzian(
     else:
         if ai_score < AI_ENTRY_MIN_SCORE:
             _set_status(last_result="Blocked by AI", last_result_at=time.time())
-            return "Blocked by AI", 403
+            return f"Blocked by AI (score={ai_score})", 403
 
     # Final multiplier: start from 1.0, modulate by AI.
     final_multiplier = float(_clamp(1.0 * lot_mult, 0.5, 2.0))
