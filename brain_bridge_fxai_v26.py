@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 
 import zmq
 import MetaTrader5 as mt5
-from flask import Flask, request
+from flask import Flask, request, Response
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -59,6 +59,13 @@ ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "1200"))
 ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", "1200"))
 
 
+# --- Metrics / log aggregation (for fast tuning) ---
+ENTRY_METRICS_ENABLED = _env_bool("ENTRY_METRICS_ENABLED", "1")
+METRICS_FILE = str(os.getenv("METRICS_FILE", "entry_metrics.json") or "entry_metrics.json").strip()
+METRICS_KEEP_DAYS = int(os.getenv("METRICS_KEEP_DAYS", "14"))
+METRICS_MAX_EXAMPLES = int(os.getenv("METRICS_MAX_EXAMPLES", "80"))
+
+
 # --- Behavior toggles ---
 ASSUME_ACTION_IS_QTREND = _env_bool("ASSUME_ACTION_IS_QTREND", "0")
 ALLOW_ADD_ON_ENTRIES = _env_bool("ALLOW_ADD_ON_ENTRIES", "1")
@@ -79,12 +86,15 @@ API_RETRY_WAIT_SEC = float(os.getenv("API_RETRY_WAIT_SEC", "1.5"))
 AI_ENTRY_DEFAULT_SCORE = int(os.getenv("AI_ENTRY_DEFAULT_SCORE", "50"))
 AI_ENTRY_DEFAULT_LOT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_LOT_MULTIPLIER", "1.0"))
 AI_ENTRY_MIN_SCORE = int(os.getenv("AI_ENTRY_MIN_SCORE", "70"))
+# Optional: allow a lower minimum score only when Q-Trend is Strong AND aligned with Lorentzian.
+# Default keeps behavior unchanged.
+AI_ENTRY_MIN_SCORE_STRONG_ALIGNED = int(os.getenv("AI_ENTRY_MIN_SCORE_STRONG_ALIGNED", str(AI_ENTRY_MIN_SCORE)))
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "15"))
 ADDON_MIN_AI_SCORE = int(os.getenv("ADDON_MIN_AI_SCORE", str(AI_ENTRY_MIN_SCORE)))
 
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
 
-CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "300"))
+CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "600"))
 CONFLUENCE_DEBUG = _env_bool("CONFLUENCE_DEBUG", "0")
 CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 
@@ -98,7 +108,7 @@ AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "60")
 # --- Local entry safety guards (professional defaults) ---
 # Gold day-trading (M5/M15) tends to suffer when spread is wide or ATR is too small.
 ENTRY_MAX_SPREAD_POINTS = float(os.getenv("ENTRY_MAX_SPREAD_POINTS", "90"))
-ENTRY_MIN_ATR_TO_SPREAD = float(os.getenv("ENTRY_MIN_ATR_TO_SPREAD", "3.0"))
+ENTRY_MIN_ATR_TO_SPREAD = float(os.getenv("ENTRY_MIN_ATR_TO_SPREAD", "2.5"))
 ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "25"))
 
 
@@ -129,6 +139,14 @@ _cache_dirty = False
 _cache_last_save_at = 0.0
 _cache_last_dirty_at = 0.0
 _cache_flush_thread_started = False
+
+_metrics_lock = Lock()
+_metrics: Dict[str, Any] = {
+    "started_at": time.time(),
+    "by_day": {},
+}
+_metrics_dirty = False
+_metrics_last_save_at = 0.0
 
 _qtrend_lock = Lock()
 _qtrend_state_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -216,6 +234,13 @@ def init_runtime() -> bool:
             _load_cache()
         except Exception as e:
             print(f"[FXAI][WARN] Cache load failed: {e}")
+
+        # Restore metrics
+        if ENTRY_METRICS_ENABLED:
+            try:
+                _load_metrics()
+            except Exception as e:
+                print(f"[FXAI][WARN] Metrics load failed: {e}")
 
         # Start background loops
         if ZMQ_HEARTBEAT_ENABLED:
@@ -1013,6 +1038,297 @@ def _weight_confirmed(confirmed: str) -> float:
     return 0.8
 
 
+def _utc_day_key(ts: Optional[float] = None) -> str:
+    if ts is None:
+        ts = time.time()
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    except Exception:
+        dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _metrics_mark_dirty_locked() -> None:
+    global _metrics_dirty
+    _metrics_dirty = True
+
+
+def _metrics_bucket_score(score: int) -> str:
+    try:
+        s = int(score)
+    except Exception:
+        s = 0
+    if s < 50:
+        return "0-49"
+    if s < 60:
+        return "50-59"
+    if s < 70:
+        return "60-69"
+    if s < 80:
+        return "70-79"
+    if s < 90:
+        return "80-89"
+    return "90-100"
+
+
+def _metrics_prune_locked(now: Optional[float] = None) -> None:
+    if now is None:
+        now = time.time()
+    keep_days = max(1, int(METRICS_KEEP_DAYS or 14))
+    try:
+        cutoff = datetime.fromtimestamp(float(now), tz=timezone.utc) - timedelta(days=keep_days)
+        cutoff_key = cutoff.strftime("%Y-%m-%d")
+    except Exception:
+        cutoff_key = "0000-00-00"
+
+    by_day = _metrics.get("by_day")
+    if not isinstance(by_day, dict):
+        _metrics["by_day"] = {}
+        return
+
+    for day in list(by_day.keys()):
+        try:
+            if str(day) < str(cutoff_key):
+                by_day.pop(day, None)
+        except Exception:
+            continue
+
+
+def _metrics_get_bucket_locked(day_key: str, symbol: str) -> Dict[str, Any]:
+    by_day = _metrics.setdefault("by_day", {})
+    if not isinstance(by_day, dict):
+        by_day = {}
+        _metrics["by_day"] = by_day
+
+    day = by_day.setdefault(day_key, {})
+    if not isinstance(day, dict):
+        day = {}
+        by_day[day_key] = day
+
+    sym = (symbol or "").strip().upper() or (SYMBOL or "GOLD")
+    b = day.setdefault(sym, {})
+    if not isinstance(b, dict):
+        b = {}
+        day[sym] = b
+
+    # initialize common fields
+    b.setdefault("webhooks", 0)
+    b.setdefault("duplicates", 0)
+    b.setdefault("context_updates", 0)
+    b.setdefault("entry_triggers", 0)
+    b.setdefault("entry_attempts", 0)
+    b.setdefault("entry_ok", 0)
+    b.setdefault("blocked", {})
+    b.setdefault("ai_score_hist", {})
+    b.setdefault("guard_stats", {})
+    b.setdefault("examples", [])
+    return b
+
+
+def _metrics_inc_locked(b: Dict[str, Any], key: str, n: int = 1) -> None:
+    try:
+        b[key] = int(b.get(key) or 0) + int(n)
+    except Exception:
+        b[key] = int(n)
+
+
+def _metrics_inc_map_locked(m: Dict[str, Any], key: str, n: int = 1) -> None:
+    if not isinstance(m, dict):
+        return
+    try:
+        m[key] = int(m.get(key) or 0) + int(n)
+    except Exception:
+        m[key] = int(n)
+
+
+def _metrics_update_guard_stat_locked(guard_stats: Dict[str, Any], name: str, value: Optional[float]) -> None:
+    if value is None:
+        return
+    try:
+        v = float(value)
+    except Exception:
+        return
+    if not isinstance(guard_stats, dict):
+        return
+    st = guard_stats.get(name)
+    if not isinstance(st, dict):
+        st = {"count": 0, "sum": 0.0, "min": None, "max": None}
+        guard_stats[name] = st
+    st["count"] = int(st.get("count") or 0) + 1
+    st["sum"] = float(st.get("sum") or 0.0) + v
+    mn = st.get("min")
+    mx = st.get("max")
+    st["min"] = v if (mn is None or v < float(mn)) else float(mn)
+    st["max"] = v if (mx is None or v > float(mx)) else float(mx)
+
+
+def _metrics_append_example_locked(examples: List[Dict[str, Any]], ex: Dict[str, Any]) -> None:
+    if not isinstance(examples, list):
+        return
+    try:
+        examples.append(ex)
+        max_n = max(10, int(METRICS_MAX_EXAMPLES or 80))
+        if len(examples) > max_n:
+            del examples[: max(0, len(examples) - max_n)]
+    except Exception:
+        return
+
+
+def _record_webhook_metric(symbol: str, sig_type: str, appended: bool) -> None:
+    if not ENTRY_METRICS_ENABLED:
+        return
+    now = time.time()
+    day_key = _utc_day_key(now)
+    with _metrics_lock:
+        _metrics_prune_locked(now)
+        b = _metrics_get_bucket_locked(day_key, symbol)
+        _metrics_inc_locked(b, "webhooks", 1)
+        if not appended:
+            _metrics_inc_locked(b, "duplicates", 1)
+        if (sig_type or "").strip().lower() == "context":
+            _metrics_inc_locked(b, "context_updates", 1)
+        if (sig_type or "").strip().lower() == "entry_trigger":
+            _metrics_inc_locked(b, "entry_triggers", 1)
+        _metrics_mark_dirty_locked()
+
+
+def _record_entry_outcome(
+    *,
+    symbol: str,
+    outcome: str,
+    http_status: int,
+    action: Optional[str] = None,
+    is_addon: Optional[bool] = None,
+    trigger: Optional[Dict[str, Any]] = None,
+    qtrend: Optional[Dict[str, Any]] = None,
+    market: Optional[Dict[str, Any]] = None,
+    window_signals: Optional[Dict[str, Any]] = None,
+    zones_confirmed_recent: Optional[int] = None,
+    ai_score: Optional[int] = None,
+    min_required: Optional[int] = None,
+    ai_reason: Optional[str] = None,
+) -> None:
+    if not ENTRY_METRICS_ENABLED:
+        return
+
+    now = time.time()
+    day_key = _utc_day_key(now)
+
+    spread_points = None
+    atr_to_spread = None
+    if isinstance(market, dict):
+        try:
+            spread_points = float(market.get("spread") or 0.0)
+        except Exception:
+            spread_points = None
+        try:
+            v = market.get("atr_to_spread")
+            atr_to_spread = float(v) if v is not None else None
+        except Exception:
+            atr_to_spread = None
+
+    q_side = (qtrend or {}).get("side") if isinstance(qtrend, dict) else None
+    q_strength = (qtrend or {}).get("strength") if isinstance(qtrend, dict) else None
+    w_counts = (window_signals or {}).get("counts") if isinstance(window_signals, dict) else None
+
+    with _metrics_lock:
+        _metrics_prune_locked(now)
+        b = _metrics_get_bucket_locked(day_key, symbol)
+        _metrics_inc_locked(b, "entry_attempts", 1)
+
+        guard_stats = b.get("guard_stats")
+        if not isinstance(guard_stats, dict):
+            guard_stats = {}
+            b["guard_stats"] = guard_stats
+        _metrics_update_guard_stat_locked(guard_stats, "spread_points", spread_points)
+        _metrics_update_guard_stat_locked(guard_stats, "atr_to_spread", atr_to_spread)
+        if isinstance(w_counts, dict):
+            _metrics_update_guard_stat_locked(guard_stats, "window_aligned", w_counts.get("aligned"))
+            _metrics_update_guard_stat_locked(guard_stats, "window_opposed", w_counts.get("opposed"))
+
+        if str(outcome) == "ok":
+            _metrics_inc_locked(b, "entry_ok", 1)
+        else:
+            blocked = b.get("blocked")
+            if not isinstance(blocked, dict):
+                blocked = {}
+                b["blocked"] = blocked
+            _metrics_inc_map_locked(blocked, str(outcome), 1)
+
+            if ai_score is not None:
+                hist = b.get("ai_score_hist")
+                if not isinstance(hist, dict):
+                    hist = {}
+                    b["ai_score_hist"] = hist
+                _metrics_inc_map_locked(hist, _metrics_bucket_score(int(ai_score)), 1)
+
+        examples = b.get("examples")
+        if not isinstance(examples, list):
+            examples = []
+            b["examples"] = examples
+
+        ex = {
+            "ts": now,
+            "outcome": str(outcome),
+            "http": int(http_status),
+            "action": action,
+            "addon": bool(is_addon) if is_addon is not None else None,
+            "ai_score": int(ai_score) if ai_score is not None else None,
+            "min_required": int(min_required) if min_required is not None else None,
+            "ai_reason": (str(ai_reason)[:220] if ai_reason else None),
+            "spread_points": spread_points,
+            "atr_to_spread": atr_to_spread,
+            "qtrend": {"side": q_side, "strength": q_strength} if (q_side or q_strength) else None,
+            "window_counts": w_counts,
+            "zones_confirmed_recent": int(zones_confirmed_recent) if zones_confirmed_recent is not None else None,
+            "trigger": {
+                "source": (trigger or {}).get("source"),
+                "event": (trigger or {}).get("event"),
+                "side": (trigger or {}).get("side"),
+                "signal_time": (trigger or {}).get("signal_time"),
+            }
+            if isinstance(trigger, dict)
+            else None,
+        }
+        _metrics_append_example_locked(examples, ex)
+        _metrics_mark_dirty_locked()
+
+
+def _load_metrics() -> None:
+    if not METRICS_FILE:
+        return
+    if not os.path.exists(METRICS_FILE):
+        return
+    try:
+        with open(METRICS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        with _metrics_lock:
+            _metrics.clear()
+            _metrics.update(data)
+            _metrics.setdefault("started_at", time.time())
+            _metrics.setdefault("by_day", {})
+            _metrics_prune_locked(time.time())
+            global _metrics_dirty, _metrics_last_save_at
+            _metrics_dirty = False
+            _metrics_last_save_at = time.time()
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to load metrics: {e}")
+
+
+def _save_metrics_locked() -> None:
+    if not METRICS_FILE:
+        return
+    try:
+        tmp = f"{METRICS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_metrics, f, ensure_ascii=False)
+        os.replace(tmp, METRICS_FILE)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to save metrics: {e}")
+
+
 def _load_cache():
     """起動時にファイルからシグナル履歴を復元する"""
     if not os.path.exists(CACHE_FILE):
@@ -1062,7 +1378,7 @@ def _mark_cache_dirty_locked(now: Optional[float] = None) -> None:
 
 def _cache_flush_loop() -> None:
     """Background loop to flush cache to disk at a controlled interval."""
-    global _cache_last_save_at, _cache_dirty
+    global _cache_last_save_at, _cache_dirty, _metrics_last_save_at, _metrics_dirty
     # small sleep to avoid hot loop; ensure >= 0.5s
     sleep_sec = max(0.5, float(CACHE_FLUSH_INTERVAL_SEC or 2.0))
     while True:
@@ -1094,6 +1410,23 @@ def _cache_flush_loop() -> None:
                 _cache_dirty = False
         except Exception as e:
             print(f"[FXAI][WARN] Cache flush loop error: {e}")
+
+        # Flush metrics (best-effort)
+        if not ENTRY_METRICS_ENABLED:
+            continue
+        try:
+            now = time.time()
+            with _metrics_lock:
+                if not _metrics_dirty:
+                    continue
+                # Reuse cache flush cadence; metrics volume is tiny.
+                if (now - float(_metrics_last_save_at or 0.0)) < float(CACHE_FLUSH_INTERVAL_SEC or 2.0):
+                    continue
+                _save_metrics_locked()
+                _metrics_last_save_at = now
+                _metrics_dirty = False
+        except Exception as e:
+            print(f"[FXAI][WARN] Metrics flush loop error: {e}")
 
 def _save_cache_locked():
     """シグナルキャッシュをファイルに保存する (Lock保持中に呼ぶこと)"""
@@ -2243,14 +2576,48 @@ def _attempt_entry_from_lorentzian(
     """
     trig_side = (normalized_trigger.get("side") or "").strip().lower()
     action = "BUY" if trig_side == "buy" else "SELL" if trig_side == "sell" else ""
+
+    def _finish(
+        message: str,
+        http_status: int,
+        outcome: str,
+        *,
+        ai_score: Optional[int] = None,
+        min_required: Optional[int] = None,
+        ai_reason: Optional[str] = None,
+        market: Optional[Dict[str, Any]] = None,
+        qtrend_ctx: Optional[Dict[str, Any]] = None,
+        window_signals: Optional[Dict[str, Any]] = None,
+        zones_confirmed_recent: Optional[int] = None,
+    ) -> tuple[str, int]:
+        try:
+            _record_entry_outcome(
+                symbol=symbol,
+                outcome=outcome,
+                http_status=int(http_status),
+                action=action,
+                is_addon=is_addon,
+                trigger=normalized_trigger,
+                qtrend=qtrend_ctx,
+                market=market,
+                window_signals=window_signals,
+                zones_confirmed_recent=zones_confirmed_recent,
+                ai_score=ai_score,
+                min_required=min_required,
+                ai_reason=ai_reason,
+            )
+        except Exception:
+            pass
+        return message, int(http_status)
+
     if action not in {"BUY", "SELL"}:
         _set_status(last_result="Invalid Lorentzian side", last_result_at=time.time())
-        return "Invalid trigger", 400
+        return _finish("Invalid trigger", 400, "invalid_trigger")
 
     # Safety: block entries when EA heartbeat is stale/missing.
     if not _heartbeat_is_fresh(now_ts=now):
         _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
-        return "Blocked by heartbeat", 503
+        return _finish("Blocked by heartbeat", 503, "blocked_heartbeat")
 
     positions_open = int((pos_summary or {}).get("positions_open") or 0)
     net_side = ((pos_summary or {}).get("net_side") or "flat").lower()
@@ -2267,11 +2634,11 @@ def _attempt_entry_from_lorentzian(
         # When holding positions, add-ons are strictly controlled.
         if net_side not in {"buy", "sell"}:
             _set_status(last_result="Skip entry (net_side unknown)", last_result_at=time.time())
-            return "Skip (net_side unknown)", 200
+            return _finish("Skip (net_side unknown)", 200, "skip_net_side_unknown")
 
         if (not ALLOW_ADD_ON_ENTRIES) or (net_side != trig_side):
             _set_status(last_result="Skip entry (position open)", last_result_at=time.time())
-            return "Skip (position open)", 200
+            return _finish("Skip (position open)", 200, "skip_position_open")
 
         is_addon = True
 
@@ -2289,7 +2656,7 @@ def _attempt_entry_from_lorentzian(
                     last_result_at=time.time(),
                     last_addon_limit={"max": max_entries, "count": count, "side": net_side},
                 )
-                return "Skip (add-on limit)", 200
+                return _finish("Skip (add-on limit)", 200, "skip_addon_limit")
             _addon_state_by_symbol[symbol] = st
 
     market = get_mt5_market_data(symbol)
@@ -2309,7 +2676,7 @@ def _attempt_entry_from_lorentzian(
 
     if spread_points <= 0:
         _set_status(last_result="Blocked (no spread)", last_result_at=time.time())
-        return "Blocked (no spread)", 503
+        return _finish("Blocked (no spread)", 503, "blocked_no_spread", market=market)
 
     if float(ENTRY_MAX_SPREAD_POINTS or 0.0) > 0 and spread_points >= float(ENTRY_MAX_SPREAD_POINTS):
         _set_status(
@@ -2317,7 +2684,7 @@ def _attempt_entry_from_lorentzian(
             last_result_at=time.time(),
             last_entry_guard={"spread_points": spread_points, "max": float(ENTRY_MAX_SPREAD_POINTS)},
         )
-        return "Blocked (spread too wide)", 200
+        return _finish("Blocked (spread too wide)", 200, "blocked_spread", market=market)
 
     if float(ENTRY_MIN_ATR_TO_SPREAD or 0.0) > 0 and (atr_to_spread_v is not None):
         if atr_to_spread_v < float(ENTRY_MIN_ATR_TO_SPREAD):
@@ -2326,7 +2693,7 @@ def _attempt_entry_from_lorentzian(
                 last_result_at=time.time(),
                 last_entry_guard={"atr_to_spread": atr_to_spread_v, "min": float(ENTRY_MIN_ATR_TO_SPREAD)},
             )
-            return "Blocked (ATR too small vs spread)", 200
+            return _finish("Blocked (ATR too small vs spread)", 200, "blocked_atr_to_spread", market=market)
 
     if float(ENTRY_COOLDOWN_SEC or 0.0) > 0:
         with _entry_lock:
@@ -2340,12 +2707,13 @@ def _attempt_entry_from_lorentzian(
                     "since_last_order_sec": round(float(now - last_sent), 3),
                 },
             )
-            return "Blocked (cooldown)", 200
+            return _finish("Blocked (cooldown)", 200, "blocked_cooldown", market=market)
 
     qtrend_ctx = _get_qtrend_context(symbol, now=now)
 
     trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
-    window_signals = _collect_window_signals_around_trigger(symbol, trig_st, trig_side, window_sec=300.0)
+    window_sec = float(CONFLUENCE_WINDOW_SEC or 300)
+    window_signals = _collect_window_signals_around_trigger(symbol, trig_st, trig_side, window_sec=window_sec)
     evidence_ctx = _collect_recent_context_signals(symbol, now)
 
     # Assemble a compact stats dict for the existing prompt structure.
@@ -2385,7 +2753,7 @@ def _attempt_entry_from_lorentzian(
     now_mono = time.time()
     if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
         _set_status(last_result="AI throttled", last_result_at=time.time())
-        return "AI throttled", 200
+        return _finish("AI throttled", 200, "ai_throttled", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
     _last_ai_attempt_key = attempt_key
     _last_ai_attempt_at = now_mono
 
@@ -2399,7 +2767,7 @@ def _attempt_entry_from_lorentzian(
     )
     if not ai_decision:
         _set_status(last_result="Blocked by AI (no score)", last_result_at=time.time())
-        return "Blocked by AI", 503
+        return _finish("Blocked by AI", 503, "blocked_ai_no_score", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
 
     ai_score = int(ai_decision.get("confluence_score") or 0)
     ai_reason = (ai_decision.get("reason") or "").strip()
@@ -2427,9 +2795,31 @@ def _attempt_entry_from_lorentzian(
                 },
             )
             print(f"[FXAI][ENTRY] Blocked add-on by AI: score={ai_score} min={min_addon_score} reason={reason_snip}")
-            return "Blocked add-on by AI", 403
+            return _finish(
+                "Blocked add-on by AI",
+                403,
+                "blocked_addon_ai",
+                ai_score=ai_score,
+                min_required=min_addon_score,
+                ai_reason=reason_snip,
+                market=market,
+                qtrend_ctx=qtrend_ctx,
+                window_signals=window_signals,
+                zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0),
+            )
     else:
-        if ai_score < AI_ENTRY_MIN_SCORE:
+        min_entry_score = int(AI_ENTRY_MIN_SCORE)
+        try:
+            if (
+                bool(qtrend_ctx)
+                and (str((qtrend_ctx or {}).get("strength") or "").strip().lower() == "strong")
+                and (str((qtrend_ctx or {}).get("side") or "").strip().lower() == trig_side)
+            ):
+                min_entry_score = int(AI_ENTRY_MIN_SCORE_STRONG_ALIGNED or AI_ENTRY_MIN_SCORE)
+        except Exception:
+            min_entry_score = int(AI_ENTRY_MIN_SCORE)
+
+        if ai_score < min_entry_score:
             reason_snip = ai_reason[:160] if ai_reason else ""
             _set_status(
                 last_result="Blocked by AI",
@@ -2437,7 +2827,7 @@ def _attempt_entry_from_lorentzian(
                 last_entry_guard={
                     "addon": False,
                     "ai_score": ai_score,
-                    "min_required": int(AI_ENTRY_MIN_SCORE),
+                    "min_required": int(min_entry_score),
                     "ai_reason": reason_snip,
                     "qtrend": {
                         "available": bool(qtrend_ctx),
@@ -2448,8 +2838,19 @@ def _attempt_entry_from_lorentzian(
                     "zones_confirmed_recent": int(stats.get("zones_confirmed_recent") or 0),
                 },
             )
-            print(f"[FXAI][ENTRY] Blocked by AI: score={ai_score} min={int(AI_ENTRY_MIN_SCORE)} reason={reason_snip}")
-            return f"Blocked by AI (score={ai_score}, reason={reason_snip})", 403
+            print(f"[FXAI][ENTRY] Blocked by AI: score={ai_score} min={int(min_entry_score)} reason={reason_snip}")
+            return _finish(
+                f"Blocked by AI (score={ai_score}, reason={reason_snip})",
+                403,
+                "blocked_ai_score",
+                ai_score=ai_score,
+                min_required=int(min_entry_score),
+                ai_reason=reason_snip,
+                market=market,
+                qtrend_ctx=qtrend_ctx,
+                window_signals=window_signals,
+                zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0),
+            )
 
     # Final multiplier: start from 1.0, modulate by AI.
     final_multiplier = float(_clamp(1.0 * lot_mult, 0.5, 2.0))
@@ -2457,7 +2858,7 @@ def _attempt_entry_from_lorentzian(
     # Re-check heartbeat just before sending the order (avoid race).
     if not _heartbeat_is_fresh(now_ts=time.time()):
         _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
-        return "Blocked by heartbeat", 503
+        return _finish("Blocked by heartbeat", 503, "blocked_heartbeat", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
 
     reason = ai_reason or "lorentzian_entry"
     payload = {
@@ -2519,7 +2920,18 @@ def _attempt_entry_from_lorentzian(
     )
 
     print(f"[FXAI][ZMQ] Order sent: {payload}")
-    return "OK", 200
+    return _finish(
+        "OK",
+        200,
+        "ok",
+        ai_score=ai_score,
+        min_required=int((ADDON_MIN_AI_SCORE if is_addon else (AI_ENTRY_MIN_SCORE_STRONG_ALIGNED if (qtrend_ctx and str((qtrend_ctx or {}).get("strength") or "").strip().lower() == "strong" and str((qtrend_ctx or {}).get("side") or "").strip().lower() == trig_side) else AI_ENTRY_MIN_SCORE)) or AI_ENTRY_MIN_SCORE),
+        ai_reason=ai_reason,
+        market=market,
+        qtrend_ctx=qtrend_ctx,
+        window_signals=window_signals,
+        zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0),
+    )
 
 
 @app.route('/webhook', methods=['POST'])
@@ -2594,6 +3006,12 @@ def webhook():
         _mark_cache_dirty_locked(now)
         if not CACHE_ASYNC_FLUSH_ENABLED:
             _save_cache_locked()
+
+    # Record webhook-level metrics (even if duplicate)
+    try:
+        _record_webhook_metric(symbol, (normalized.get("signal_type") or ""), bool(appended))
+    except Exception:
+        pass
 
     if not appended:
         _set_status(last_result="Duplicate webhook", last_result_at=time.time())
@@ -2767,6 +3185,42 @@ def status():
         if header_token != WEBHOOK_TOKEN:
             return "Unauthorized", 401
     return _get_status_snapshot(), 200
+
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    # Optional shared-secret authentication (same rule as /webhook)
+    if WEBHOOK_TOKEN:
+        header_token = (request.headers.get("X-Webhook-Token") or "").strip()
+        if header_token != WEBHOOK_TOKEN:
+            return "Unauthorized", 401
+
+    if not ensure_runtime_initialized():
+        return "Runtime init failed", 503
+
+    if not ENTRY_METRICS_ENABLED:
+        return {"ok": True, "enabled": False}, 200
+
+    with _metrics_lock:
+        snap = json.loads(json.dumps(_metrics))  # cheap deep-copy (small data)
+
+    snap["ok"] = True
+    snap["enabled"] = True
+    snap["config"] = {
+        "AI_ENTRY_MIN_SCORE": int(AI_ENTRY_MIN_SCORE),
+        "AI_ENTRY_MIN_SCORE_STRONG_ALIGNED": int(AI_ENTRY_MIN_SCORE_STRONG_ALIGNED),
+        "ADDON_MIN_AI_SCORE": int(ADDON_MIN_AI_SCORE),
+        "CONFLUENCE_WINDOW_SEC": int(CONFLUENCE_WINDOW_SEC),
+        "ENTRY_MAX_SPREAD_POINTS": float(ENTRY_MAX_SPREAD_POINTS),
+        "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
+        "ENTRY_COOLDOWN_SEC": float(ENTRY_COOLDOWN_SEC),
+        "Q_TREND_MAX_AGE_SEC": int(Q_TREND_MAX_AGE_SEC),
+        "SIGNAL_LOOKBACK_SEC": int(SIGNAL_LOOKBACK_SEC),
+        "ZONE_LOOKBACK_SEC": int(ZONE_LOOKBACK_SEC),
+        "ZONE_TOUCH_LOOKBACK_SEC": int(ZONE_TOUCH_LOOKBACK_SEC),
+    }
+
+    return Response(json.dumps(snap, ensure_ascii=False), mimetype="application/json"), 200
 
 
 if __name__ == '__main__':
