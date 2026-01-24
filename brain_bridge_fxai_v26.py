@@ -54,6 +54,7 @@ CACHE_FLUSH_FORCE_SEC = float(os.getenv("CACHE_FLUSH_FORCE_SEC", "10.0"))
 
 CONFLUENCE_LOOKBACK_SEC = int(os.getenv("CONFLUENCE_LOOKBACK_SEC", "600"))
 Q_TREND_MAX_AGE_SEC = int(os.getenv("Q_TREND_MAX_AGE_SEC", "300"))
+Q_TREND_TF_FALLBACK_ENABLED = _env_bool("Q_TREND_TF_FALLBACK_ENABLED", "0")
 
 ZONE_LOOKBACK_SEC = int(os.getenv("ZONE_LOOKBACK_SEC", "1200"))
 ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", "1200"))
@@ -149,7 +150,9 @@ _metrics_dirty = False
 _metrics_last_save_at = 0.0
 
 _qtrend_lock = Lock()
-_qtrend_state_by_symbol: Dict[str, Dict[str, Any]] = {}
+# Q-Trend context should be stored per timeframe to avoid mixing (e.g., M5 Q-Trend with H1 triggers).
+# Structure: { SYMBOL: { tf_key: state_dict } }
+_qtrend_state_by_symbol_tf: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 _last_atr_by_symbol: Dict[str, float] = {}
 
@@ -710,6 +713,14 @@ def _normalize_signal_fields(signal: dict) -> dict:
         else:
             s["source"] = src
 
+    # Some alert templates may send direction as `action` instead of `side`.
+    # Accept it as an alias (do not override an explicit `side`).
+    if (not s.get("side")) and isinstance(s.get("action"), str):
+        a = s.get("action")
+        a_norm = str(a).strip().lower()
+        if a_norm in {"buy", "sell"}:
+            s["side"] = a_norm
+
     if isinstance(s.get("side"), str):
         side_norm = s["side"].strip().lower()
         s["side"] = side_norm if side_norm else ""
@@ -728,6 +739,65 @@ def _normalize_signal_fields(signal: dict) -> dict:
         s["signal_time"] = parsed
     else:
         s["signal_time"] = s.get("receive_time")
+
+    # Keep timeframe (tf) if provided by alert templates.
+    tf_in = s.get("tf") or s.get("timeframe") or s.get("interval")
+    s["tf"] = _normalize_tf(tf_in)
+
+    # Keep a representative price if provided.
+    if "price" not in s:
+        s["price"] = s.get("close") or s.get("c")
+
+    return s
+
+
+def _normalize_tf(tf_value: Any) -> Optional[str]:
+    if tf_value is None:
+        return None
+    try:
+        if isinstance(tf_value, (int, float)):
+            n = int(tf_value)
+            if n <= 0:
+                return None
+            if n == 60:
+                return "h1"
+            if n == 240:
+                return "h4"
+            if n == 1440:
+                return "d1"
+            return f"m{n}"
+        s = str(tf_value).strip().lower().replace(" ", "")
+    except Exception:
+        return None
+
+    if not s:
+        return None
+
+    # Digits-only often mean minutes in TradingView alerts.
+    if s.isdigit():
+        n = int(s)
+        if n == 60:
+            return "h1"
+        if n == 240:
+            return "h4"
+        if n == 1440:
+            return "d1"
+        return f"m{n}"
+
+    if s.endswith("m") and s[:-1].isdigit():
+        return f"m{int(s[:-1])}"
+    if s.startswith("m") and s[1:].isdigit():
+        return f"m{int(s[1:])}"
+
+    if s in {"1h", "h1"}:
+        return "h1"
+    if s.endswith("h") and s[:-1].isdigit():
+        return f"h{int(s[:-1])}"
+    if s.startswith("h") and s[1:].isdigit():
+        return f"h{int(s[1:])}"
+
+    if s in {"d", "1d", "d1"}:
+        return "d1"
 
     return s
 
@@ -779,13 +849,19 @@ def _update_qtrend_context_from_signal(normalized: Dict[str, Any]) -> None:
     strength = (normalized.get("strength") or "normal").strip().lower()
     strength = "strong" if strength == "strong" else "normal"
 
+    tf_key = _normalize_tf(normalized.get("tf")) or "unknown"
+
     now = float(normalized.get("receive_time") or time.time())
     with _qtrend_lock:
-        _qtrend_state_by_symbol[symbol] = {
+        bucket = _qtrend_state_by_symbol_tf.get(symbol)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            _qtrend_state_by_symbol_tf[symbol] = bucket
+        bucket[tf_key] = {
             "side": side,
             "strength": strength,
             "updated_at": now,
-            "tf": normalized.get("tf"),
+            "tf": tf_key,
             "price": normalized.get("price"),
             "confirmed": normalized.get("confirmed"),
             "event": normalized.get("event"),
@@ -793,16 +869,43 @@ def _update_qtrend_context_from_signal(normalized: Dict[str, Any]) -> None:
         }
 
 
-def _get_qtrend_context(symbol: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+def _get_qtrend_context(symbol: str, now: Optional[float] = None, tf: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     sym = (symbol or "").strip().upper()
     if not sym:
         return None
     if now is None:
         now = time.time()
+
+    tf_key = _normalize_tf(tf)
     with _qtrend_lock:
-        st = _qtrend_state_by_symbol.get(sym)
-    if not st:
+        bucket = _qtrend_state_by_symbol_tf.get(sym)
+
+    if not isinstance(bucket, dict) or not bucket:
         return None
+
+    st = None
+    if tf_key:
+        if tf_key in bucket:
+            st = bucket.get(tf_key)
+        else:
+            # If caller specifies a timeframe but we don't have that TF, do not mix TFs by default.
+            if not Q_TREND_TF_FALLBACK_ENABLED:
+                return None
+
+    if st is None:
+        # Fallback (optional): choose the freshest timeframe context.
+        best_ts = 0.0
+        for cand in bucket.values():
+            if not isinstance(cand, dict):
+                continue
+            ts = float(cand.get("updated_at") or 0.0)
+            if ts > best_ts:
+                best_ts = ts
+                st = cand
+
+    if not isinstance(st, dict):
+        return None
+
     updated_at = float(st.get("updated_at") or 0.0)
     if updated_at <= 0:
         return None
@@ -2709,12 +2812,45 @@ def _attempt_entry_from_lorentzian(
             )
             return _finish("Blocked (cooldown)", 200, "blocked_cooldown", market=market)
 
-    qtrend_ctx = _get_qtrend_context(symbol, now=now)
-
     trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
     window_sec = float(CONFLUENCE_WINDOW_SEC or 300)
     window_signals = _collect_window_signals_around_trigger(symbol, trig_st, trig_side, window_sec=window_sec)
     evidence_ctx = _collect_recent_context_signals(symbol, now)
+
+    trig_tf = _normalize_tf(normalized_trigger.get("tf") or normalized_trigger.get("timeframe") or normalized_trigger.get("interval"))
+    qtrend_ctx = _get_qtrend_context(symbol, now=now, tf=trig_tf)
+
+    # If timeframe-matched Q-Trend context is unavailable (often because Q-Trend alerts omit `tf`),
+    # derive it from the most recent Q-Trend signal in the same confluence window.
+    if qtrend_ctx is None and isinstance(window_signals, dict):
+        candidates: List[Dict[str, Any]] = []
+        for group in ("aligned", "opposed", "neutral"):
+            for ev in (window_signals.get(group) or []):
+                if not isinstance(ev, dict):
+                    continue
+                src = (ev.get("source") or "")
+                if not _is_qtrend_source(str(src)):
+                    continue
+                side = (ev.get("side") or "").strip().lower()
+                if side not in {"buy", "sell"}:
+                    continue
+                candidates.append(ev)
+
+        if candidates:
+            best = max(candidates, key=lambda x: float(x.get("signal_time") or 0.0))
+            st = float(best.get("signal_time") or 0.0)
+            if st > 0 and (float(Q_TREND_MAX_AGE_SEC or 300) <= 0 or (now - st) <= float(Q_TREND_MAX_AGE_SEC or 300)):
+                qtrend_ctx = {
+                    "side": (best.get("side") or "").strip().lower(),
+                    "strength": (best.get("strength") or "normal"),
+                    "updated_at": st,
+                    "tf": trig_tf or "unknown",
+                    "price": best.get("price"),
+                    "confirmed": best.get("confirmed"),
+                    "event": best.get("event"),
+                    "source": best.get("source"),
+                    "derived_from_window": True,
+                }
 
     # Assemble a compact stats dict for the existing prompt structure.
     # Keep legacy keys used in the prompt where they still add value.
@@ -2989,6 +3125,8 @@ def webhook():
         "symbol": symbol,
         "source": source_for_cache,
         "side": data.get("side") or inferred_side,
+        "tf": data.get("tf") or data.get("timeframe") or data.get("interval"),
+        "price": data.get("price") or data.get("close") or data.get("c"),
         "strength": data.get("strength"),
         "signal_type": data.get("signal_type"),
         "event": data.get("event"),
@@ -3215,6 +3353,7 @@ def metrics():
         "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
         "ENTRY_COOLDOWN_SEC": float(ENTRY_COOLDOWN_SEC),
         "Q_TREND_MAX_AGE_SEC": int(Q_TREND_MAX_AGE_SEC),
+        "Q_TREND_TF_FALLBACK_ENABLED": bool(Q_TREND_TF_FALLBACK_ENABLED),
         "SIGNAL_LOOKBACK_SEC": int(SIGNAL_LOOKBACK_SEC),
         "ZONE_LOOKBACK_SEC": int(ZONE_LOOKBACK_SEC),
         "ZONE_TOUCH_LOOKBACK_SEC": int(ZONE_TOUCH_LOOKBACK_SEC),
