@@ -2502,9 +2502,10 @@ def _build_entry_filter_prompt(
             "confirm_signals": confirm_n,
             "oppose_unique_sources": opp_u,
             "oppose_signals": opp_n,
-            "confluence_score": confluence_score,
-            "confluence_score_base": confluence_score_base,
-            "qtrend_strong_bonus": strong_bonus,
+            # IMPORTANT: these are local heuristic points (small integers), NOT the AI output 1-100 score.
+            "local_points": confluence_score,
+            "local_points_base": confluence_score_base,
+            "qtrend_strong_bonus_points": strong_bonus,
             "opposition_score": opposition_score,
             "weighted_confirm_score": w_confirm,
             "weighted_oppose_score": w_oppose,
@@ -2530,7 +2531,7 @@ def _build_entry_filter_prompt(
             "spread_flag": spread_flag,
         },
         "constraints": {
-            "confluence_score_range": [1, 100],
+            "ai_confluence_score_range": [1, 100],
             "lot_multiplier_range": [0.5, 2.0],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
@@ -2558,6 +2559,7 @@ def _build_entry_filter_prompt(
         "- If some opposite FVG/Zones exist BUT trend is aligned and ATR-to-spread is healthy and confluence is decent, you MAY still approve ENTRY (EV can remain positive).\n"
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
+        "IMPORTANT: ContextJSON.confluence.local_points is a small local heuristic (NOT the output confluence_score 1-100).\n"
         "Return ONLY strict JSON schema:\n"
         '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
         "ContextJSON:\n"
