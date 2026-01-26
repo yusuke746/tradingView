@@ -151,9 +151,9 @@ DELAYED_ENTRY_SOURCES_RAW = str(os.getenv("DELAYED_ENTRY_SOURCES", "Q-Trend,Q-Tr
 
 AI_CLOSE_ENABLED = _env_bool("AI_CLOSE_ENABLED", "1")
 AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "20"))
-AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "55"))
+AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "65"))
 AI_CLOSE_FALLBACK = str(os.getenv("AI_CLOSE_FALLBACK", "hold") or "hold").strip().lower()
-AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "60"))
+AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65"))
 
 
 # --- Local entry safety guards (professional defaults) ---
