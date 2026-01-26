@@ -31,6 +31,42 @@ WEBHOOK_TOKEN = str(os.getenv("WEBHOOK_TOKEN", "") or "").strip()
 
 SYMBOL = (os.getenv("SYMBOL", "GOLD") or "GOLD").strip().upper()
 
+# Optional: normalize/alias incoming symbols to a canonical MT5 symbol.
+# Example: SYMBOL_ALIASES="XAUUSD=GOLD,XAUUSDm=GOLD,OANDA:XAUUSD=GOLD"
+SYMBOL_ALIASES_RAW = str(os.getenv("SYMBOL_ALIASES", "") or "").strip()
+
+
+def _parse_symbol_aliases(raw: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    s = (raw or "").strip()
+    if not s:
+        return out
+    # Split by comma/semicolon/newline
+    parts: List[str] = []
+    for chunk in s.replace("\n", ",").replace(";", ",").split(","):
+        chunk = (chunk or "").strip()
+        if chunk:
+            parts.append(chunk)
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+        elif ":" in p:
+            k, v = p.split(":", 1)
+        else:
+            continue
+        k = (k or "").strip().upper()
+        v = (v or "").strip().upper()
+        if not k or not v:
+            continue
+        # Allow broker prefixes in keys like OANDA:XAUUSD
+        if ":" in k:
+            k = k.split(":")[-1].strip().upper()
+        out[k] = v
+    return out
+
+
+SYMBOL_ALIASES = _parse_symbol_aliases(SYMBOL_ALIASES_RAW)
+
 ZMQ_PORT = str(os.getenv("ZMQ_PORT", "5555") or "5555").strip()
 ZMQ_BIND = str(os.getenv("ZMQ_BIND", "") or "").strip() or f"tcp://*:{ZMQ_PORT}"
 
@@ -289,7 +325,11 @@ def _extract_symbol_from_webhook(data: Dict[str, Any]) -> str:
     raw = str(raw).strip()
     if ":" in raw:
         raw = raw.split(":")[-1].strip()
-    return raw.upper() if raw else (SYMBOL or "").strip().upper()
+    sym = raw.upper() if raw else (SYMBOL or "").strip().upper()
+    # Apply aliases (e.g., XAUUSD -> GOLD)
+    if sym and isinstance(SYMBOL_ALIASES, dict) and sym in SYMBOL_ALIASES:
+        return str(SYMBOL_ALIASES.get(sym) or sym).strip().upper()
+    return sym
 
 
 def _ensure_mt5_symbol_selected(symbol: str) -> tuple[str, bool]:
@@ -888,9 +928,15 @@ def _get_qtrend_context(symbol: str, now: Optional[float] = None, tf: Optional[A
         if tf_key in bucket:
             st = bucket.get(tf_key)
         else:
-            # If caller specifies a timeframe but we don't have that TF, do not mix TFs by default.
-            if not Q_TREND_TF_FALLBACK_ENABLED:
-                return None
+            # Some alert payloads omit timeframe; we store those under "unknown".
+            # When a specific TF is requested but only "unknown" exists, prefer returning it
+            # over dropping Q-Trend context entirely.
+            if "unknown" in bucket:
+                st = bucket.get("unknown")
+            else:
+                # If caller specifies a timeframe but we don't have that TF, do not mix TFs by default.
+                if not Q_TREND_TF_FALLBACK_ENABLED:
+                    return None
 
     if st is None:
         # Fallback (optional): choose the freshest timeframe context.
@@ -1310,6 +1356,8 @@ def _record_entry_outcome(
     ai_score: Optional[int] = None,
     min_required: Optional[int] = None,
     ai_reason: Optional[str] = None,
+    openai_response_id: Optional[str] = None,
+    ai_latency_ms: Optional[int] = None,
 ) -> None:
     if not ENTRY_METRICS_ENABLED:
         return
@@ -1379,6 +1427,8 @@ def _record_entry_outcome(
             "ai_score": int(ai_score) if ai_score is not None else None,
             "min_required": int(min_required) if min_required is not None else None,
             "ai_reason": (str(ai_reason)[:220] if ai_reason else None),
+            "openai_response_id": (str(openai_response_id)[:120] if openai_response_id else None),
+            "ai_latency_ms": int(ai_latency_ms) if ai_latency_ms is not None else None,
             "spread_points": spread_points,
             "atr_to_spread": atr_to_spread,
             "qtrend": {"side": q_side, "strength": q_strength} if (q_side or q_strength) else None,
@@ -2214,6 +2264,7 @@ def _call_openai_with_retry(prompt: str) -> Optional[Dict[str, Any]]:
     last_err = None
     for i in range(API_RETRY_COUNT):
         try:
+            t0 = time.time()
             res = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 response_format={"type": "json_object"},
@@ -2227,7 +2278,17 @@ def _call_openai_with_retry(prompt: str) -> Optional[Dict[str, Any]]:
             raw_content = (res.choices[0].message.content or "").strip()
             if raw_content.startswith("```"):
                 raw_content = raw_content.replace("```json", "").replace("```", "").strip()
-            return json.loads(raw_content)
+            data = json.loads(raw_content)
+            if isinstance(data, dict):
+                try:
+                    data["_openai_response_id"] = getattr(res, "id", None)
+                except Exception:
+                    data["_openai_response_id"] = None
+                try:
+                    data["_ai_latency_ms"] = int(round((time.time() - t0) * 1000.0))
+                except Exception:
+                    data["_ai_latency_ms"] = None
+            return data
         except Exception as e:
             last_err = e
             if i < API_RETRY_COUNT - 1:
@@ -2262,7 +2323,13 @@ def _validate_ai_entry_score(decision: Dict[str, Any]) -> Optional[Dict[str, Any
         reason = ""
     reason = reason.strip()
 
-    return {"confluence_score": score, "lot_multiplier": lot_mult, "reason": reason}
+    out: Dict[str, Any] = {"confluence_score": score, "lot_multiplier": lot_mult, "reason": reason}
+    # optional meta for observability
+    if "_openai_response_id" in decision:
+        out["_openai_response_id"] = decision.get("_openai_response_id")
+    if "_ai_latency_ms" in decision:
+        out["_ai_latency_ms"] = decision.get("_ai_latency_ms")
+    return out
 
 
 def _build_entry_logic_prompt(
@@ -2310,7 +2377,7 @@ def _build_entry_logic_prompt(
             "Environment: Q-Trend provides direction/strength context only (not a trigger).\n"
             "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
             "Return ONLY strict JSON with this schema:\n"
-            '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
+            '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
             "ContextJSON:\n"
             + json.dumps(minimal_payload, ensure_ascii=False)
         )
@@ -2319,7 +2386,7 @@ def _build_entry_logic_prompt(
     return (
         "You are a strict confluence scoring engine for algorithmic trading.\n"
         "Given the technical context, output ONLY strict JSON with this schema:\n"
-        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
+        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
         "--- CONTEXT BELOW (do not output it) ---\n"
         + base
     )
@@ -2492,7 +2559,7 @@ def _build_entry_filter_prompt(
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
         "Return ONLY strict JSON schema:\n"
-        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "short"}\n\n'
+        '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
         "ContextJSON:\n"
         + json.dumps(payload, ensure_ascii=False)
     )
@@ -2521,7 +2588,12 @@ def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
     if trail_mode not in {"WIDE", "NORMAL", "TIGHT"}:
         trail_mode = "NORMAL"
 
-    return {"action": action, "confidence": confidence, "reason": reason, "trail_mode": trail_mode}  # 追加
+    out: Dict[str, Any] = {"action": action, "confidence": confidence, "reason": reason, "trail_mode": trail_mode}
+    if "_openai_response_id" in decision:
+        out["_openai_response_id"] = decision.get("_openai_response_id")
+    if "_ai_latency_ms" in decision:
+        out["_ai_latency_ms"] = decision.get("_ai_latency_ms")
+    return out
 
 
 def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> str:
@@ -2612,7 +2684,7 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     "   - 'NORMAL': Standard trend strength.\n"
     "   - 'TIGHT': Momentum is weakening or chopping. Tighten stop to protect profits.\n"
     "Return ONLY strict JSON with this schema:\n"
-    '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "short"}\n\n'
+    '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "brief"}\n\n'
     "ContextJSON:\n"
     + json.dumps(payload, ensure_ascii=False)
     )
@@ -2688,6 +2760,8 @@ def _attempt_entry_from_lorentzian(
         ai_score: Optional[int] = None,
         min_required: Optional[int] = None,
         ai_reason: Optional[str] = None,
+        openai_response_id: Optional[str] = None,
+        ai_latency_ms: Optional[int] = None,
         market: Optional[Dict[str, Any]] = None,
         qtrend_ctx: Optional[Dict[str, Any]] = None,
         window_signals: Optional[Dict[str, Any]] = None,
@@ -2708,6 +2782,8 @@ def _attempt_entry_from_lorentzian(
                 ai_score=ai_score,
                 min_required=min_required,
                 ai_reason=ai_reason,
+                openai_response_id=openai_response_id,
+                ai_latency_ms=ai_latency_ms,
             )
         except Exception:
             pass
@@ -2908,6 +2984,8 @@ def _attempt_entry_from_lorentzian(
     ai_score = int(ai_decision.get("confluence_score") or 0)
     ai_reason = (ai_decision.get("reason") or "").strip()
     lot_mult = float(ai_decision.get("lot_multiplier") or 1.0)
+    openai_response_id = ai_decision.get("_openai_response_id")
+    ai_latency_ms = ai_decision.get("_ai_latency_ms")
 
     if is_addon:
         min_addon_score = int(ADDON_MIN_AI_SCORE or AI_ENTRY_MIN_SCORE)
@@ -2938,6 +3016,8 @@ def _attempt_entry_from_lorentzian(
                 ai_score=ai_score,
                 min_required=min_addon_score,
                 ai_reason=reason_snip,
+                openai_response_id=openai_response_id,
+                ai_latency_ms=ai_latency_ms,
                 market=market,
                 qtrend_ctx=qtrend_ctx,
                 window_signals=window_signals,
@@ -2982,6 +3062,8 @@ def _attempt_entry_from_lorentzian(
                 ai_score=ai_score,
                 min_required=int(min_entry_score),
                 ai_reason=reason_snip,
+                openai_response_id=openai_response_id,
+                ai_latency_ms=ai_latency_ms,
                 market=market,
                 qtrend_ctx=qtrend_ctx,
                 window_signals=window_signals,
@@ -3063,6 +3145,8 @@ def _attempt_entry_from_lorentzian(
         ai_score=ai_score,
         min_required=int((ADDON_MIN_AI_SCORE if is_addon else (AI_ENTRY_MIN_SCORE_STRONG_ALIGNED if (qtrend_ctx and str((qtrend_ctx or {}).get("strength") or "").strip().lower() == "strong" and str((qtrend_ctx or {}).get("side") or "").strip().lower() == trig_side) else AI_ENTRY_MIN_SCORE)) or AI_ENTRY_MIN_SCORE),
         ai_reason=ai_reason,
+        openai_response_id=openai_response_id,
+        ai_latency_ms=ai_latency_ms,
         market=market,
         qtrend_ctx=qtrend_ctx,
         window_signals=window_signals,
@@ -3162,11 +3246,15 @@ def webhook():
                 "symbol": symbol,
                 "source": normalized.get("source"),
                 "side": normalized.get("side"),
+                "tf": normalized.get("tf"),
+                "price": normalized.get("price"),
                 "signal_type": normalized.get("signal_type"),
                 "event": normalized.get("event"),
                 "confirmed": normalized.get("confirmed"),
                 "strength": normalized.get("strength"),
                 "time": normalized.get("signal_time"),
+                "raw_tf": data.get("tf") or data.get("timeframe") or data.get("interval"),
+                "raw_price": data.get("price") or data.get("close") or data.get("c"),
                 "raw_source": source_in,
                 "raw_action": raw_action,
             },
@@ -3401,7 +3489,7 @@ if __name__ == '__main__':
                 print("[FXAI][WARN] Continuing to start Flask anyway (PORT_PRECHECK_MODE=warn).")
 
     try:
-        app.run(host='0.0.0.0', port=WEBHOOK_PORT)
+        app.run(host='0.0.0.0', port=WEBHOOK_PORT, threaded=True)
     except OSError as e:
         print(f"[FXAI][FATAL] Failed to start web server on 0.0.0.0:{WEBHOOK_PORT}. OS error: {e}")
         print("[FXAI][HINT] If you must use port 80, ensure nothing else is listening on it (IIS/Apache/Nginx/another Python process).")
