@@ -135,6 +135,20 @@ CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "600"))
 CONFLUENCE_DEBUG = _env_bool("CONFLUENCE_DEBUG", "0")
 CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 
+# --- Optional: delayed entry re-evaluation (cost-agnostic) ---
+# If enabled, we keep the last Lorentzian entry_trigger as "pending" and will re-run
+# the entry decision when new context/structure signals arrive AFTER the trigger time
+# (e.g., Q-Trend at +5m). This helps include late-arriving evidence in ContextJSON.
+DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "0")
+# Max seconds after the trigger to allow delayed attempts (defaults to the confluence window).
+DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", str(CONFLUENCE_WINDOW_SEC)))
+# Total attempts INCLUDING the initial attempt on Lorentzian.
+DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS = int(os.getenv("DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS", "3"))
+# Minimum gap between attempts (seconds).
+DELAYED_ENTRY_MIN_GAP_SEC = float(os.getenv("DELAYED_ENTRY_MIN_GAP_SEC", "5"))
+# Only re-attempt when these sources arrive in-window (normalized sources).
+DELAYED_ENTRY_SOURCES_RAW = str(os.getenv("DELAYED_ENTRY_SOURCES", "Q-Trend,Q-Trend Strong,Zones,FVG") or "").strip()
+
 AI_CLOSE_ENABLED = _env_bool("AI_CLOSE_ENABLED", "1")
 AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "20"))
 AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "55"))
@@ -197,6 +211,138 @@ _addon_state_by_symbol: Dict[str, Dict[str, Any]] = {}
 
 _entry_lock = Lock()
 _last_order_sent_at_by_symbol: Dict[str, float] = {}
+
+_pending_entry_lock = Lock()
+# Per symbol: pending Lorentzian trigger for delayed re-evaluation.
+_pending_entry_by_symbol: Dict[str, Dict[str, Any]] = {}
+
+
+def _parse_csv_set(raw: str) -> set:
+    out = set()
+    s = (raw or "").strip()
+    if not s:
+        return out
+    for chunk in s.replace(";", ",").replace("\n", ",").split(","):
+        v = (chunk or "").strip()
+        if v:
+            out.add(v)
+    return out
+
+
+DELAYED_ENTRY_SOURCES = _parse_csv_set(DELAYED_ENTRY_SOURCES_RAW)
+
+
+def _pending_entry_set(symbol: str, trigger: Dict[str, Any], now: float) -> None:
+    sym = (symbol or "").strip().upper()
+    if not sym or not isinstance(trigger, dict):
+        return
+    trig_ts = float(trigger.get("signal_time") or trigger.get("receive_time") or now)
+    with _pending_entry_lock:
+        _pending_entry_by_symbol[sym] = {
+            "trigger": dict(trigger),
+            "trigger_ts": trig_ts,
+            "created_at": float(now),
+            "attempts": 0,
+            "last_attempt_at": 0.0,
+            "last_context_ts": 0.0,
+        }
+
+
+def _pending_entry_clear(symbol: str) -> None:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return
+    with _pending_entry_lock:
+        _pending_entry_by_symbol.pop(sym, None)
+
+
+def _pending_entry_get(symbol: str) -> Optional[Dict[str, Any]]:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    with _pending_entry_lock:
+        st = _pending_entry_by_symbol.get(sym)
+        return dict(st) if isinstance(st, dict) else None
+
+
+def _pending_entry_note_attempt(symbol: str, now: float, context_ts: Optional[float] = None) -> None:
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return
+    with _pending_entry_lock:
+        st = _pending_entry_by_symbol.get(sym)
+        if not isinstance(st, dict):
+            return
+        st["attempts"] = int(st.get("attempts") or 0) + 1
+        st["last_attempt_at"] = float(now)
+        if context_ts is not None:
+            try:
+                st["last_context_ts"] = float(max(float(st.get("last_context_ts") or 0.0), float(context_ts)))
+            except Exception:
+                pass
+        _pending_entry_by_symbol[sym] = st
+
+
+def _maybe_attempt_delayed_entry(symbol: str, incoming: Dict[str, Any], now: float, pos_summary: Optional[dict]) -> Optional[tuple[str, int]]:
+    """Attempt entry again when new evidence arrives after Lorentzian.
+
+    Returns (message, http_status) from entry attempt when attempted, else None.
+    """
+    if not DELAYED_ENTRY_ENABLED:
+        return None
+    st = _pending_entry_get(symbol)
+    if not isinstance(st, dict):
+        return None
+
+    trig = st.get("trigger")
+    if not isinstance(trig, dict):
+        _pending_entry_clear(symbol)
+        return None
+
+    trig_ts = float(st.get("trigger_ts") or 0.0)
+    if trig_ts <= 0:
+        _pending_entry_clear(symbol)
+        return None
+
+    max_wait = float(DELAYED_ENTRY_MAX_WAIT_SEC or 0.0)
+    if max_wait > 0 and (float(now) - trig_ts) > max_wait:
+        _pending_entry_clear(symbol)
+        return None
+
+    # Only react to selected sources (normalized)
+    src = (incoming.get("source") or "").strip()
+    if DELAYED_ENTRY_SOURCES and (src not in DELAYED_ENTRY_SOURCES):
+        return None
+
+    # Incoming signal must be within (trigger_ts, trigger_ts + max_wait]
+    sig_ts = float(incoming.get("signal_time") or incoming.get("receive_time") or 0.0)
+    if sig_ts <= 0:
+        return None
+    if sig_ts < trig_ts:
+        return None
+    if max_wait > 0 and (sig_ts - trig_ts) > max_wait:
+        return None
+
+    # Avoid repeated attempts on the same context timestamp.
+    last_ctx = float(st.get("last_context_ts") or 0.0)
+    if sig_ts <= last_ctx:
+        return None
+
+    attempts = int(st.get("attempts") or 0)
+    if int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS):
+        _pending_entry_clear(symbol)
+        return None
+
+    last_attempt_at = float(st.get("last_attempt_at") or 0.0)
+    if last_attempt_at > 0 and (float(now) - last_attempt_at) < float(DELAYED_ENTRY_MIN_GAP_SEC or 0.0):
+        return None
+
+    print(f"[FXAI][ENTRY] Delayed re-eval triggered by {src} at t={sig_ts:.3f} (trigger_ts={trig_ts:.3f})")
+    _pending_entry_note_attempt(symbol, now=float(now), context_ts=sig_ts)
+    msg, code = _attempt_entry_from_lorentzian(symbol, dict(trig), float(now), pos_summary=pos_summary)
+    if (msg == "OK") and int(code) == 200:
+        _pending_entry_clear(symbol)
+    return msg, int(code)
 
 # fxChartAI v2.6思想寄せ：
 
@@ -3390,7 +3536,25 @@ def webhook():
 
     # --- ENTRY (Lorentzian) ---
     if pending_entry_trigger and normalized_trigger:
-        return _attempt_entry_from_lorentzian(symbol, normalized_trigger, now, pos_summary=pos_summary)
+        if DELAYED_ENTRY_ENABLED:
+            _pending_entry_set(symbol, normalized_trigger, now)
+            # Count the initial attempt against the total budget.
+            _pending_entry_note_attempt(symbol, now=float(now), context_ts=float(normalized_trigger.get("signal_time") or 0.0) or None)
+        msg, code = _attempt_entry_from_lorentzian(symbol, normalized_trigger, now, pos_summary=pos_summary)
+        if DELAYED_ENTRY_ENABLED and (msg == "OK") and int(code) == 200:
+            _pending_entry_clear(symbol)
+        return msg, int(code)
+
+    # Optional: delayed entry re-evaluation on new evidence (Q-Trend/Zones/FVG) after Lorentzian.
+    # We keep the webhook response 200 for context signals to avoid noisy alert failures on TradingView.
+    if DELAYED_ENTRY_ENABLED and sig_type in {"context", "structure"}:
+        attempted = _maybe_attempt_delayed_entry(symbol, normalized, now, pos_summary)
+        if attempted is not None:
+            msg, code = attempted
+            if (msg == "OK") and int(code) == 200:
+                return "OK", 200
+            _set_status(last_result="Context stored (delayed entry attempted)", last_result_at=time.time())
+            return "Context stored", 200
 
     if sig_type == "context":
         _set_status(last_result="Context stored", last_result_at=time.time())
@@ -3439,6 +3603,11 @@ def metrics():
         "AI_ENTRY_MIN_SCORE_STRONG_ALIGNED": int(AI_ENTRY_MIN_SCORE_STRONG_ALIGNED),
         "ADDON_MIN_AI_SCORE": int(ADDON_MIN_AI_SCORE),
         "CONFLUENCE_WINDOW_SEC": int(CONFLUENCE_WINDOW_SEC),
+        "DELAYED_ENTRY_ENABLED": bool(DELAYED_ENTRY_ENABLED),
+        "DELAYED_ENTRY_MAX_WAIT_SEC": float(DELAYED_ENTRY_MAX_WAIT_SEC),
+        "DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS": int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS),
+        "DELAYED_ENTRY_MIN_GAP_SEC": float(DELAYED_ENTRY_MIN_GAP_SEC),
+        "DELAYED_ENTRY_SOURCES": sorted(list(DELAYED_ENTRY_SOURCES)) if isinstance(DELAYED_ENTRY_SOURCES, set) else [],
         "ENTRY_MAX_SPREAD_POINTS": float(ENTRY_MAX_SPREAD_POINTS),
         "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
         "ENTRY_COOLDOWN_SEC": float(ENTRY_COOLDOWN_SEC),
