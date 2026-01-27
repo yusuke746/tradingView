@@ -129,6 +129,9 @@ AI_ENTRY_MIN_SCORE_STRONG_ALIGNED = int(os.getenv("AI_ENTRY_MIN_SCORE_STRONG_ALI
 AI_ENTRY_THROTTLE_SEC = float(os.getenv("AI_ENTRY_THROTTLE_SEC", "15"))
 ADDON_MIN_AI_SCORE = int(os.getenv("ADDON_MIN_AI_SCORE", str(AI_ENTRY_MIN_SCORE)))
 
+# /status observability: keep last N entry outcomes (ring buffer)
+ENTRY_STATUS_HISTORY_MAX = int(os.getenv("ENTRY_STATUS_HISTORY_MAX", "30"))
+
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
 
 CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "600"))
@@ -149,7 +152,7 @@ DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "1")
 # Maximum time to keep a pending Lorentzian trigger.
 DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", str(CONFLUENCE_WINDOW_SEC)))
 # Minimum interval between AI re-evaluations for the same pending trigger.
-DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "20"))
+DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "3"))
 # Safety cap: maximum number of attempts for one pending trigger (including the initial attempt).
 DELAYED_ENTRY_MAX_ATTEMPTS = int(os.getenv("DELAYED_ENTRY_MAX_ATTEMPTS", "4"))
 
@@ -410,6 +413,14 @@ _last_status: Dict[str, Any] = {
     "last_mgmt_at": None,
     "last_mgmt_throttled": None,
 
+    # Entry attempt observability
+    "last_entry_attempt_at": None,
+    "last_entry_attempt_context": None,
+    "last_entry_bypass_ai_throttle": None,
+
+    # Recent entry outcomes (ring buffer)
+    "recent_entry_events": [],
+
     # Heartbeat (EA -> Python)
     "heartbeat_enabled": bool(ZMQ_HEARTBEAT_ENABLED),
     "heartbeat_timeout_sec": float(ZMQ_HEARTBEAT_TIMEOUT_SEC),
@@ -423,9 +434,32 @@ def _set_status(**kwargs) -> None:
         _last_status.update(kwargs)
 
 
+def _status_append_recent_entry_event(ev: Dict[str, Any]) -> None:
+    """Append an entry event to the in-memory /status ring buffer."""
+    try:
+        max_n = int(ENTRY_STATUS_HISTORY_MAX or 0)
+    except Exception:
+        max_n = 30
+    if max_n <= 0:
+        return
+    if not isinstance(ev, dict):
+        return
+    with _status_lock:
+        arr = _last_status.get("recent_entry_events")
+        if not isinstance(arr, list):
+            arr = []
+        arr.append(ev)
+        if len(arr) > max_n:
+            del arr[: max(0, len(arr) - max_n)]
+        _last_status["recent_entry_events"] = arr
+
+
 def _get_status_snapshot() -> Dict[str, Any]:
     with _status_lock:
         snap = dict(_last_status)
+    # Copy list-like fields to avoid mutation during serialization.
+    if isinstance(snap.get("recent_entry_events"), list):
+        snap["recent_entry_events"] = list(snap.get("recent_entry_events") or [])
     # add lightweight cache stats without holding status lock
     with signals_lock:
         snap["signals_cache_len"] = len(signals_cache)
@@ -462,6 +496,7 @@ def _get_status_snapshot() -> Dict[str, Any]:
                 "expires_in_sec": round(expires_at - now2, 3) if expires_at > 0 else None,
                 "attempts": attempts,
                 "last_attempt_age_sec": round(now2 - last_attempt_at, 3) if last_attempt_at > 0 else None,
+                "last_attempt_context": st.get("last_attempt_context"),
                 "last_retry_signal": st.get("last_retry_signal"),
             }
         snap["pending_entries"] = pending_items
@@ -514,6 +549,57 @@ def _clear_pending_entry(symbol: str, *, reason: str) -> None:
         print(f"[FXAI][DELAYED_ENTRY] Cleared pending for {symbol}: {reason}")
 
 
+def _reserve_pending_entry_attempt(
+    symbol: str,
+    now: float,
+    *,
+    retry_signal: Optional[dict] = None,
+    attempt_context: Optional[str] = None,
+) -> Optional[int]:
+    """Reserve an attempt slot for a pending entry.
+
+    Centralizes the attempt counters and retry throttling to avoid drift across call sites.
+    Returns the (1-based) attempt number if reserved, else None.
+    """
+    try:
+        min_interval = float(DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC or 0.0)
+    except Exception:
+        min_interval = 0.0
+
+    with _pending_entry_lock:
+        st = _pending_entry_by_symbol.get(symbol)
+        if not isinstance(st, dict):
+            return None
+
+        last_attempt_at = float(st.get("last_attempt_at") or 0.0)
+        attempts = int(st.get("attempts") or 0)
+
+        if int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS):
+            _pending_entry_by_symbol.pop(symbol, None)
+            return None
+
+        if last_attempt_at > 0 and min_interval > 0 and (now - last_attempt_at) < min_interval:
+            return None
+
+        st["last_attempt_at"] = float(now)
+        st["attempts"] = attempts + 1
+        if attempt_context:
+            st["last_attempt_context"] = str(attempt_context)[:160]
+
+        if isinstance(retry_signal, dict):
+            st["last_retry_signal"] = {
+                "source": retry_signal.get("source"),
+                "event": retry_signal.get("event"),
+                "side": retry_signal.get("side"),
+                "tf": retry_signal.get("tf"),
+                "signal_time": retry_signal.get("signal_time"),
+                "receive_time": retry_signal.get("receive_time"),
+            }
+
+        _pending_entry_by_symbol[symbol] = st
+        return int(attempts + 1)
+
+
 def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> bool:
     """Return True if incoming signal is the kind that should trigger a delayed re-evaluation."""
     try:
@@ -522,12 +608,15 @@ def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> boo
         evt = (incoming.get("event") or "").strip().lower()
         inc_side = (incoming.get("side") or "").strip().lower()
         pend_side = (pending_trigger.get("side") or "").strip().lower()
+        confirmed = (incoming.get("confirmed") or "").strip().lower()
+        strength = (incoming.get("strength") or "").strip().lower()
     except Exception:
         return False
 
-    # Only re-evaluate on signals that can add evidence.
-    if sig_type not in {"context", "structure", "trend_filter"} and src not in {"Zones", "FVG", "OSGFC", "LuxAlgo_FVG"}:
-        return False
+    # Tighten delayed re-evaluation triggers to reduce noisy repeated AI calls.
+    # We only re-evaluate when the incoming signal is likely to add *structural* evidence.
+    is_confirmed = confirmed in {"bar_close", "confirmed", "close"}
+    is_strong = strength == "strong"
 
     # Directional signals must match the pending trigger direction.
     if inc_side in {"buy", "sell"} and pend_side in {"buy", "sell"} and inc_side != pend_side:
@@ -537,15 +626,21 @@ def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> boo
     if _is_qtrend_source(src):
         return True
 
-    # Zones/FVG touches help; zone confirmations can help even if neutral.
-    if src == "Zones" and (evt in {"zone_retrace_touch", "zone_touch", "new_zone_confirmed", "zone_confirmed"} or "touch" in evt):
-        return True
-    if src in {"FVG", "LuxAlgo_FVG"} and (evt in {"fvg_touch"} or "touch" in evt):
+    # Zones structure confirmations (neutral is ok) are meaningful.
+    if src == "Zones" and sig_type in {"structure", "zones", "zone"} and evt in {"new_zone_confirmed", "zone_confirmed", "new_zone", "zone_created", "zone_breakout"}:
         return True
 
-    # Other allowed evidence sources in the pipeline.
-    if src in {"OSGFC"}:
-        return True
+    # Zones touch events are noisy; only trigger delayed re-eval when confirmed/strong.
+    if src == "Zones" and (evt in {"zone_retrace_touch", "zone_touch"} or "touch" in evt):
+        return bool(is_confirmed or is_strong)
+
+    # FVG touch events: also require confirmed/strong.
+    if src in {"FVG", "LuxAlgo_FVG"} and (evt == "fvg_touch" or "touch" in evt):
+        return bool(is_confirmed or is_strong)
+
+    # Trend filter evidence: only when confirmed (avoid intrabar churn).
+    if src == "OSGFC" or sig_type == "trend_filter":
+        return bool(is_confirmed)
 
     return False
 
@@ -576,33 +671,26 @@ def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float)
         _clear_pending_entry(symbol, reason="positions_open")
         return None
 
-    # Throttle + attempt caps
+    retry_src = (incoming_signal.get("source") or "")
+    retry_evt = (incoming_signal.get("event") or "")
+    retry_tf = (incoming_signal.get("tf") or "")
+    retry_st_raw = incoming_signal.get("signal_time") or incoming_signal.get("receive_time") or now
     try:
-        min_interval = float(DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC or 0.0)
+        retry_st = float(retry_st_raw)
     except Exception:
-        min_interval = 0.0
+        retry_st = float(now)
+    retry_strength = str(incoming_signal.get("strength") or "")
+    retry_confirmed = 1 if bool(incoming_signal.get("confirmed")) else 0
+    attempt_context = f"DE:{retry_src}:{retry_evt}:{retry_tf}:{retry_st:.0f}:{retry_strength}:{retry_confirmed}"
 
-    with _pending_entry_lock:
-        st2 = _pending_entry_by_symbol.get(symbol) or {}
-        last_attempt_at = float(st2.get("last_attempt_at") or 0.0)
-        attempts = int(st2.get("attempts") or 0)
-        if int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS):
-            _pending_entry_by_symbol.pop(symbol, None)
-            return None
-        if last_attempt_at > 0 and min_interval > 0 and (now - last_attempt_at) < min_interval:
-            return None
-        # reserve attempt slot
-        st2["last_attempt_at"] = float(now)
-        st2["attempts"] = attempts + 1
-        st2["last_retry_signal"] = {
-            "source": incoming_signal.get("source"),
-            "event": incoming_signal.get("event"),
-            "side": incoming_signal.get("side"),
-            "tf": incoming_signal.get("tf"),
-            "signal_time": incoming_signal.get("signal_time"),
-            "receive_time": incoming_signal.get("receive_time"),
-        }
-        _pending_entry_by_symbol[symbol] = st2
+    attempt_n = _reserve_pending_entry_attempt(
+        symbol,
+        float(now),
+        retry_signal=incoming_signal,
+        attempt_context=attempt_context,
+    )
+    if attempt_n is None:
+        return None
 
     with _entry_lock:
         last_sent_before = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
@@ -612,15 +700,28 @@ def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float)
         + json.dumps(
             {
                 "symbol": symbol,
-                "incoming": {"source": incoming_signal.get("source"), "event": incoming_signal.get("event"), "side": incoming_signal.get("side"), "tf": incoming_signal.get("tf")},
-                "attempt": int(attempts + 1),
+                "incoming": {
+                    "source": incoming_signal.get("source"),
+                    "event": incoming_signal.get("event"),
+                    "side": incoming_signal.get("side"),
+                    "tf": incoming_signal.get("tf"),
+                },
+                "attempt": int(attempt_n),
                 "max_attempts": int(DELAYED_ENTRY_MAX_ATTEMPTS or 0),
+                "attempt_context": attempt_context,
             },
             ensure_ascii=False,
         )
     )
 
-    resp = _attempt_entry_from_lorentzian(symbol, trigger, now, pos_summary=pos_summary)
+    resp = _attempt_entry_from_lorentzian(
+        symbol,
+        trigger,
+        now,
+        pos_summary=pos_summary,
+        bypass_ai_throttle=True,
+        attempt_context=attempt_context,
+    )
 
     with _entry_lock:
         last_sent_after = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
@@ -1672,6 +1773,8 @@ def _record_entry_outcome(
     ai_reason: Optional[str] = None,
     openai_response_id: Optional[str] = None,
     ai_latency_ms: Optional[int] = None,
+    attempt_context: Optional[str] = None,
+    bypass_ai_throttle: Optional[bool] = None,
 ) -> None:
     if not ENTRY_METRICS_ENABLED:
         return
@@ -1700,6 +1803,12 @@ def _record_entry_outcome(
         _metrics_prune_locked(now)
         b = _metrics_get_bucket_locked(day_key, symbol)
         _metrics_inc_locked(b, "entry_attempts", 1)
+
+        # Observability counters
+        if attempt_context and str(attempt_context).startswith("DE:"):
+            _metrics_inc_locked(b, "delayed_entry_attempts", 1)
+        if bool(bypass_ai_throttle):
+            _metrics_inc_locked(b, "ai_throttle_bypassed", 1)
 
         guard_stats = b.get("guard_stats")
         if not isinstance(guard_stats, dict):
@@ -1738,6 +1847,8 @@ def _record_entry_outcome(
             "http": int(http_status),
             "action": action,
             "addon": bool(is_addon) if is_addon is not None else None,
+            "attempt_context": (str(attempt_context)[:160] if attempt_context else None),
+            "bypass_ai_throttle": bool(bypass_ai_throttle) if bypass_ai_throttle is not None else None,
             "ai_score": int(ai_score) if ai_score is not None else None,
             "min_required": int(min_required) if min_required is not None else None,
             "ai_reason": (str(ai_reason)[:220] if ai_reason else None),
@@ -2653,6 +2764,7 @@ def _build_entry_logic_prompt(
     action: str,
     normalized_trigger: Optional[Dict[str, Any]] = None,
     qtrend_context: Optional[Dict[str, Any]] = None,
+    attempt_context: Optional[str] = None,
 ) -> str:
     """Entry context prompt (new spec).
 
@@ -2665,6 +2777,7 @@ def _build_entry_logic_prompt(
         minimal_payload = {
             "symbol": symbol,
             "proposed_action": action,
+            "attempt_context": (str(attempt_context)[:160] if attempt_context else None),
             "trigger": {
                 "source": (normalized_trigger or {}).get("source"),
                 "side": (normalized_trigger or {}).get("side"),
@@ -2691,11 +2804,12 @@ def _build_entry_logic_prompt(
             "You are a strict confluence scoring engine for algorithmic trading.\n"
             "Trigger: Lorentzian fired the proposed_action.\n"
             "Environment: Q-Trend provides direction/strength context only (not a trigger).\n"
-            "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
-            "IMPORTANT: If ContextJSON.price_drift.enabled is true and price_drift.ok is false, output a VERY LOW confluence_score (e.g., <= 20).\n"
-            "Return ONLY strict JSON with this schema:\n"
-            '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
-            "ContextJSON:\n"
+            + (f"AttemptContext: {str(attempt_context)[:160]}\n" if attempt_context else "")
+            + "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
+            + "IMPORTANT: If ContextJSON.price_drift.enabled is true and price_drift.ok is false, output a VERY LOW confluence_score (e.g., <= 20).\n"
+            + "Return ONLY strict JSON with this schema:\n"
+            + '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
+            + "ContextJSON:\n"
             + json.dumps(minimal_payload, ensure_ascii=False)
         )
 
@@ -2704,7 +2818,8 @@ def _build_entry_logic_prompt(
         "You are a strict confluence scoring engine for algorithmic trading.\n"
         "Given the technical context, output ONLY strict JSON with this schema:\n"
         '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
-        "--- CONTEXT BELOW (do not output it) ---\n"
+        + (f"AttemptContext: {str(attempt_context)[:160]}\n" if attempt_context else "")
+        + "--- CONTEXT BELOW (do not output it) ---\n"
         + base
     )
 
@@ -2948,7 +3063,6 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
 
     # Phase Management helpers (keep it lightweight; this only affects the prompt)
     holding_sec = float(pos_summary.get("max_holding_sec") or 0.0)
-    profit_money = float(pos_summary.get("total_profit") or 0.0)
     spread_points = float(market.get("spread") or 0.0)
     atr_points = float(market.get("atr_points") or 0.0)
     point = float(market.get("point") or 0.0)
@@ -2966,14 +3080,16 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     if move_points_pts is not None:
         is_breakeven_like = abs(float(move_points_pts)) <= float(breakeven_band_points)
     else:
-        # Fallback: money PnL near zero (account-dependent; only a weak hint)
-        is_breakeven_like = abs(float(profit_money)) <= 0.5
+        # If we cannot compute points, do NOT attempt money-based breakeven detection.
+        # Money PnL scale differs by account/broker/lot size and may misclassify phases.
+        is_breakeven_like = False
 
     profit_protect_threshold_points = 0.0
     try:
-        profit_protect_threshold_points = max(float(spread_points) * 3.0, float(atr_points) * 0.6)
+        # Make PROFIT_PROTECT harder to enter; avoid early fear-based closes.
+        profit_protect_threshold_points = max(float(spread_points) * 4.0, float(atr_points) * 0.9)
     except Exception:
-        profit_protect_threshold_points = float(spread_points) * 3.0
+        profit_protect_threshold_points = float(spread_points) * 4.0
 
     in_profit_protect = (move_points_pts is not None) and (float(move_points_pts) >= float(profit_protect_threshold_points))
     in_development = (holding_sec > 0 and holding_sec < 15.0 * 60.0) or bool(is_breakeven_like)
@@ -2989,7 +3105,16 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
                 "development_holding_sec_lt": 15 * 60,
                 "breakeven_band_points": round(float(breakeven_band_points), 3),
                 "profit_protect_threshold_points": round(float(profit_protect_threshold_points), 3),
+                "phase1_close_confidence_min_hint": 80,
                 "notes": "Phase is a hint for AI behavior. Use POSITION + MARKET context to decide; do not override hard risk realities.",
+            },
+            "inputs": {
+                "holding_sec": round(float(holding_sec), 3),
+                "move_points": round(float(move_points_pts), 3) if move_points_pts is not None else None,
+                "is_breakeven_like": bool(is_breakeven_like),
+                "in_profit_protect": bool(in_profit_protect),
+                "in_development": bool(in_development),
+                "note": "Phase is computed from points/ATR/spread/time only; do not infer phase from money PnL.",
             },
         },
         "position": {
@@ -3005,8 +3130,8 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
             "buy_profit": pos_summary.get("buy_profit"),
             "sell_profit": pos_summary.get("sell_profit"),
             "net_avg_open": round(net_avg_open, 6),
-            # NOTE: This is a *price delta* (not points). Keep for backward compatibility.
-            "net_move_points_approx": round(move_points, 6),
+            # Price delta from avg open to current mid (units: price, NOT broker points).
+            "net_move_price_delta": round(move_points, 6),
             # Preferred: move in broker points (positive means favorable move for the current net_side).
             "net_move_points": round(float(move_points_pts), 3) if move_points_pts is not None else None,
         },
@@ -3053,7 +3178,7 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
         "You MUST follow Phase Management rules below to avoid early whipsaws.\n\n"
         "PHASE MANAGEMENT (IMPORTANT):\n"
         "- Phase 1: DEVELOPMENT (育成フェーズ)\n"
-        "  - Condition hint: position.max_holding_sec is short (e.g., < 15 min) OR position is near breakeven (see phase.rules.breakeven_band_points).\n"
+        "  - Condition hint: position.max_holding_sec is short (e.g., < 15 min) OR position is near breakeven in POINTS (see phase.rules.breakeven_band_points and position.net_move_points).\n"
         "  - Behavior: be INSENSITIVE. Default to HOLD.\n"
         "    - Ignore single touch/noise opposition (e.g., one FVG/Zones touch) and minor momentum weakening.\n"
         "    - Do NOT CLOSE just because the latest_signal is opposite if it is not structural/confirmed.\n"
@@ -3063,7 +3188,7 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
         "    - In Phase 1, require HIGH confidence to CLOSE (aim >= 80). Otherwise HOLD.\n"
         "  - Trailing: prefer NORMAL/WIDE to avoid noise stop-out unless reversal is structural.\n\n"
         "- Phase 2: PROFIT_PROTECT (利益確保フェーズ)\n"
-        "  - Condition hint: position has meaningful run-up (see phase.rules.profit_protect_threshold_points) / sufficient open profit.\n"
+        "  - Condition hint: position has meaningful run-up in POINTS (see phase.rules.profit_protect_threshold_points and position.net_move_points).\n"
         "  - Behavior: be SENSITIVE (protect profits).\n"
         "    - If reversal risk rises, close faster to secure gains.\n"
         "    - TRAIL_MODE can be TIGHT when momentum weakens/chops, NORMAL otherwise; WIDE only when momentum is VERY STRONG and reversal risk is low.\n\n"
@@ -3099,6 +3224,7 @@ def _ai_entry_score(
     action: str,
     normalized_trigger: Optional[Dict[str, Any]] = None,
     qtrend_context: Optional[Dict[str, Any]] = None,
+    attempt_context: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """AIに Confluence Score(1-100) と Lot Multiplier を出させる。"""
     if not client:
@@ -3110,6 +3236,7 @@ def _ai_entry_score(
         action,
         normalized_trigger=normalized_trigger,
         qtrend_context=qtrend_context,
+        attempt_context=attempt_context,
     )
     decision = _call_openai_with_retry(prompt)
     if not decision:
@@ -3129,6 +3256,8 @@ def _attempt_entry_from_lorentzian(
     normalized_trigger: dict,
     now: float,
     pos_summary: Optional[dict] = None,
+    bypass_ai_throttle: bool = False,
+    attempt_context: Optional[str] = None,
 ) -> tuple[str, int]:
     """New spec entry flow.
 
@@ -3138,6 +3267,12 @@ def _attempt_entry_from_lorentzian(
     """
     trig_side = (normalized_trigger.get("side") or "").strip().lower()
     action = "BUY" if trig_side == "buy" else "SELL" if trig_side == "sell" else ""
+
+    _set_status(
+        last_entry_attempt_at=time.time(),
+        last_entry_attempt_context=(str(attempt_context)[:160] if attempt_context else None),
+        last_entry_bypass_ai_throttle=bool(bypass_ai_throttle),
+    )
 
     def _finish(
         message: str,
@@ -3171,6 +3306,36 @@ def _attempt_entry_from_lorentzian(
                 ai_reason=ai_reason,
                 openai_response_id=openai_response_id,
                 ai_latency_ms=ai_latency_ms,
+                attempt_context=(attempt_context if attempt_context else None),
+                bypass_ai_throttle=(bool(bypass_ai_throttle) if bypass_ai_throttle is not None else None),
+            )
+        except Exception:
+            pass
+
+        try:
+            _status_append_recent_entry_event(
+                {
+                    "ts": time.time(),
+                    "symbol": symbol,
+                    "action": action,
+                    "outcome": str(outcome),
+                    "http": int(http_status),
+                    "attempt_context": (str(attempt_context)[:160] if attempt_context else None),
+                    "bypass_ai_throttle": bool(bypass_ai_throttle),
+                    "ai_score": int(ai_score) if ai_score is not None else None,
+                    "min_required": int(min_required) if min_required is not None else None,
+                    "ai_latency_ms": int(ai_latency_ms) if ai_latency_ms is not None else None,
+                    "openai_response_id": (str(openai_response_id)[:80] if openai_response_id else None),
+                    "ai_reason": (str(ai_reason)[:160] if ai_reason else None),
+                    "trigger": {
+                        "source": (normalized_trigger or {}).get("source"),
+                        "event": (normalized_trigger or {}).get("event"),
+                        "side": (normalized_trigger or {}).get("side"),
+                        "signal_time": (normalized_trigger or {}).get("signal_time"),
+                    }
+                    if isinstance(normalized_trigger, dict)
+                    else None,
+                }
             )
         except Exception:
             pass
@@ -3384,9 +3549,11 @@ def _attempt_entry_from_lorentzian(
     trig_src = (normalized_trigger.get("source") or "")
     trig_evt = (normalized_trigger.get("event") or "")
     attempt_key = f"LZ:{symbol}:{action}:{trig_src}:{trig_evt}:{trig_st:.3f}"
+    if attempt_context:
+        attempt_key = f"{attempt_key}:{attempt_context}"
 
     now_mono = time.time()
-    if _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+    if (not bypass_ai_throttle) and _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
         _set_status(last_result="AI throttled", last_result_at=time.time())
         return _finish("AI throttled", 200, "ai_throttled", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
     _last_ai_attempt_key = attempt_key
@@ -3399,6 +3566,7 @@ def _attempt_entry_from_lorentzian(
         action,
         normalized_trigger=normalized_trigger,
         qtrend_context=qtrend_ctx,
+        attempt_context=attempt_context,
     )
     if not ai_decision:
         _set_status(last_result="Blocked by AI (no score)", last_result_at=time.time())
@@ -3814,11 +3982,7 @@ def webhook():
         # Register pending trigger for delayed re-evaluation (even if the first attempt fails).
         if DELAYED_ENTRY_ENABLED:
             _upsert_pending_entry(symbol, normalized_trigger, float(now))
-            with _pending_entry_lock:
-                st = _pending_entry_by_symbol.get(symbol) or {}
-                st["last_attempt_at"] = float(time.time())
-                st["attempts"] = max(1, int(st.get("attempts") or 0) + 1)
-                _pending_entry_by_symbol[symbol] = st
+            _reserve_pending_entry_attempt(symbol, float(time.time()), retry_signal=normalized_trigger)
 
         with _entry_lock:
             last_sent_before = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
