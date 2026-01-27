@@ -132,6 +132,12 @@ ADDON_MIN_AI_SCORE = int(os.getenv("ADDON_MIN_AI_SCORE", str(AI_ENTRY_MIN_SCORE)
 # /status observability: keep last N entry outcomes (ring buffer)
 ENTRY_STATUS_HISTORY_MAX = int(os.getenv("ENTRY_STATUS_HISTORY_MAX", "30"))
 
+# /status observability: keep last N management outcomes (ring buffer)
+MGMT_STATUS_HISTORY_MAX = int(os.getenv("MGMT_STATUS_HISTORY_MAX", "50"))
+
+# Pending management: keep last N signals gathered during settle window
+MGMT_PENDING_SIGNAL_HISTORY_MAX = int(os.getenv("MGMT_PENDING_SIGNAL_HISTORY_MAX", "12"))
+
 MIN_OTHER_SIGNALS_FOR_ENTRY = int(os.getenv("MIN_OTHER_SIGNALS_FOR_ENTRY", "1"))
 
 CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "600"))
@@ -152,7 +158,7 @@ DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "1")
 # Maximum time to keep a pending Lorentzian trigger.
 DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", str(CONFLUENCE_WINDOW_SEC)))
 # Minimum interval between AI re-evaluations for the same pending trigger.
-DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "3"))
+DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "1"))
 # Safety cap: maximum number of attempts for one pending trigger (including the initial attempt).
 DELAYED_ENTRY_MAX_ATTEMPTS = int(os.getenv("DELAYED_ENTRY_MAX_ATTEMPTS", "4"))
 
@@ -167,8 +173,8 @@ AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65")
 
 # Management settle window: when positions are open, wait briefly to let near-simultaneous
 # context alerts (e.g., Q-Trend + Zones + FVG) arrive, then run ONE AI decision.
-MGMT_POST_SIGNAL_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_WAIT_SEC", "2"))
-MGMT_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_MAX_WAIT_SEC", "5"))
+MGMT_POST_SIGNAL_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_WAIT_SEC", "1"))
+MGMT_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_MAX_WAIT_SEC", "1"))
 
 
 # --- Local entry safety guards (professional defaults) ---
@@ -431,6 +437,9 @@ _last_status: Dict[str, Any] = {
     # Recent entry outcomes (ring buffer)
     "recent_entry_events": [],
 
+    # Recent management outcomes (ring buffer)
+    "recent_mgmt_events": [],
+
     # Heartbeat (EA -> Python)
     "heartbeat_enabled": bool(ZMQ_HEARTBEAT_ENABLED),
     "heartbeat_timeout_sec": float(ZMQ_HEARTBEAT_TIMEOUT_SEC),
@@ -464,12 +473,34 @@ def _status_append_recent_entry_event(ev: Dict[str, Any]) -> None:
         _last_status["recent_entry_events"] = arr
 
 
+def _status_append_recent_mgmt_event(ev: Dict[str, Any]) -> None:
+    """Append a management event to the in-memory /status ring buffer."""
+    try:
+        max_n = int(MGMT_STATUS_HISTORY_MAX or 0)
+    except Exception:
+        max_n = 50
+    if max_n <= 0:
+        return
+    if not isinstance(ev, dict):
+        return
+    with _status_lock:
+        arr = _last_status.get("recent_mgmt_events")
+        if not isinstance(arr, list):
+            arr = []
+        arr.append(ev)
+        if len(arr) > max_n:
+            del arr[: max(0, len(arr) - max_n)]
+        _last_status["recent_mgmt_events"] = arr
+
+
 def _get_status_snapshot() -> Dict[str, Any]:
     with _status_lock:
         snap = dict(_last_status)
     # Copy list-like fields to avoid mutation during serialization.
     if isinstance(snap.get("recent_entry_events"), list):
         snap["recent_entry_events"] = list(snap.get("recent_entry_events") or [])
+    if isinstance(snap.get("recent_mgmt_events"), list):
+        snap["recent_mgmt_events"] = list(snap.get("recent_mgmt_events") or [])
     # add lightweight cache stats without holding status lock
     with signals_lock:
         snap["signals_cache_len"] = len(signals_cache)
@@ -526,12 +557,18 @@ def _get_status_snapshot() -> Dict[str, Any]:
                 "due_in_sec": round(due_at - now3, 3) if due_at > 0 else None,
                 "max_due_in_sec": round(max_due_at - now3, 3) if max_due_at > 0 else None,
                 "last_signal": st.get("last_signal"),
+                "last_signals": list(st.get("last_signals") or []) if isinstance(st.get("last_signals"), list) else None,
             }
         snap["pending_mgmt"] = pending_mgmt
     return snap
 
 
-def _run_position_management_once(symbol: str, normalized_signal: dict, now: float) -> Optional[tuple[str, int]]:
+def _run_position_management_once(
+    symbol: str,
+    normalized_signal: dict,
+    now: float,
+    recent_signals: Optional[List[dict]] = None,
+) -> Optional[tuple[str, int]]:
     """Run one CLOSE/HOLD decision (synchronously) for the current position state."""
     # Under freeze mode: do not send any management while heartbeat is stale.
     if (HEARTBEAT_STALE_MODE == "freeze") and (not _heartbeat_is_fresh(now_ts=now)):
@@ -584,7 +621,13 @@ def _run_position_management_once(symbol: str, normalized_signal: dict, now: flo
     _last_close_attempt_key = attempt_key
     _last_close_attempt_at = now_mono
 
-    ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized_signal)
+    used_signals = None
+    if isinstance(recent_signals, list) and recent_signals:
+        used_signals = [s for s in recent_signals if isinstance(s, dict)]
+    if not used_signals:
+        used_signals = [normalized_signal] if isinstance(normalized_signal, dict) else []
+
+    ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized_signal, recent_signals=used_signals)
     if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
         if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
             ai_decision = {
@@ -607,29 +650,58 @@ def _run_position_management_once(symbol: str, normalized_signal: dict, now: flo
 
     decision_action = (ai_decision or {}).get("action")
     decision_reason = (ai_decision or {}).get("reason") or ""
+    decision_conf = int((ai_decision or {}).get("confidence") or 0)
+    decision_trail = (ai_decision or {}).get("trail_mode", "NORMAL")
+    openai_rid = (ai_decision or {}).get("_openai_response_id")
+    ai_ms = (ai_decision or {}).get("_ai_latency_ms")
     if decision_action == "CLOSE":
         zmq_socket.send_json({"type": "CLOSE", "reason": decision_reason})
         _set_status(
             last_result="CLOSE",
             last_result_at=time.time(),
             last_mgmt_action="CLOSE",
-            last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
+            last_mgmt_confidence=decision_conf,
             last_mgmt_reason=decision_reason,
             last_mgmt_at=time.time(),
             last_mgmt_throttled=None,
         )
+        _status_append_recent_mgmt_event(
+            {
+                "ts": time.time(),
+                "symbol": symbol,
+                "action": "CLOSE",
+                "confidence": decision_conf,
+                "trail_mode": decision_trail,
+                "reason": decision_reason,
+                "openai_response_id": openai_rid,
+                "ai_latency_ms": ai_ms,
+                "signals_used": used_signals,
+            }
+        )
         return "CLOSE", 200
 
-    t_mode = (ai_decision or {}).get("trail_mode", "NORMAL")
-    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": t_mode})
+    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": decision_trail})
     _set_status(
         last_result="HOLD",
         last_result_at=time.time(),
         last_mgmt_action="HOLD",
-        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
+        last_mgmt_confidence=decision_conf,
         last_mgmt_reason=decision_reason,
         last_mgmt_at=time.time(),
         last_mgmt_throttled=None,
+    )
+    _status_append_recent_mgmt_event(
+        {
+            "ts": time.time(),
+            "symbol": symbol,
+            "action": "HOLD",
+            "confidence": decision_conf,
+            "trail_mode": decision_trail,
+            "reason": decision_reason,
+            "openai_response_id": openai_rid,
+            "ai_latency_ms": ai_ms,
+            "signals_used": used_signals,
+        }
     )
     return "HOLD", 200
 
@@ -658,9 +730,21 @@ def _mgmt_deferred_worker(symbol: str) -> None:
             if not isinstance(st2, dict):
                 return
             last_signal2 = st2.get("last_signal") or {}
+            last_signals2 = st2.get("last_signals")
+
+            used_signals = None
+            if isinstance(last_signals2, list) and last_signals2:
+                used_signals = [s for s in last_signals2 if isinstance(s, dict)]
+            if not used_signals:
+                used_signals = [dict(last_signal2)] if isinstance(last_signal2, dict) else []
 
             with _mgmt_lock:
-                _run_position_management_once(symbol, dict(last_signal2) if isinstance(last_signal2, dict) else {}, time.time())
+                _run_position_management_once(
+                    symbol,
+                    dict(last_signal2) if isinstance(last_signal2, dict) else {},
+                    time.time(),
+                    recent_signals=used_signals,
+                )
             return
     except Exception as e:
         try:
@@ -690,25 +774,54 @@ def _schedule_deferred_mgmt(symbol: str, normalized_signal: dict, now: float) ->
         max_wait_sec = wait_sec
 
     with _mgmt_pending_lock:
+        def _mk_sig(sig: dict) -> Dict[str, Any]:
+            return {
+                "source": sig.get("source"),
+                "event": sig.get("event"),
+                "side": sig.get("side"),
+                "tf": sig.get("tf"),
+                "signal_type": sig.get("signal_type"),
+                "confirmed": sig.get("confirmed"),
+                "signal_time": sig.get("signal_time"),
+                "receive_time": sig.get("receive_time"),
+            }
+
+        def _dedupe_append(arr: list, item: dict) -> list:
+            if not isinstance(arr, list):
+                arr = []
+            if arr and isinstance(arr[-1], dict):
+                last = arr[-1]
+                if (
+                    last.get("source") == item.get("source")
+                    and last.get("event") == item.get("event")
+                    and last.get("side") == item.get("side")
+                    and last.get("tf") == item.get("tf")
+                    and last.get("signal_time") == item.get("signal_time")
+                ):
+                    arr[-1] = item
+                    return arr
+            arr.append(item)
+            return arr
+
+        try:
+            keep_n = int(MGMT_PENDING_SIGNAL_HISTORY_MAX or 0)
+        except Exception:
+            keep_n = 12
+        if keep_n <= 0:
+            keep_n = 1
+
         st = _mgmt_pending_by_symbol.get(symbol)
         if not isinstance(st, dict):
             created_at = float(now)
             max_due_at = created_at + float(max_wait_sec)
             due_at = min(float(now) + float(wait_sec), max_due_at)
+            sig_item = _mk_sig(normalized_signal if isinstance(normalized_signal, dict) else {})
             st = {
                 "created_at": created_at,
                 "max_due_at": float(max_due_at),
                 "due_at": float(due_at),
-                "last_signal": {
-                    "source": normalized_signal.get("source"),
-                    "event": normalized_signal.get("event"),
-                    "side": normalized_signal.get("side"),
-                    "tf": normalized_signal.get("tf"),
-                    "signal_type": normalized_signal.get("signal_type"),
-                    "confirmed": normalized_signal.get("confirmed"),
-                    "signal_time": normalized_signal.get("signal_time"),
-                    "receive_time": normalized_signal.get("receive_time"),
-                },
+                "last_signal": dict(sig_item),
+                "last_signals": [dict(sig_item)],
             }
             _mgmt_pending_by_symbol[symbol] = st
         else:
@@ -716,16 +829,11 @@ def _schedule_deferred_mgmt(symbol: str, normalized_signal: dict, now: float) ->
             max_due_at = float(st.get("max_due_at") or (created_at + float(max_wait_sec)))
             due_at = min(float(now) + float(wait_sec), max_due_at)
             st["due_at"] = float(due_at)
-            st["last_signal"] = {
-                "source": normalized_signal.get("source"),
-                "event": normalized_signal.get("event"),
-                "side": normalized_signal.get("side"),
-                "tf": normalized_signal.get("tf"),
-                "signal_type": normalized_signal.get("signal_type"),
-                "confirmed": normalized_signal.get("confirmed"),
-                "signal_time": normalized_signal.get("signal_time"),
-                "receive_time": normalized_signal.get("receive_time"),
-            }
+            sig_item = _mk_sig(normalized_signal if isinstance(normalized_signal, dict) else {})
+            st["last_signal"] = dict(sig_item)
+            st["last_signals"] = _dedupe_append(st.get("last_signals"), dict(sig_item))
+            if isinstance(st.get("last_signals"), list) and len(st["last_signals"]) > keep_n:
+                st["last_signals"] = list(st["last_signals"])[-keep_n:]
             _mgmt_pending_by_symbol[symbol] = st
 
         running = bool(_mgmt_worker_running_by_symbol.get(symbol))
