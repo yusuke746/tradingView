@@ -139,7 +139,7 @@ CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 # After receiving a Lorentzian entry_trigger, wait a short time to let near-immediate
 # context signals (e.g., Q-Trend on bar close) arrive and be included in ContextJSON.
 # Keep this small (e.g., 5-30s). Set 0 to disable.
-POST_TRIGGER_WAIT_SEC = float(os.getenv("POST_TRIGGER_WAIT_SEC", "3"))
+POST_TRIGGER_WAIT_SEC = float(os.getenv("POST_TRIGGER_WAIT_SEC", "0"))
 
 # --- Delayed entry re-evaluation (minutes-level) ---
 # If a Lorentzian trigger is blocked by AI due to missing/weak evidence,
