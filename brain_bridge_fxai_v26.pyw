@@ -165,6 +165,11 @@ AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "65"))
 AI_CLOSE_FALLBACK = str(os.getenv("AI_CLOSE_FALLBACK", "hold") or "hold").strip().lower()
 AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65"))
 
+# Management settle window: when positions are open, wait briefly to let near-simultaneous
+# context alerts (e.g., Q-Trend + Zones + FVG) arrive, then run ONE AI decision.
+MGMT_POST_SIGNAL_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_WAIT_SEC", "2"))
+MGMT_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_MAX_WAIT_SEC", "5"))
+
 
 # --- Local entry safety guards (professional defaults) ---
 # Gold day-trading (M5/M15) tends to suffer when spread is wide or ATR is too small.
@@ -230,6 +235,11 @@ _addon_state_by_symbol: Dict[str, Dict[str, Any]] = {}
 
 _entry_lock = Lock()
 _last_order_sent_at_by_symbol: Dict[str, float] = {}
+
+_mgmt_lock = Lock()
+_mgmt_pending_lock = Lock()
+_mgmt_pending_by_symbol: Dict[str, Dict[str, Any]] = {}
+_mgmt_worker_running_by_symbol: Dict[str, bool] = {}
 
 _pending_entry_lock = Lock()
 # Structure: { SYMBOL: { trigger: dict, created_at: float, expires_at: float, attempts: int,
@@ -500,7 +510,240 @@ def _get_status_snapshot() -> Dict[str, Any]:
                 "last_retry_signal": st.get("last_retry_signal"),
             }
         snap["pending_entries"] = pending_items
+
+    # Pending management snapshot (for settle-window observability)
+    now3 = time.time()
+    with _mgmt_pending_lock:
+        pending_mgmt = {}
+        for sym, st in _mgmt_pending_by_symbol.items():
+            if not isinstance(st, dict):
+                continue
+            created_at = float(st.get("created_at") or 0.0)
+            due_at = float(st.get("due_at") or 0.0)
+            max_due_at = float(st.get("max_due_at") or 0.0)
+            pending_mgmt[sym] = {
+                "age_sec": round(now3 - created_at, 3) if created_at > 0 else None,
+                "due_in_sec": round(due_at - now3, 3) if due_at > 0 else None,
+                "max_due_in_sec": round(max_due_at - now3, 3) if max_due_at > 0 else None,
+                "last_signal": st.get("last_signal"),
+            }
+        snap["pending_mgmt"] = pending_mgmt
     return snap
+
+
+def _run_position_management_once(symbol: str, normalized_signal: dict, now: float) -> Optional[tuple[str, int]]:
+    """Run one CLOSE/HOLD decision (synchronously) for the current position state."""
+    # Under freeze mode: do not send any management while heartbeat is stale.
+    if (HEARTBEAT_STALE_MODE == "freeze") and (not _heartbeat_is_fresh(now_ts=now)):
+        _set_status(last_result="Frozen by heartbeat", last_result_at=time.time())
+        return "Frozen by heartbeat", 200
+
+    pos_summary = get_mt5_positions_summary(symbol)
+    if int(pos_summary.get("positions_open") or 0) <= 0:
+        return None
+
+    net_side = (pos_summary.get("net_side") or "flat").lower()
+    market = get_mt5_market_data(symbol)
+    stats = get_qtrend_anchor_stats(symbol)
+
+    if not AI_CLOSE_ENABLED:
+        return None
+
+    global _last_close_attempt_key, _last_close_attempt_at
+    now_mono = time.time()
+
+    src = (normalized_signal.get("source") or "")
+    evt = (normalized_signal.get("event") or "")
+    sig_side = (normalized_signal.get("side") or "").lower()
+
+    is_reversal_like = (
+        (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
+        and (
+            (src in {"Q-Trend Strong", "Q-Trend", "Q-Trend-Strong", "Q-Trend-Normal"})
+            or (src == "FVG" and evt == "fvg_touch")
+            or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
+        )
+    )
+
+    last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
+    if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
+        _set_status(
+            last_result="AI close throttled",
+            last_result_at=time.time(),
+            last_mgmt_throttled={
+                "cooldown_sec": float(AI_CLOSE_THROTTLE_SEC),
+                "since_last_call_sec": round(float(last_attempt_age), 3),
+                "reason": "cooldown",
+                "bypass": False,
+                "incoming": {"source": src, "event": evt, "side": sig_side},
+            },
+        )
+        return None
+
+    attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
+    _last_close_attempt_key = attempt_key
+    _last_close_attempt_at = now_mono
+
+    ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized_signal)
+    if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
+        if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
+            ai_decision = {
+                "action": "CLOSE",
+                "confidence": int(_clamp(AI_CLOSE_DEFAULT_CONFIDENCE, 0, 100)),
+                "reason": "fallback_default_close",
+                "trail_mode": "NORMAL",
+            }
+        else:
+            _set_status(
+                last_result="HOLD (AI fallback)",
+                last_result_at=time.time(),
+                last_mgmt_action="HOLD",
+                last_mgmt_confidence=None,
+                last_mgmt_reason="ai_fallback_hold",
+                last_mgmt_at=time.time(),
+            )
+            zmq_socket.send_json({"type": "HOLD", "reason": "ai_fallback_hold"})
+            ai_decision = {"action": "HOLD", "confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
+
+    decision_action = (ai_decision or {}).get("action")
+    decision_reason = (ai_decision or {}).get("reason") or ""
+    if decision_action == "CLOSE":
+        zmq_socket.send_json({"type": "CLOSE", "reason": decision_reason})
+        _set_status(
+            last_result="CLOSE",
+            last_result_at=time.time(),
+            last_mgmt_action="CLOSE",
+            last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
+            last_mgmt_reason=decision_reason,
+            last_mgmt_at=time.time(),
+            last_mgmt_throttled=None,
+        )
+        return "CLOSE", 200
+
+    t_mode = (ai_decision or {}).get("trail_mode", "NORMAL")
+    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": t_mode})
+    _set_status(
+        last_result="HOLD",
+        last_result_at=time.time(),
+        last_mgmt_action="HOLD",
+        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
+        last_mgmt_reason=decision_reason,
+        last_mgmt_at=time.time(),
+        last_mgmt_throttled=None,
+    )
+    return "HOLD", 200
+
+
+def _mgmt_deferred_worker(symbol: str) -> None:
+    """Wait for settle window, then run one management decision."""
+    try:
+        while True:
+            with _mgmt_pending_lock:
+                st = _mgmt_pending_by_symbol.get(symbol)
+                if not isinstance(st, dict):
+                    _mgmt_worker_running_by_symbol[symbol] = False
+                    return
+                due_at = float(st.get("due_at") or 0.0)
+                last_signal = st.get("last_signal")
+
+            now = time.time()
+            if due_at > 0 and now < due_at:
+                time.sleep(min(0.2, max(0.01, due_at - now)))
+                continue
+
+            # Time to run the decision.
+            with _mgmt_pending_lock:
+                st2 = _mgmt_pending_by_symbol.pop(symbol, None)
+                _mgmt_worker_running_by_symbol[symbol] = False
+            if not isinstance(st2, dict):
+                return
+            last_signal2 = st2.get("last_signal") or {}
+
+            with _mgmt_lock:
+                _run_position_management_once(symbol, dict(last_signal2) if isinstance(last_signal2, dict) else {}, time.time())
+            return
+    except Exception as e:
+        try:
+            with _mgmt_pending_lock:
+                _mgmt_worker_running_by_symbol[symbol] = False
+        except Exception:
+            pass
+        print(f"[FXAI][MGMT] Deferred worker error for {symbol}: {e}")
+
+
+def _schedule_deferred_mgmt(symbol: str, normalized_signal: dict, now: float) -> bool:
+    """Schedule a deferred management AI run after a short settle window.
+
+    Uses a sliding window capped by MGMT_POST_SIGNAL_MAX_WAIT_SEC.
+    Returns True if scheduled/updated; False if disabled.
+    """
+    try:
+        wait_sec = float(MGMT_POST_SIGNAL_WAIT_SEC or 0.0)
+        max_wait_sec = float(MGMT_POST_SIGNAL_MAX_WAIT_SEC or 0.0)
+    except Exception:
+        wait_sec = 0.0
+        max_wait_sec = 0.0
+
+    if wait_sec <= 0:
+        return False
+    if max_wait_sec <= 0:
+        max_wait_sec = wait_sec
+
+    with _mgmt_pending_lock:
+        st = _mgmt_pending_by_symbol.get(symbol)
+        if not isinstance(st, dict):
+            created_at = float(now)
+            max_due_at = created_at + float(max_wait_sec)
+            due_at = min(float(now) + float(wait_sec), max_due_at)
+            st = {
+                "created_at": created_at,
+                "max_due_at": float(max_due_at),
+                "due_at": float(due_at),
+                "last_signal": {
+                    "source": normalized_signal.get("source"),
+                    "event": normalized_signal.get("event"),
+                    "side": normalized_signal.get("side"),
+                    "tf": normalized_signal.get("tf"),
+                    "signal_type": normalized_signal.get("signal_type"),
+                    "confirmed": normalized_signal.get("confirmed"),
+                    "signal_time": normalized_signal.get("signal_time"),
+                    "receive_time": normalized_signal.get("receive_time"),
+                },
+            }
+            _mgmt_pending_by_symbol[symbol] = st
+        else:
+            created_at = float(st.get("created_at") or now)
+            max_due_at = float(st.get("max_due_at") or (created_at + float(max_wait_sec)))
+            due_at = min(float(now) + float(wait_sec), max_due_at)
+            st["due_at"] = float(due_at)
+            st["last_signal"] = {
+                "source": normalized_signal.get("source"),
+                "event": normalized_signal.get("event"),
+                "side": normalized_signal.get("side"),
+                "tf": normalized_signal.get("tf"),
+                "signal_type": normalized_signal.get("signal_type"),
+                "confirmed": normalized_signal.get("confirmed"),
+                "signal_time": normalized_signal.get("signal_time"),
+                "receive_time": normalized_signal.get("receive_time"),
+            }
+            _mgmt_pending_by_symbol[symbol] = st
+
+        running = bool(_mgmt_worker_running_by_symbol.get(symbol))
+        if not running:
+            _mgmt_worker_running_by_symbol[symbol] = True
+            Thread(target=_mgmt_deferred_worker, args=(symbol,), daemon=True).start()
+
+    _set_status(
+        last_result="Mgmt deferred",
+        last_result_at=time.time(),
+        last_mgmt_throttled={
+            "reason": "settle_window",
+            "wait_sec": float(wait_sec),
+            "max_wait_sec": float(max_wait_sec),
+            "incoming": {"source": normalized_signal.get("source"), "event": normalized_signal.get("event"), "side": (normalized_signal.get("side") or "")},
+        },
+    )
+    return True
 
 
 def _prune_pending_entries_locked(now: float) -> None:
@@ -3885,95 +4128,17 @@ def webhook():
         return "Frozen by heartbeat", 200
 
     # --- POSITION MANAGEMENT MODE (CLOSE/HOLD) ---
+    # When positions are open, defer the management AI by a short settle window so that
+    # near-simultaneous context alerts can be included and we avoid conflicting decisions.
     pos_summary = get_mt5_positions_summary(symbol)
     if int(pos_summary.get("positions_open") or 0) > 0:
-        net_side = (pos_summary.get("net_side") or "flat").lower()
-        market = get_mt5_market_data(symbol)
-        stats = get_qtrend_anchor_stats(symbol)
-
-        # Always attempt management AI when positions are open (recommended timing, cost not a concern).
-        if AI_CLOSE_ENABLED:
-            global _last_close_attempt_key, _last_close_attempt_at
-            now_mono = time.time()
-
-            src = (normalized.get("source") or "")
-            evt = (normalized.get("event") or "")
-            sig_side = (normalized.get("side") or "").lower()
-
-            is_reversal_like = (
-                (net_side in {"buy", "sell"} and sig_side in {"buy", "sell"} and sig_side != net_side)
-                and (
-                    (src in {"Q-Trend Strong", "Q-Trend", "Q-Trend-Strong", "Q-Trend-Normal"})
-                    or (src == "FVG" and evt == "fvg_touch")
-                    or (src == "Zones" and evt in {"zone_retrace_touch", "zone_touch"})
-                )
-            )
-
-            last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
-            if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
-                _set_status(
-                    last_result="AI close throttled",
-                    last_result_at=time.time(),
-                    last_mgmt_throttled={
-                        "cooldown_sec": float(AI_CLOSE_THROTTLE_SEC),
-                        "since_last_call_sec": round(float(last_attempt_age), 3),
-                        "reason": "cooldown",
-                        "bypass": False,
-                        "incoming": {"source": src, "event": evt, "side": sig_side},
-                    },
-                )
-            else:
-                attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
-                _last_close_attempt_key = attempt_key
-                _last_close_attempt_at = now_mono
-
-                ai_decision = _ai_close_hold_decision(symbol, market, stats, pos_summary, normalized)
-                if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
-                    if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
-                        ai_decision = {
-                            "action": "CLOSE",
-                            "confidence": int(_clamp(AI_CLOSE_DEFAULT_CONFIDENCE, 0, 100)),
-                            "reason": "fallback_default_close",
-                        }
-                    else:
-                        _set_status(
-                            last_result="HOLD (AI fallback)",
-                            last_result_at=time.time(),
-                            last_mgmt_action="HOLD",
-                            last_mgmt_confidence=None,
-                            last_mgmt_reason="ai_fallback_hold",
-                            last_mgmt_at=time.time(),
-                        )
-                        zmq_socket.send_json({"type": "HOLD", "reason": "ai_fallback_hold"})
-                        # even on fallback HOLD, we can still consider add-on entries below
-                        ai_decision = {"action": "HOLD", "confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
-
-                decision_action = (ai_decision or {}).get("action")
-                decision_reason = (ai_decision or {}).get("reason") or ""
-                if decision_action == "CLOSE":
-                    zmq_socket.send_json({"type": "CLOSE", "reason": decision_reason})
-                    _set_status(
-                        last_result="CLOSE",
-                        last_result_at=time.time(),
-                        last_mgmt_action="CLOSE",
-                        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
-                        last_mgmt_reason=decision_reason,
-                        last_mgmt_at=time.time(),
-                        last_mgmt_throttled=None,
-                    )
-                    return "CLOSE", 200
-                else:
-                    t_mode = (ai_decision or {}).get("trail_mode", "NORMAL")
-                    zmq_socket.send_json({"type": "HOLD", "reason": decision_reason, "trail_mode": t_mode})
-                    _set_status(
-                        last_result="HOLD",
-                        last_result_at=time.time(),
-                        last_mgmt_action="HOLD",
-                        last_mgmt_confidence=int((ai_decision or {}).get("confidence") or 0),
-                        last_mgmt_reason=decision_reason,
-                        last_mgmt_at=time.time(),
-                        last_mgmt_throttled=None,
-                    )
+        if AI_CLOSE_ENABLED and _schedule_deferred_mgmt(symbol, normalized, float(now)):
+            return "Mgmt deferred", 200
+        # If settle window disabled, run immediately (serialized).
+        with _mgmt_lock:
+            r = _run_position_management_once(symbol, normalized, float(now))
+        if r is not None:
+            return r
 
         # After management decision (unless CLOSED), allow add-on entries by falling through to ENTRY section.
 
