@@ -135,19 +135,26 @@ CONFLUENCE_WINDOW_SEC = int(os.getenv("CONFLUENCE_WINDOW_SEC", "600"))
 CONFLUENCE_DEBUG = _env_bool("CONFLUENCE_DEBUG", "0")
 CONFLUENCE_DEBUG_MAX_LINES = int(os.getenv("CONFLUENCE_DEBUG_MAX_LINES", "80"))
 
-# --- Optional: delayed entry re-evaluation (cost-agnostic) ---
-# If enabled, we keep the last Lorentzian entry_trigger as "pending" and will re-run
-# the entry decision when new context/structure signals arrive AFTER the trigger time
-# (e.g., Q-Trend at +5m). This helps include late-arriving evidence in ContextJSON.
-DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "0")
-# Max seconds after the trigger to allow delayed attempts (defaults to the confluence window).
+# --- Post-trigger settle window (simple) ---
+# After receiving a Lorentzian entry_trigger, wait a short time to let near-immediate
+# context signals (e.g., Q-Trend on bar close) arrive and be included in ContextJSON.
+# Keep this small (e.g., 5-30s). Set 0 to disable.
+POST_TRIGGER_WAIT_SEC = float(os.getenv("POST_TRIGGER_WAIT_SEC", "3"))
+
+# --- Delayed entry re-evaluation (minutes-level) ---
+# If a Lorentzian trigger is blocked by AI due to missing/weak evidence,
+# re-try the same trigger when supportive signals arrive later (e.g., Q-Trend / Zones / FVG).
+# This keeps logic simple: we re-run the same entry prompt with fresher context.
+DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "1")
+# Maximum time to keep a pending Lorentzian trigger.
 DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", str(CONFLUENCE_WINDOW_SEC)))
-# Total attempts INCLUDING the initial attempt on Lorentzian.
-DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS = int(os.getenv("DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS", "3"))
-# Minimum gap between attempts (seconds).
-DELAYED_ENTRY_MIN_GAP_SEC = float(os.getenv("DELAYED_ENTRY_MIN_GAP_SEC", "5"))
-# Only re-attempt when these sources arrive in-window (normalized sources).
-DELAYED_ENTRY_SOURCES_RAW = str(os.getenv("DELAYED_ENTRY_SOURCES", "Q-Trend,Q-Trend Strong,Zones,FVG") or "").strip()
+# Minimum interval between AI re-evaluations for the same pending trigger.
+DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "20"))
+# Safety cap: maximum number of attempts for one pending trigger (including the initial attempt).
+DELAYED_ENTRY_MAX_ATTEMPTS = int(os.getenv("DELAYED_ENTRY_MAX_ATTEMPTS", "4"))
+
+# Freshness policy (prompt-side): signals within this age are considered "fresh".
+ENTRY_FRESHNESS_SEC = float(os.getenv("ENTRY_FRESHNESS_SEC", "15"))
 
 AI_CLOSE_ENABLED = _env_bool("AI_CLOSE_ENABLED", "1")
 AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "20"))
@@ -161,6 +168,15 @@ AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65")
 ENTRY_MAX_SPREAD_POINTS = float(os.getenv("ENTRY_MAX_SPREAD_POINTS", "90"))
 ENTRY_MIN_ATR_TO_SPREAD = float(os.getenv("ENTRY_MIN_ATR_TO_SPREAD", "2.5"))
 ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "25"))
+
+# --- Price drift safety (prompt-side by default) ---
+# Prevent entering far away from the trigger price (avoid chasing highs/lows).
+# Units are *points* (MT5 symbol_info.point based), consistent with spread_points.
+# Set <= 0 to disable.
+DRIFT_LIMIT_POINTS = float(os.getenv("DRIFT_LIMIT_POINTS", os.getenv("MAX_SLIPPAGE_POINTS", "2.0")))
+# If enabled, hard-block entry locally when drift exceeds the limit.
+# Default is OFF to allow prompt-driven decisioning only.
+DRIFT_HARD_BLOCK_ENABLED = _env_bool("DRIFT_HARD_BLOCK_ENABLED", "0")
 
 
 # --- Weekend discretionary close ---
@@ -213,136 +229,10 @@ _entry_lock = Lock()
 _last_order_sent_at_by_symbol: Dict[str, float] = {}
 
 _pending_entry_lock = Lock()
-# Per symbol: pending Lorentzian trigger for delayed re-evaluation.
+# Structure: { SYMBOL: { trigger: dict, created_at: float, expires_at: float, attempts: int,
+#                        last_attempt_at: float, last_retry_signal: dict|None } }
 _pending_entry_by_symbol: Dict[str, Dict[str, Any]] = {}
 
-
-def _parse_csv_set(raw: str) -> set:
-    out = set()
-    s = (raw or "").strip()
-    if not s:
-        return out
-    for chunk in s.replace(";", ",").replace("\n", ",").split(","):
-        v = (chunk or "").strip()
-        if v:
-            out.add(v)
-    return out
-
-
-DELAYED_ENTRY_SOURCES = _parse_csv_set(DELAYED_ENTRY_SOURCES_RAW)
-
-
-def _pending_entry_set(symbol: str, trigger: Dict[str, Any], now: float) -> None:
-    sym = (symbol or "").strip().upper()
-    if not sym or not isinstance(trigger, dict):
-        return
-    trig_ts = float(trigger.get("signal_time") or trigger.get("receive_time") or now)
-    with _pending_entry_lock:
-        _pending_entry_by_symbol[sym] = {
-            "trigger": dict(trigger),
-            "trigger_ts": trig_ts,
-            "created_at": float(now),
-            "attempts": 0,
-            "last_attempt_at": 0.0,
-            "last_context_ts": 0.0,
-        }
-
-
-def _pending_entry_clear(symbol: str) -> None:
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        return
-    with _pending_entry_lock:
-        _pending_entry_by_symbol.pop(sym, None)
-
-
-def _pending_entry_get(symbol: str) -> Optional[Dict[str, Any]]:
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        return None
-    with _pending_entry_lock:
-        st = _pending_entry_by_symbol.get(sym)
-        return dict(st) if isinstance(st, dict) else None
-
-
-def _pending_entry_note_attempt(symbol: str, now: float, context_ts: Optional[float] = None) -> None:
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        return
-    with _pending_entry_lock:
-        st = _pending_entry_by_symbol.get(sym)
-        if not isinstance(st, dict):
-            return
-        st["attempts"] = int(st.get("attempts") or 0) + 1
-        st["last_attempt_at"] = float(now)
-        if context_ts is not None:
-            try:
-                st["last_context_ts"] = float(max(float(st.get("last_context_ts") or 0.0), float(context_ts)))
-            except Exception:
-                pass
-        _pending_entry_by_symbol[sym] = st
-
-
-def _maybe_attempt_delayed_entry(symbol: str, incoming: Dict[str, Any], now: float, pos_summary: Optional[dict]) -> Optional[tuple[str, int]]:
-    """Attempt entry again when new evidence arrives after Lorentzian.
-
-    Returns (message, http_status) from entry attempt when attempted, else None.
-    """
-    if not DELAYED_ENTRY_ENABLED:
-        return None
-    st = _pending_entry_get(symbol)
-    if not isinstance(st, dict):
-        return None
-
-    trig = st.get("trigger")
-    if not isinstance(trig, dict):
-        _pending_entry_clear(symbol)
-        return None
-
-    trig_ts = float(st.get("trigger_ts") or 0.0)
-    if trig_ts <= 0:
-        _pending_entry_clear(symbol)
-        return None
-
-    max_wait = float(DELAYED_ENTRY_MAX_WAIT_SEC or 0.0)
-    if max_wait > 0 and (float(now) - trig_ts) > max_wait:
-        _pending_entry_clear(symbol)
-        return None
-
-    # Only react to selected sources (normalized)
-    src = (incoming.get("source") or "").strip()
-    if DELAYED_ENTRY_SOURCES and (src not in DELAYED_ENTRY_SOURCES):
-        return None
-
-    # Incoming signal must be within (trigger_ts, trigger_ts + max_wait]
-    sig_ts = float(incoming.get("signal_time") or incoming.get("receive_time") or 0.0)
-    if sig_ts <= 0:
-        return None
-    if sig_ts < trig_ts:
-        return None
-    if max_wait > 0 and (sig_ts - trig_ts) > max_wait:
-        return None
-
-    # Avoid repeated attempts on the same context timestamp.
-    last_ctx = float(st.get("last_context_ts") or 0.0)
-    if sig_ts <= last_ctx:
-        return None
-
-    attempts = int(st.get("attempts") or 0)
-    if int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS):
-        _pending_entry_clear(symbol)
-        return None
-
-    last_attempt_at = float(st.get("last_attempt_at") or 0.0)
-    if last_attempt_at > 0 and (float(now) - last_attempt_at) < float(DELAYED_ENTRY_MIN_GAP_SEC or 0.0):
-        return None
-
-    print(f"[FXAI][ENTRY] Delayed re-eval triggered by {src} at t={sig_ts:.3f} (trigger_ts={trig_ts:.3f})")
-    _pending_entry_note_attempt(symbol, now=float(now), context_ts=sig_ts)
-    msg, code = _attempt_entry_from_lorentzian(symbol, dict(trig), float(now), pos_summary=pos_summary)
-    if (msg == "OK") and int(code) == 200:
-        _pending_entry_clear(symbol)
-    return msg, int(code)
 
 # fxChartAI v2.6思想寄せ：
 
@@ -550,7 +440,194 @@ def _get_status_snapshot() -> Dict[str, Any]:
             fresh = age <= float(snap.get("heartbeat_timeout_sec") or ZMQ_HEARTBEAT_TIMEOUT_SEC)
         snap["heartbeat_age_sec"] = age
         snap["heartbeat_fresh"] = fresh
+
+    # Pending entry snapshot (for delayed re-evaluation observability)
+    now2 = time.time()
+    with _pending_entry_lock:
+        pending_items = {}
+        for sym, st in _pending_entry_by_symbol.items():
+            if not isinstance(st, dict):
+                continue
+            trig = st.get("trigger") if isinstance(st.get("trigger"), dict) else {}
+            created_at = float(st.get("created_at") or 0.0)
+            expires_at = float(st.get("expires_at") or 0.0)
+            last_attempt_at = float(st.get("last_attempt_at") or 0.0)
+            attempts = int(st.get("attempts") or 0)
+            pending_items[sym] = {
+                "side": (trig.get("side") or "").lower(),
+                "tf": trig.get("tf"),
+                "trigger_time": trig.get("signal_time") or trig.get("receive_time"),
+                "trigger_price": trig.get("price"),
+                "age_sec": round(now2 - created_at, 3) if created_at > 0 else None,
+                "expires_in_sec": round(expires_at - now2, 3) if expires_at > 0 else None,
+                "attempts": attempts,
+                "last_attempt_age_sec": round(now2 - last_attempt_at, 3) if last_attempt_at > 0 else None,
+                "last_retry_signal": st.get("last_retry_signal"),
+            }
+        snap["pending_entries"] = pending_items
     return snap
+
+
+def _prune_pending_entries_locked(now: float) -> None:
+    remove = []
+    for sym, st in _pending_entry_by_symbol.items():
+        try:
+            expires_at = float((st or {}).get("expires_at") or 0.0)
+            attempts = int((st or {}).get("attempts") or 0)
+            if expires_at > 0 and now >= expires_at:
+                remove.append(sym)
+                continue
+            if int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS):
+                remove.append(sym)
+                continue
+        except Exception:
+            remove.append(sym)
+    for sym in remove:
+        _pending_entry_by_symbol.pop(sym, None)
+
+
+def _upsert_pending_entry(symbol: str, trigger: dict, now: float) -> None:
+    if not DELAYED_ENTRY_ENABLED:
+        return
+    try:
+        max_wait = float(DELAYED_ENTRY_MAX_WAIT_SEC or 0.0)
+    except Exception:
+        max_wait = 0.0
+    expires_at = (now + max_wait) if max_wait > 0 else (now + float(CONFLUENCE_WINDOW_SEC or 600))
+
+    with _pending_entry_lock:
+        _prune_pending_entries_locked(now)
+        _pending_entry_by_symbol[symbol] = {
+            "trigger": dict(trigger),
+            "created_at": float(now),
+            "expires_at": float(expires_at),
+            "attempts": 0,
+            "last_attempt_at": 0.0,
+            "last_retry_signal": None,
+        }
+
+
+def _clear_pending_entry(symbol: str, *, reason: str) -> None:
+    with _pending_entry_lock:
+        st = _pending_entry_by_symbol.pop(symbol, None)
+    if st is not None:
+        print(f"[FXAI][DELAYED_ENTRY] Cleared pending for {symbol}: {reason}")
+
+
+def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> bool:
+    """Return True if incoming signal is the kind that should trigger a delayed re-evaluation."""
+    try:
+        sig_type = (incoming.get("signal_type") or "").strip().lower()
+        src = (incoming.get("source") or "").strip()
+        evt = (incoming.get("event") or "").strip().lower()
+        inc_side = (incoming.get("side") or "").strip().lower()
+        pend_side = (pending_trigger.get("side") or "").strip().lower()
+    except Exception:
+        return False
+
+    # Only re-evaluate on signals that can add evidence.
+    if sig_type not in {"context", "structure", "trend_filter"} and src not in {"Zones", "FVG", "OSGFC", "LuxAlgo_FVG"}:
+        return False
+
+    # Directional signals must match the pending trigger direction.
+    if inc_side in {"buy", "sell"} and pend_side in {"buy", "sell"} and inc_side != pend_side:
+        return False
+
+    # Q-Trend updates (context) are key.
+    if _is_qtrend_source(src):
+        return True
+
+    # Zones/FVG touches help; zone confirmations can help even if neutral.
+    if src == "Zones" and (evt in {"zone_retrace_touch", "zone_touch", "new_zone_confirmed", "zone_confirmed"} or "touch" in evt):
+        return True
+    if src in {"FVG", "LuxAlgo_FVG"} and (evt in {"fvg_touch"} or "touch" in evt):
+        return True
+
+    # Other allowed evidence sources in the pipeline.
+    if src in {"OSGFC"}:
+        return True
+
+    return False
+
+
+def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float) -> Optional[tuple[str, int]]:
+    if not DELAYED_ENTRY_ENABLED:
+        return None
+
+    with _pending_entry_lock:
+        _prune_pending_entries_locked(now)
+        st = _pending_entry_by_symbol.get(symbol)
+        st_copy = dict(st) if isinstance(st, dict) else None
+
+    if not st_copy:
+        return None
+
+    trigger = st_copy.get("trigger") if isinstance(st_copy.get("trigger"), dict) else None
+    if not trigger:
+        _clear_pending_entry(symbol, reason="missing_trigger")
+        return None
+
+    if not _should_trigger_delayed_reeval(incoming_signal, trigger):
+        return None
+
+    # Only attempt delayed entries when flat (do not create add-ons minutes later).
+    pos_summary = get_mt5_positions_summary(symbol)
+    if int(pos_summary.get("positions_open") or 0) > 0:
+        _clear_pending_entry(symbol, reason="positions_open")
+        return None
+
+    # Throttle + attempt caps
+    try:
+        min_interval = float(DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC or 0.0)
+    except Exception:
+        min_interval = 0.0
+
+    with _pending_entry_lock:
+        st2 = _pending_entry_by_symbol.get(symbol) or {}
+        last_attempt_at = float(st2.get("last_attempt_at") or 0.0)
+        attempts = int(st2.get("attempts") or 0)
+        if int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS):
+            _pending_entry_by_symbol.pop(symbol, None)
+            return None
+        if last_attempt_at > 0 and min_interval > 0 and (now - last_attempt_at) < min_interval:
+            return None
+        # reserve attempt slot
+        st2["last_attempt_at"] = float(now)
+        st2["attempts"] = attempts + 1
+        st2["last_retry_signal"] = {
+            "source": incoming_signal.get("source"),
+            "event": incoming_signal.get("event"),
+            "side": incoming_signal.get("side"),
+            "tf": incoming_signal.get("tf"),
+            "signal_time": incoming_signal.get("signal_time"),
+            "receive_time": incoming_signal.get("receive_time"),
+        }
+        _pending_entry_by_symbol[symbol] = st2
+
+    with _entry_lock:
+        last_sent_before = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
+
+    print(
+        "[FXAI][DELAYED_ENTRY] Re-evaluating pending entry due to incoming signal: "
+        + json.dumps(
+            {
+                "symbol": symbol,
+                "incoming": {"source": incoming_signal.get("source"), "event": incoming_signal.get("event"), "side": incoming_signal.get("side"), "tf": incoming_signal.get("tf")},
+                "attempt": int(attempts + 1),
+                "max_attempts": int(DELAYED_ENTRY_MAX_ATTEMPTS or 0),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    resp = _attempt_entry_from_lorentzian(symbol, trigger, now, pos_summary=pos_summary)
+
+    with _entry_lock:
+        last_sent_after = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
+    if last_sent_after > last_sent_before:
+        _clear_pending_entry(symbol, reason="order_sent")
+
+    return resp
 
 
 def _check_port_bindable(host: str, port: int) -> Optional[str]:
@@ -751,6 +828,97 @@ _last_close_attempt_at = 0.0
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: str) -> tuple[bool, str]:
+    """Check price drift between signal price and current market.
+
+    - BUY: block if current_ask > signal_price + limit
+    - SELL: block if current_bid < signal_price - limit
+
+    Returns (ok, reason).
+    """
+    limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
+    if limit_points <= 0:
+        return True, "disabled"
+
+    try:
+        sp = float(signal_price)
+    except Exception:
+        return True, "no_signal_price"
+
+    if not isinstance(current_market, dict):
+        return True, "no_market"
+
+    try:
+        bid = float(current_market.get("bid") or 0.0)
+        ask = float(current_market.get("ask") or 0.0)
+        point = float(current_market.get("point") or 0.0)
+    except Exception:
+        bid, ask, point = 0.0, 0.0, 0.0
+
+    if sp <= 0 or (bid <= 0 and ask <= 0):
+        return True, "invalid_prices"
+    if point <= 0:
+        return True, "no_point"
+
+    s = (side or "").strip().lower()
+    if s in {"buy", "long"}:
+        cur = ask if ask > 0 else bid
+        if cur <= 0:
+            return True, "no_current_ask"
+        max_allowed = sp + (limit_points * point)
+        if cur > max_allowed:
+            drift_pts = (cur - sp) / point
+            return False, f"drift_too_high buy signal={sp} ask={cur} limit_pts={limit_points} drift_pts={drift_pts:.2f}"
+        return True, "ok"
+
+    if s in {"sell", "short"}:
+        cur = bid if bid > 0 else ask
+        if cur <= 0:
+            return True, "no_current_bid"
+        min_allowed = sp - (limit_points * point)
+        if cur < min_allowed:
+            drift_pts = (sp - cur) / point
+            return False, f"drift_too_low sell signal={sp} bid={cur} limit_pts={limit_points} drift_pts={drift_pts:.2f}"
+        return True, "ok"
+
+    return True, "unknown_side"
+
+
+def _price_drift_snapshot(signal_price: Any, current_market: Dict[str, Any], side: str) -> Dict[str, Any]:
+    """Return a compact snapshot for prompts/metrics (never raises)."""
+    limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
+    ok, reason = _check_price_drift(signal_price, current_market, side)
+    snap: Dict[str, Any] = {
+        "enabled": bool(limit_points > 0),
+        "hard_block_enabled": bool(DRIFT_HARD_BLOCK_ENABLED),
+        "limit_points": limit_points,
+        "ok": bool(ok),
+        "reason": reason,
+        "signal_price": signal_price,
+        "bid": (current_market or {}).get("bid") if isinstance(current_market, dict) else None,
+        "ask": (current_market or {}).get("ask") if isinstance(current_market, dict) else None,
+        "point": (current_market or {}).get("point") if isinstance(current_market, dict) else None,
+    }
+    try:
+        sp = float(signal_price)
+        bid = float((current_market or {}).get("bid") or 0.0)
+        ask = float((current_market or {}).get("ask") or 0.0)
+        point = float((current_market or {}).get("point") or 0.0)
+        s = (side or "").strip().lower()
+        if sp > 0 and point > 0 and (bid > 0 or ask > 0):
+            if s == "buy":
+                cur = ask if ask > 0 else bid
+                snap["current_price"] = cur
+                snap["drift_points"] = (cur - sp) / point
+            elif s == "sell":
+                cur = bid if bid > 0 else ask
+                snap["current_price"] = cur
+                snap["drift_points"] = (sp - cur) / point
+    except Exception:
+        pass
+    return snap
 
 
 def _stable_round_time(t: Optional[float], resolution_sec: float = 1.0) -> Optional[float]:
@@ -2504,6 +2672,7 @@ def _build_entry_logic_prompt(
                 "event": (normalized_trigger or {}).get("event"),
                 "confirmed": (normalized_trigger or {}).get("confirmed"),
                 "signal_time": (normalized_trigger or {}).get("signal_time"),
+                "price": (normalized_trigger or {}).get("price"),
             },
             "qtrend_context": qtrend_context,
             "mt5_positions_summary": (stats or {}).get("mt5_positions_summary"),
@@ -2515,6 +2684,7 @@ def _build_entry_logic_prompt(
                 "atr_m5_approx": market.get("atr"),
                 "spread_points": market.get("spread"),
             },
+            "price_drift": _price_drift_snapshot((normalized_trigger or {}).get("price"), market, (normalized_trigger or {}).get("side")),
             "note": "No aggregated evidence stats available yet. Score conservatively.",
         }
         return (
@@ -2522,6 +2692,7 @@ def _build_entry_logic_prompt(
             "Trigger: Lorentzian fired the proposed_action.\n"
             "Environment: Q-Trend provides direction/strength context only (not a trigger).\n"
             "If Q-Trend context is missing/stale, do NOT auto-reject; treat it as UNKNOWN and evaluate other evidence and market conditions.\n"
+            "IMPORTANT: If ContextJSON.price_drift.enabled is true and price_drift.ok is false, output a VERY LOW confluence_score (e.g., <= 20).\n"
             "Return ONLY strict JSON with this schema:\n"
             '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
             "ContextJSON:\n"
@@ -2622,6 +2793,8 @@ def _build_entry_filter_prompt(
             "event": (normalized_trigger or {}).get("event"),
             "confirmed": (normalized_trigger or {}).get("confirmed"),
             "signal_time": (normalized_trigger or {}).get("signal_time"),
+            "price": (normalized_trigger or {}).get("price"),
+            "age_sec": int(now - float((normalized_trigger or {}).get("signal_time") or 0.0)) if (normalized_trigger or {}).get("signal_time") else None,
         },
         "signals_window": stats.get("window_signals"),
         "mt5_positions_summary": stats.get("mt5_positions_summary"),
@@ -2676,11 +2849,13 @@ def _build_entry_filter_prompt(
             "spread_points": spread_points,
             "spread_flag": spread_flag,
         },
+        "price_drift": _price_drift_snapshot((normalized_trigger or {}).get("price"), market, trigger_side),
         "constraints": {
             "ai_confluence_score_range": [1, 100],
             "lot_multiplier_range": [0.5, 2.0],
             "local_multiplier": local_multiplier,
             "final_multiplier_max": 2.0,
+            "freshness_sec": float(ENTRY_FRESHNESS_SEC or 30.0),
             "note": "Return JSON only. Score 70+ only when confluence is truly strong AND market conditions (ATR vs spread, trend alignment) are acceptable. Be conservative on uncertainty.",
         },
     }
@@ -2706,6 +2881,8 @@ def _build_entry_filter_prompt(
         "- If structural Zones context exists (zones_confirmed_recent > 0) and confluence is weak, be conservative unless other evidence strongly improves EV.\n"
         "- Penalize wide spread.\n"
         "IMPORTANT: ContextJSON.confluence.local_points is a small local heuristic (NOT the output confluence_score 1-100).\n"
+        "IMPORTANT: Use freshness. If trigger.age_sec is <= constraints.freshness_sec, treat context as fresh.\n"
+        "If trigger.age_sec is > constraints.freshness_sec and ContextJSON.price_drift.enabled is true and price_drift.ok is false, treat it as chasing/missed entry and output a VERY LOW confluence_score (e.g., <= 20).\n"
         "Return ONLY strict JSON schema:\n"
         '{"confluence_score": 1-100, "lot_multiplier": 0.5-2.0, "reason": "brief"}\n\n'
         "ContextJSON:\n"
@@ -2769,9 +2946,52 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     elif net_side == "sell" and net_avg_open > 0 and mid > 0:
         move_points = net_avg_open - mid
 
+    # Phase Management helpers (keep it lightweight; this only affects the prompt)
+    holding_sec = float(pos_summary.get("max_holding_sec") or 0.0)
+    profit_money = float(pos_summary.get("total_profit") or 0.0)
+    spread_points = float(market.get("spread") or 0.0)
+    atr_points = float(market.get("atr_points") or 0.0)
+    point = float(market.get("point") or 0.0)
+
+    move_points_pts = (move_points / point) if (point > 0 and move_points != 0.0) else (0.0 if point > 0 else None)
+
+    # Breakeven-like band: within noise/spread/volatility. Used only as a hint to AI.
+    breakeven_band_points = 0.0
+    try:
+        breakeven_band_points = max(0.0, float(spread_points) * 1.5, float(atr_points) * 0.15)
+    except Exception:
+        breakeven_band_points = max(0.0, float(spread_points) * 1.5)
+
+    is_breakeven_like = False
+    if move_points_pts is not None:
+        is_breakeven_like = abs(float(move_points_pts)) <= float(breakeven_band_points)
+    else:
+        # Fallback: money PnL near zero (account-dependent; only a weak hint)
+        is_breakeven_like = abs(float(profit_money)) <= 0.5
+
+    profit_protect_threshold_points = 0.0
+    try:
+        profit_protect_threshold_points = max(float(spread_points) * 3.0, float(atr_points) * 0.6)
+    except Exception:
+        profit_protect_threshold_points = float(spread_points) * 3.0
+
+    in_profit_protect = (move_points_pts is not None) and (float(move_points_pts) >= float(profit_protect_threshold_points))
+    in_development = (holding_sec > 0 and holding_sec < 15.0 * 60.0) or bool(is_breakeven_like)
+
+    phase_name = "PROFIT_PROTECT" if in_profit_protect else "DEVELOPMENT" if in_development else "DEVELOPMENT"
+
     payload = {
         "symbol": symbol,
         "mode": "POSITION_MANAGEMENT",
+        "phase": {
+            "name": phase_name,
+            "rules": {
+                "development_holding_sec_lt": 15 * 60,
+                "breakeven_band_points": round(float(breakeven_band_points), 3),
+                "profit_protect_threshold_points": round(float(profit_protect_threshold_points), 3),
+                "notes": "Phase is a hint for AI behavior. Use POSITION + MARKET context to decide; do not override hard risk realities.",
+            },
+        },
         "position": {
             "positions_open": int(pos_summary.get("positions_open") or 0),
             "net_side": pos_summary.get("net_side"),
@@ -2785,7 +3005,10 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
             "buy_profit": pos_summary.get("buy_profit"),
             "sell_profit": pos_summary.get("sell_profit"),
             "net_avg_open": round(net_avg_open, 6),
+            # NOTE: This is a *price delta* (not points). Keep for backward compatibility.
             "net_move_points_approx": round(move_points, 6),
+            # Preferred: move in broker points (positive means favorable move for the current net_side).
+            "net_move_points": round(float(move_points_pts), 3) if move_points_pts is not None else None,
         },
         "qtrend_context": {
             "latest_q_side": stats.get("q_side"),
@@ -2825,16 +3048,32 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     }
 
     return (
-    "You are an elite XAUUSD/GOLD DAY TRADER focused on maximizing run-up profits while securing gains.\n"
-    "1. Decide ACTION: HOLD or CLOSE.\n"
-    "2. Decide TRAIL_MODE (Dynamic Trailing):\n"
-    "   - 'WIDE': Momentum is VERY STRONG. Use wide trailing to catch big waves (avoid noise stop-out).\n"
-    "   - 'NORMAL': Standard trend strength.\n"
-    "   - 'TIGHT': Momentum is weakening or chopping. Tighten stop to protect profits.\n"
-    "Return ONLY strict JSON with this schema:\n"
-    '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "brief"}\n\n'
-    "ContextJSON:\n"
-    + json.dumps(payload, ensure_ascii=False)
+        "You are an elite XAUUSD/GOLD DAY TRADER focused on maximizing run-up profits while securing gains.\n"
+        "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
+        "You MUST follow Phase Management rules below to avoid early whipsaws.\n\n"
+        "PHASE MANAGEMENT (IMPORTANT):\n"
+        "- Phase 1: DEVELOPMENT (育成フェーズ)\n"
+        "  - Condition hint: position.max_holding_sec is short (e.g., < 15 min) OR position is near breakeven (see phase.rules.breakeven_band_points).\n"
+        "  - Behavior: be INSENSITIVE. Default to HOLD.\n"
+        "    - Ignore single touch/noise opposition (e.g., one FVG/Zones touch) and minor momentum weakening.\n"
+        "    - Do NOT CLOSE just because the latest_signal is opposite if it is not structural/confirmed.\n"
+        "  - Exit conditions (CLOSE only when clear):\n"
+        "    - Clear STRUCTURAL REVERSAL against the position (confirmed multi-source opposition, strong opposite Zones structure, decisive Q-Trend reversal aligned with market deterioration).\n"
+        "    - Sudden adverse move / risk event exceeding acceptable risk (e.g., sharp expansion against you, spread blowout + reversal signs).\n"
+        "    - In Phase 1, require HIGH confidence to CLOSE (aim >= 80). Otherwise HOLD.\n"
+        "  - Trailing: prefer NORMAL/WIDE to avoid noise stop-out unless reversal is structural.\n\n"
+        "- Phase 2: PROFIT_PROTECT (利益確保フェーズ)\n"
+        "  - Condition hint: position has meaningful run-up (see phase.rules.profit_protect_threshold_points) / sufficient open profit.\n"
+        "  - Behavior: be SENSITIVE (protect profits).\n"
+        "    - If reversal risk rises, close faster to secure gains.\n"
+        "    - TRAIL_MODE can be TIGHT when momentum weakens/chops, NORMAL otherwise; WIDE only when momentum is VERY STRONG and reversal risk is low.\n\n"
+        "TASK:\n"
+        "1. Decide ACTION: HOLD or CLOSE.\n"
+        "2. Decide TRAIL_MODE (Dynamic Trailing): WIDE | NORMAL | TIGHT.\n"
+        "Return ONLY strict JSON with this schema (no extra keys, no markdown):\n"
+        '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "brief"}\n\n'
+        "ContextJSON:\n"
+        + json.dumps(payload, ensure_ascii=False)
     )
 
 
@@ -3036,7 +3275,43 @@ def _attempt_entry_from_lorentzian(
             )
             return _finish("Blocked (cooldown)", 200, "blocked_cooldown", market=market)
 
+    # --- Price drift guard (especially important for delayed entry) ---
+    # Prefer prompt-driven decisioning; only hard-block when explicitly enabled.
+    ok_drift, drift_reason = _check_price_drift(normalized_trigger.get("price"), market, trig_side)
+    if DRIFT_HARD_BLOCK_ENABLED and (not ok_drift):
+        _set_status(
+            last_result="Blocked (price drift)",
+            last_result_at=time.time(),
+            last_entry_guard={
+                "price_drift": True,
+                "reason": drift_reason,
+                "limit_points": float(DRIFT_LIMIT_POINTS or 0.0),
+                "signal_price": normalized_trigger.get("price"),
+                "bid": market.get("bid"),
+                "ask": market.get("ask"),
+            },
+        )
+        print(f"[FXAI][WARN] Blocked entry due to price drift: {drift_reason}")
+        return _finish("Blocked (price drift)", 200, "blocked_price_drift", market=market)
+
     trig_st = float(normalized_trigger.get("signal_time") or normalized_trigger.get("receive_time") or now)
+
+    # Optional: small settle window to capture near-immediate context AFTER the trigger.
+    # This is intentionally short (e.g., 5-30s) to avoid waiting minutes.
+    try:
+        wait_sec = float(POST_TRIGGER_WAIT_SEC or 0.0)
+    except Exception:
+        wait_sec = 0.0
+    if wait_sec > 0:
+        try:
+            age = float(now - trig_st)
+            remain = float(wait_sec - age)
+            if remain > 0:
+                time.sleep(min(remain, wait_sec))
+                now = float(time.time())
+        except Exception:
+            pass
+
     window_sec = float(CONFLUENCE_WINDOW_SEC or 300)
     window_signals = _collect_window_signals_around_trigger(symbol, trig_st, trig_side, window_sec=window_sec)
     evidence_ctx = _collect_recent_context_signals(symbol, now)
@@ -3536,25 +3811,29 @@ def webhook():
 
     # --- ENTRY (Lorentzian) ---
     if pending_entry_trigger and normalized_trigger:
+        # Register pending trigger for delayed re-evaluation (even if the first attempt fails).
         if DELAYED_ENTRY_ENABLED:
-            _pending_entry_set(symbol, normalized_trigger, now)
-            # Count the initial attempt against the total budget.
-            _pending_entry_note_attempt(symbol, now=float(now), context_ts=float(normalized_trigger.get("signal_time") or 0.0) or None)
-        msg, code = _attempt_entry_from_lorentzian(symbol, normalized_trigger, now, pos_summary=pos_summary)
-        if DELAYED_ENTRY_ENABLED and (msg == "OK") and int(code) == 200:
-            _pending_entry_clear(symbol)
-        return msg, int(code)
+            _upsert_pending_entry(symbol, normalized_trigger, float(now))
+            with _pending_entry_lock:
+                st = _pending_entry_by_symbol.get(symbol) or {}
+                st["last_attempt_at"] = float(time.time())
+                st["attempts"] = max(1, int(st.get("attempts") or 0) + 1)
+                _pending_entry_by_symbol[symbol] = st
 
-    # Optional: delayed entry re-evaluation on new evidence (Q-Trend/Zones/FVG) after Lorentzian.
-    # We keep the webhook response 200 for context signals to avoid noisy alert failures on TradingView.
-    if DELAYED_ENTRY_ENABLED and sig_type in {"context", "structure"}:
-        attempted = _maybe_attempt_delayed_entry(symbol, normalized, now, pos_summary)
-        if attempted is not None:
-            msg, code = attempted
-            if (msg == "OK") and int(code) == 200:
-                return "OK", 200
-            _set_status(last_result="Context stored (delayed entry attempted)", last_result_at=time.time())
-            return "Context stored", 200
+        with _entry_lock:
+            last_sent_before = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
+        resp = _attempt_entry_from_lorentzian(symbol, normalized_trigger, now, pos_summary=pos_summary)
+        with _entry_lock:
+            last_sent_after = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
+        if DELAYED_ENTRY_ENABLED and (last_sent_after > last_sent_before):
+            _clear_pending_entry(symbol, reason="order_sent")
+        return resp
+
+    # --- DELAYED_ENTRY (re-evaluate on later supportive context) ---
+    if DELAYED_ENTRY_ENABLED:
+        delayed_resp = _maybe_attempt_delayed_entry(symbol, normalized, float(now))
+        if delayed_resp is not None:
+            return delayed_resp
 
     if sig_type == "context":
         _set_status(last_result="Context stored", last_result_at=time.time())
@@ -3603,11 +3882,14 @@ def metrics():
         "AI_ENTRY_MIN_SCORE_STRONG_ALIGNED": int(AI_ENTRY_MIN_SCORE_STRONG_ALIGNED),
         "ADDON_MIN_AI_SCORE": int(ADDON_MIN_AI_SCORE),
         "CONFLUENCE_WINDOW_SEC": int(CONFLUENCE_WINDOW_SEC),
+        "POST_TRIGGER_WAIT_SEC": float(POST_TRIGGER_WAIT_SEC or 0.0),
         "DELAYED_ENTRY_ENABLED": bool(DELAYED_ENTRY_ENABLED),
-        "DELAYED_ENTRY_MAX_WAIT_SEC": float(DELAYED_ENTRY_MAX_WAIT_SEC),
-        "DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS": int(DELAYED_ENTRY_MAX_TOTAL_ATTEMPTS),
-        "DELAYED_ENTRY_MIN_GAP_SEC": float(DELAYED_ENTRY_MIN_GAP_SEC),
-        "DELAYED_ENTRY_SOURCES": sorted(list(DELAYED_ENTRY_SOURCES)) if isinstance(DELAYED_ENTRY_SOURCES, set) else [],
+        "DELAYED_ENTRY_MAX_WAIT_SEC": float(DELAYED_ENTRY_MAX_WAIT_SEC or 0.0),
+        "DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC": float(DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC or 0.0),
+        "DELAYED_ENTRY_MAX_ATTEMPTS": int(DELAYED_ENTRY_MAX_ATTEMPTS or 0),
+        "ENTRY_FRESHNESS_SEC": float(ENTRY_FRESHNESS_SEC or 0.0),
+        "DRIFT_LIMIT_POINTS": float(DRIFT_LIMIT_POINTS or 0.0),
+        "DRIFT_HARD_BLOCK_ENABLED": bool(DRIFT_HARD_BLOCK_ENABLED),
         "ENTRY_MAX_SPREAD_POINTS": float(ENTRY_MAX_SPREAD_POINTS),
         "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
         "ENTRY_COOLDOWN_SEC": float(ENTRY_COOLDOWN_SEC),
