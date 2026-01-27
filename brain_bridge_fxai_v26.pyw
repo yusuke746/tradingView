@@ -3387,7 +3387,14 @@ def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
     return out
 
 
-def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> str:
+def _build_close_logic_prompt(
+    symbol: str,
+    market: dict,
+    stats: Optional[dict],
+    pos_summary: dict,
+    latest_signal: dict,
+    recent_signals: Optional[List[dict]] = None,
+) -> str:
     """保有中のCLOSE/HOLD判断用プロンプト（Day Trading・損小利大）。"""
     now = time.time()
     stats = stats or {}
@@ -3446,6 +3453,16 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     in_development = (holding_sec > 0 and holding_sec < 15.0 * 60.0) or bool(is_breakeven_like)
 
     phase_name = "PROFIT_PROTECT" if in_profit_protect else "DEVELOPMENT" if in_development else "DEVELOPMENT"
+
+    # Recent signals gathered during settle window (if available). Keep it small.
+    recent_signals_clean: List[dict] = []
+    if isinstance(recent_signals, list) and recent_signals:
+        for s in recent_signals:
+            if isinstance(s, dict):
+                recent_signals_clean.append(s)
+    # Cap to avoid prompt bloat (we only need the latest few).
+    if len(recent_signals_clean) > 8:
+        recent_signals_clean = recent_signals_clean[-8:]
 
     payload = {
         "symbol": symbol,
@@ -3517,6 +3534,8 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
             "confirmed": latest_signal.get("confirmed"),
             "signal_time": latest_signal.get("signal_time"),
         },
+        "recent_signals": recent_signals_clean,
+        "recent_signals_count": int(len(recent_signals_clean)),
         "notes": {
             "opposition_handling": "Opposition signals can be noise. Prioritize confirmed/structural reversal signs (e.g., strong opposite Zones context) over single touch events.",
             "day_trading_goal": "Loss-cut small, Profit-target large. If profit is available and reversal risk rises, take profit. If loss grows and reversal evidence increases, exit early.",
@@ -3527,6 +3546,7 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
         "You are an elite XAUUSD/GOLD DAY TRADER focused on maximizing run-up profits while securing gains.\n"
         "Core principle: Minimize loss, Maximize profit (cut losers fast; let winners run when EV is positive).\n"
         "You MUST follow Phase Management rules below to avoid early whipsaws.\n\n"
+        "IMPORTANT: ContextJSON.recent_signals contains multiple alerts collected within the settle window; use it to judge confluence and avoid reacting to a single latest_signal.\n\n"
         "PHASE MANAGEMENT (IMPORTANT):\n"
         "- Phase 1: DEVELOPMENT (育成フェーズ)\n"
         "  - Condition hint: position.max_holding_sec is short (e.g., < 15 min) OR position is near breakeven in POINTS (see phase.rules.breakeven_band_points and position.net_move_points).\n"
@@ -3553,10 +3573,17 @@ def _build_close_logic_prompt(symbol: str, market: dict, stats: Optional[dict], 
     )
 
 
-def _ai_close_hold_decision(symbol: str, market: dict, stats: Optional[dict], pos_summary: dict, latest_signal: dict) -> Optional[Dict[str, Any]]:
+def _ai_close_hold_decision(
+    symbol: str,
+    market: dict,
+    stats: Optional[dict],
+    pos_summary: dict,
+    latest_signal: dict,
+    recent_signals: Optional[List[dict]] = None,
+) -> Optional[Dict[str, Any]]:
     if not client:
         return None
-    prompt = _build_close_logic_prompt(symbol, market, stats, pos_summary, latest_signal)
+    prompt = _build_close_logic_prompt(symbol, market, stats, pos_summary, latest_signal, recent_signals=recent_signals)
     decision = _call_openai_with_retry(prompt)
     if not decision:
         print("[FXAI][AI] No response from AI (close/hold). Using fallback.")
