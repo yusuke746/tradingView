@@ -2932,6 +2932,9 @@ def _mt5_position_open_time_seconds(p: Any) -> float:
     """Extract position open time from MT5 position object (best-effort)."""
     # Prefer explicit open/create time fields when available.
     for key in (
+        # Some bindings expose explicit open time.
+        "time_open",
+        "time_open_msc",
         "time",
         "time_msc",
         "time_create",
@@ -3025,9 +3028,11 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
 
     # Safety: if positions exist, avoid returning 0 forever due to time parsing quirks.
     if len(positions) > 0 and int(max_holding) <= 0:
-        # If we saw at least one time field, this implies "just opened"; still set to 1 sec
-        # to prevent Phase Management from treating long-held positions as new due to zeros.
-        max_holding = 1
+        # Only apply the "just opened" 1-second fallback if we actually parsed at least one
+        # time field. If we couldn't parse any time at all, report 0 (unknown) rather than
+        # pinning to 1 forever.
+        if any_open_time:
+            max_holding = 1
     if not any_open_time:
         oldest_time = None
 
