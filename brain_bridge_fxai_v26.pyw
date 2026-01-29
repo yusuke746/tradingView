@@ -3718,9 +3718,12 @@ def _attempt_entry_from_lorentzian(
             _set_status(last_result="Skip entry (net_side unknown)", last_result_at=time.time())
             return _finish("Skip (net_side unknown)", 200, "skip_net_side_unknown")
 
+        # Design decision: Skip opposite-direction signals to maintain strategy clarity.
+        # Entry AI focuses on same-direction add-ons; Management AI handles reversal detection.
+        # This prevents judgment conflicts and maintains clear role separation.
         if (not ALLOW_ADD_ON_ENTRIES) or (net_side != trig_side):
-            _set_status(last_result="Skip entry (position open)", last_result_at=time.time())
-            return _finish("Skip (position open)", 200, "skip_position_open")
+            _set_status(last_result="Skip entry (position open, opposite direction)", last_result_at=time.time())
+            return _finish("Skip (position open, opposite direction)", 200, "skip_position_open")
 
         is_addon = True
 
