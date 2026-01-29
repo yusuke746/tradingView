@@ -2951,7 +2951,9 @@ def _mt5_position_open_time_seconds(p: Any) -> float:
             raw = None
         ts = _mt5_time_to_unix_seconds(raw)
         if ts > 0:
+            print(f"[DEBUG] _mt5_position_open_time_seconds: Found time from key={key}, raw={raw}, ts={ts}")
             return ts
+    print(f"[DEBUG] _mt5_position_open_time_seconds: No valid time found, returning 0")
     return 0.0
 
 
@@ -2973,6 +2975,7 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         }
 
     now = time.time()
+    print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now}, positions_count={len(positions)}")
     net_volume = 0.0
     total_profit = 0.0
     oldest_time = None
@@ -3024,7 +3027,9 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             any_open_time = True
             if oldest_time is None or t_open < float(oldest_time):
                 oldest_time = float(t_open)
-            max_holding = max(max_holding, int(max(0.0, now - float(t_open))))
+            holding_duration = int(max(0.0, now - float(t_open)))
+            max_holding = max(max_holding, holding_duration)
+            print(f"[DEBUG] Position: type={ptype}, t_open={t_open}, now={now}, holding_duration={holding_duration}, max_holding={max_holding}")
 
     # Safety: if positions exist, avoid returning 0 forever due to time parsing quirks.
     if len(positions) > 0 and int(max_holding) <= 0:
