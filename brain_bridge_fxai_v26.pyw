@@ -51,8 +51,10 @@ except Exception:
 
 try:
     import fxai_signal_cache as _fxai_signal_cache
+    from fxai_signal_cache import is_zone_presence_signal
 except Exception:
     from tradingView import fxai_signal_cache as _fxai_signal_cache
+    from tradingView.fxai_signal_cache import is_zone_presence_signal
 
 try:
     import fxai_persistence as _fxai_persist
@@ -307,7 +309,10 @@ ENTRY_TRIGGER_DEDUPE_TTL_SEC = float(os.getenv("ENTRY_TRIGGER_DEDUPE_TTL_SEC", "
 # Prevent entering far away from the trigger price (avoid chasing highs/lows).
 # Units are *points* (MT5 symbol_info.point based), consistent with spread_points.
 # Set <= 0 to disable.
-DRIFT_LIMIT_POINTS = float(os.getenv("DRIFT_LIMIT_POINTS", os.getenv("MAX_SLIPPAGE_POINTS", "2.0")))
+# NOTE: For XAUUSD, MT5 point is often 0.01 (1 point = $0.01).
+# Default drift limit 20 points ≈ $0.20 with point=0.01, but we normalize drift using a
+# larger "drift_point" for XAUUSD (see _drift_point_size) to avoid overly strict blocks.
+DRIFT_LIMIT_POINTS = float(os.getenv("DRIFT_LIMIT_POINTS", os.getenv("MAX_SLIPPAGE_POINTS", "20.0")))
 # If enabled, hard-block entry locally when drift exceeds the limit.
 # Default is OFF to allow prompt-driven decisioning only.
 DRIFT_HARD_BLOCK_ENABLED = _env_bool("DRIFT_HARD_BLOCK_ENABLED", "0")
@@ -1773,6 +1778,28 @@ def _compact_for_prompt(obj: Any, *, max_list_items: int, max_str_len: int, dept
     return s
 
 
+def _drift_point_size(symbol: str, point: float) -> float:
+    """Return the point size to use for drift checks.
+
+    For XAUUSD/GOLD, MT5 often reports point=0.01 (1 point = $0.01).
+    Drift checks are more intuitive in $0.10 increments (pip-like), so we
+    normalize to 0.10 when point is very small.
+    """
+    try:
+        sym = (symbol or "").strip().upper()
+    except Exception:
+        sym = ""
+    try:
+        p = float(point or 0.0)
+    except Exception:
+        p = 0.0
+    if p <= 0:
+        return 0.0
+    if sym in {"XAUUSD", "GOLD", "XAU"} and p <= 0.01:
+        return 0.1
+    return p
+
+
 def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: str) -> tuple[bool, str]:
     """Check price drift between signal price and current market.
 
@@ -1796,7 +1823,7 @@ def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: 
     try:
         bid = float(current_market.get("bid") or 0.0)
         ask = float(current_market.get("ask") or 0.0)
-        point = float(current_market.get("point") or 0.0)
+        point = float(current_market.get("drift_point") or current_market.get("point") or 0.0)
     except Exception:
         bid, ask, point = 0.0, 0.0, 0.0
 
@@ -1843,12 +1870,13 @@ def _price_drift_snapshot(signal_price: Any, current_market: Dict[str, Any], sid
         "bid": (current_market or {}).get("bid") if isinstance(current_market, dict) else None,
         "ask": (current_market or {}).get("ask") if isinstance(current_market, dict) else None,
         "point": (current_market or {}).get("point") if isinstance(current_market, dict) else None,
+        "drift_point": (current_market or {}).get("drift_point") if isinstance(current_market, dict) else None,
     }
     try:
         sp = float(signal_price)
         bid = float((current_market or {}).get("bid") or 0.0)
         ask = float((current_market or {}).get("ask") or 0.0)
-        point = float((current_market or {}).get("point") or 0.0)
+        point = float((current_market or {}).get("drift_point") or (current_market or {}).get("point") or 0.0)
         s = (side or "").strip().lower()
         if sp > 0 and point > 0 and (bid > 0 or ask > 0):
             if s == "buy":
@@ -1862,6 +1890,148 @@ def _price_drift_snapshot(signal_price: Any, current_market: Dict[str, Any], sid
     except Exception:
         pass
     return snap
+
+
+def _current_price_from_market(market: Dict[str, Any]) -> float:
+    try:
+        bid = float((market or {}).get("bid") or 0.0)
+        ask = float((market or {}).get("ask") or 0.0)
+    except Exception:
+        bid, ask = 0.0, 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return bid if bid > 0 else ask if ask > 0 else 0.0
+
+
+def _build_sma_context(market: Dict[str, Any]) -> Dict[str, Any]:
+    """Build SMA context with distance and slope information."""
+    sma_price = float((market or {}).get("m15_ma") or 0.0)
+    point = float((market or {}).get("point") or 0.0)
+    slope = (market or {}).get("m15_sma20_slope") or "FLAT"
+    if slope not in {"UP", "DOWN", "FLAT"}:
+        slope = "FLAT"
+    
+    cur = _current_price_from_market(market)
+    if sma_price <= 0 or cur <= 0 or point <= 0:
+        return {
+            "price": float(sma_price) if sma_price > 0 else None,
+            "distance_points": None,
+            "relationship": None,
+            "slope": slope,
+        }
+
+    distance_points = abs(cur - sma_price) / point
+    relationship = "ABOVE" if cur >= sma_price else "BELOW"
+    return {
+        "price": float(sma_price),
+        "distance_points": float(distance_points),
+        "relationship": relationship,
+        "slope": slope,
+    }
+
+
+def _build_volatility_context(market: Dict[str, Any]) -> Dict[str, Any]:
+    cur_atr = float((market or {}).get("atr") or 0.0)
+    avg_atr = float((market or {}).get("atr_avg_24h") or 0.0)
+    ratio = (cur_atr / avg_atr) if (avg_atr > 0) else None
+    return {
+        "current_atr": float(cur_atr),
+        "average_atr_24h": float(avg_atr) if avg_atr > 0 else None,
+        "volatility_ratio": float(ratio) if ratio is not None else None,
+    }
+
+
+def _build_spread_context(market: Dict[str, Any]) -> Dict[str, Any]:
+    cur = float((market or {}).get("spread") or 0.0)
+    avg = float((market or {}).get("spread_avg_24h") or 0.0)
+    ratio = (cur / avg) if (avg > 0) else None
+    return {
+        "current_spread": float(cur),
+        "average_spread": float(avg) if avg > 0 else None,
+        "spread_ratio": float(ratio) if ratio is not None else None,
+    }
+
+
+def _compute_session_context(now_ts: Optional[float] = None) -> Dict[str, Any]:
+    """Compute trading session context based on UTC hour.
+    
+    ASIAN: 0-7 UTC (Tokyo/Sydney)
+    LONDON: 7-13 UTC (London open)
+    NY: 13-21 UTC (NY session)
+    YZ: 21-24 UTC (After-hours, low liquidity)
+    """
+    if now_ts is None:
+        now_ts = time.time()
+    try:
+        dt = datetime.fromtimestamp(float(now_ts), tz=timezone.utc)
+        hour = int(dt.hour)
+    except Exception:
+        hour = int(datetime.now(timezone.utc).hour)
+
+    if 13 <= hour < 21:
+        session = "NY"
+    elif 7 <= hour < 13:
+        session = "LONDON"
+    elif 0 <= hour < 7:
+        session = "ASIAN"
+    else:  # 21-24 UTC
+        session = "YZ"
+
+    is_high = bool(session in {"LONDON", "NY"} and (7 <= hour < 21))
+    return {
+        "current_session": session,
+        "is_high_activity": bool(is_high),
+        "utc_hour": int(hour),
+    }
+
+
+def _extract_zone_level(signal: Dict[str, Any]) -> Optional[float]:
+    def _num(v: Any) -> Optional[float]:
+        try:
+            fv = float(v)
+            return fv if fv > 0 else None
+        except Exception:
+            return None
+
+    low = _num(signal.get("zone_low") or signal.get("low") or signal.get("bottom") or signal.get("lower"))
+    high = _num(signal.get("zone_high") or signal.get("high") or signal.get("top") or signal.get("upper"))
+    if low is not None and high is not None:
+        return (low + high) / 2.0
+
+    for k in ("zone_price", "zone_mid", "mid", "price", "close", "c"):
+        v = _num(signal.get(k))
+        if v is not None:
+            return v
+    return None
+
+
+def _build_zones_context(symbol: str, now: float, current_price: float) -> Dict[str, Any]:
+    """Build zones_context: counts of zones above/below current price."""
+    if current_price <= 0:
+        return {"total": 0, "support_count": 0, "resistance_count": 0}
+
+    normalized = _filter_fresh_signals(symbol, float(now))
+    support = 0
+    resistance = 0
+
+    for s in normalized:
+        if not is_zone_presence_signal(s):
+            continue
+        level = _extract_zone_level(s)
+        if level is None:
+            continue
+        # Zones at current price are counted as support (conservative for entry)
+        if level <= current_price:
+            support += 1
+        else:
+            resistance += 1
+
+    total = support + resistance
+    return {
+        "total": int(total),
+        "support_count": int(support),
+        "resistance_count": int(resistance),
+    }
 
 
 def _stable_round_time(t: Optional[float], resolution_sec: float = 1.0) -> Optional[float]:
@@ -2835,12 +3005,28 @@ def get_mt5_market_data(symbol: str):
         except Exception:
             return default
 
-    rates_m15 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 20)
+    rates_m15 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 30)
+    ma15 = 0.0
+    m15_slope = "FLAT"
     if rates_m15 is not None and len(rates_m15) > 0:
         closes = [_rate_field(r, "close", 0.0) for r in rates_m15]
-        ma15 = sum(closes) / max(1, len(closes))
-    else:
-        ma15 = 0.0
+        if len(closes) >= 20:
+            ma15 = sum(closes[:20]) / 20.0
+        else:
+            ma15 = sum(closes) / max(1, len(closes))
+
+        if len(closes) >= 22:
+            sma0 = sum(closes[0:20]) / 20.0  # Current SMA(20)
+            sma2 = sum(closes[2:22]) / 20.0  # SMA(20) from 2 bars ago
+            delta = sma0 - sma2
+            # Threshold: 0.01% of price or minimum $0.01 (for XAUUSD ~$2600, thresh ≈ $0.026)
+            thresh = max(abs(sma0) * 1e-4, 0.01)
+            if delta > thresh:
+                m15_slope = "UP"
+            elif delta < -thresh:
+                m15_slope = "DOWN"
+            else:
+                m15_slope = "FLAT"
 
     # ATR: 旧EA(iATR)に寄せて True Range で近似
     rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 60)
@@ -2862,6 +3048,26 @@ def get_mt5_market_data(symbol: str):
         if trs:
             atr = sum(trs[:period]) / max(1, min(period, len(trs)))
 
+    # 24h average ATR: simplified using recent longer window
+    # Full 288-bar rolling ATR is too expensive; use a 60-bar approximation
+    atr_avg_24h = 0.0
+    rates_m5_60 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 62)
+    if rates_m5_60 is not None and len(rates_m5_60) >= 15:
+        highs_60 = [_rate_field(r, "high", 0.0) for r in rates_m5_60]
+        lows_60 = [_rate_field(r, "low", 0.0) for r in rates_m5_60]
+        closes_60 = [_rate_field(r, "close", 0.0) for r in rates_m5_60]
+        trs_60 = []
+        for i in range(1, len(rates_m5_60)):
+            h = highs_60[i]
+            l = lows_60[i]
+            pc = closes_60[i - 1]
+            tr = max(abs(h - l), abs(h - pc), abs(l - pc))
+            if tr > 0:
+                trs_60.append(tr)
+        if len(trs_60) >= 14:
+            # Simple average of TR over 14-period windows
+            atr_avg_24h = sum(trs_60[:min(60, len(trs_60))]) / max(1, min(60, len(trs_60)))
+
     # If market data isn't available, reuse last known ATR for this symbol.
     if atr <= 0:
         atr = float(_last_atr_by_symbol.get(symbol, 0.0) or 0.0)
@@ -2873,18 +3079,35 @@ def get_mt5_market_data(symbol: str):
     ask = float(getattr(tick, "ask", 0.0) or 0.0)
     spread = ((ask - bid) / point) if point > 0 else 0.0
 
+    # 24h average spread: approximate from high-low ranges (more reliable than spread field)
+    spread_avg_24h = 0.0
+    if rates_m5_60 is not None and len(rates_m5_60) > 0 and point > 0:
+        hl_ranges = []
+        for r in rates_m5_60:
+            h = _rate_field(r, "high", 0.0)
+            l = _rate_field(r, "low", 0.0)
+            if h > 0 and l > 0 and h >= l:
+                hl_ranges.append((h - l) / point)
+        if hl_ranges:
+            spread_avg_24h = sum(hl_ranges) / len(hl_ranges)
+
     atr_points = (atr / point) if point > 0 else 0.0
     atr_to_spread = (atr_points / spread) if spread > 0 else None
 
+    drift_point = _drift_point_size(symbol, point)
     return {
         "bid": bid,
         "ask": ask,
         "m15_ma": ma15,
+        "m15_sma20_slope": m15_slope,
         "atr": atr,
+        "atr_avg_24h": atr_avg_24h,
         "point": point,
+        "drift_point": drift_point,
         "atr_points": atr_points,
         "atr_to_spread": atr_to_spread,
         "spread": spread,
+        "spread_avg_24h": spread_avg_24h,
     }
 
 
@@ -2974,13 +3197,12 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             "max_holding_sec": 0,
         }
 
-    now = time.time()
-    print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now}, positions_count={len(positions)}")
+    now_ts = time.time()
+    print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now_ts}, positions_count={len(positions)}")
     net_volume = 0.0
     total_profit = 0.0
-    oldest_time = None
-    max_holding = 0
-    any_open_time = False
+    oldest_open_time = float("inf")
+    max_holding = 0.0
     buy_vol = 0.0
     sell_vol = 0.0
     buy_profit = 0.0
@@ -3003,7 +3225,29 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             profit = float(getattr(p, "profit", 0.0) or 0.0)
         except Exception:
             profit = 0.0
+        
+        # Use robust helper function that tries multiple MT5 time fields
         t_open = _mt5_position_open_time_seconds(p)
+        if t_open <= 0:
+            print(f"[WARN] get_mt5_positions_summary: missing/invalid pos.time for ticket={getattr(p, 'ticket', 'unknown')}")
+            # Skip this position for holding time calculation but still count volume/profit
+            ptype = getattr(p, "type", None)
+            if ptype == mt5.POSITION_TYPE_BUY:
+                buy_vol += vol
+                net_volume += vol
+                buy_profit += profit
+                if vol > 0 and open_px > 0:
+                    buy_open_px_sum += (open_px * vol)
+                buy_count += 1
+            elif ptype == mt5.POSITION_TYPE_SELL:
+                sell_vol += vol
+                net_volume -= vol
+                sell_profit += profit
+                if vol > 0 and open_px > 0:
+                    sell_open_px_sum += (open_px * vol)
+                sell_count += 1
+            total_profit += profit
+            continue
 
         ptype = getattr(p, "type", None)
         if ptype == mt5.POSITION_TYPE_BUY:
@@ -3023,23 +3267,23 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
 
         total_profit += profit
 
-        if t_open > 0:
-            any_open_time = True
-            if oldest_time is None or t_open < float(oldest_time):
-                oldest_time = float(t_open)
-            holding_duration = int(max(0.0, now - float(t_open)))
-            max_holding = max(max_holding, holding_duration)
-            print(f"[DEBUG] Position: type={ptype}, t_open={t_open}, now={now}, holding_duration={holding_duration}, max_holding={max_holding}")
+        # Update oldest_open_time and max_holding_sec
+        if t_open < oldest_open_time:
+            oldest_open_time = t_open
+        holding_duration = max(0.0, now_ts - t_open)
+        if holding_duration > max_holding:
+            max_holding = holding_duration
 
-    # Safety: if positions exist, avoid returning 0 forever due to time parsing quirks.
-    if len(positions) > 0 and int(max_holding) <= 0:
-        # Only apply the "just opened" 1-second fallback if we actually parsed at least one
-        # time field. If we couldn't parse any time at all, report 0 (unknown) rather than
-        # pinning to 1 forever.
-        if any_open_time:
-            max_holding = 1
-    if not any_open_time:
-        oldest_time = None
+    # Finalize: if no valid position times were found, reset to None/0
+    if oldest_open_time == float("inf"):
+        oldest_open_time = None
+        max_holding = 0.0
+        print(f"[WARN] get_mt5_positions_summary: No valid position times found for {len(positions)} positions")
+    else:
+        print(
+            f"[DEBUG] Calculated max_holding_sec: {max_holding:.1f}s "
+            f"(Oldest: {oldest_open_time:.1f}, Now: {now_ts:.1f}, Positions: {len(positions)})"
+        )
 
     net_side = "flat"
     if net_volume > 0:
@@ -3055,7 +3299,7 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         "net_side": net_side,
         "net_volume": round(abs(net_volume), 4),
         "total_profit": round(total_profit, 2),
-        "oldest_open_time": oldest_time,
+        "oldest_open_time": oldest_open_time,
         "max_holding_sec": int(max_holding),
         "buy_volume": round(buy_vol, 4),
         "sell_volume": round(sell_vol, 4),
@@ -3190,6 +3434,8 @@ def _build_entry_logic_prompt(
     """
 
     if not stats:
+        now = time.time()
+        current_price = _current_price_from_market(market)
         minimal_payload = {
             "symbol": symbol,
             "proposed_action": action,
@@ -3204,6 +3450,11 @@ def _build_entry_logic_prompt(
                 "price": (normalized_trigger or {}).get("price"),
             },
             "qtrend_context": qtrend_context,
+            "zones_context": _build_zones_context(symbol, now, current_price),
+            "sma_context": _build_sma_context(market),
+            "volatility_context": _build_volatility_context(market),
+            "spread_context": _build_spread_context(market),
+            "session_context": _compute_session_context(now),
             "mt5_positions_summary": (stats or {}).get("mt5_positions_summary"),
             "signals_window": (stats or {}).get("window_signals"),
             "market": {
@@ -3318,6 +3569,38 @@ def _build_entry_filter_prompt(
     trigger_age_sec = int(now - float((normalized_trigger or {}).get("signal_time") or 0.0)) if (normalized_trigger or {}).get("signal_time") else None
     qt_age_sec = int(now - float((qtrend_context or {}).get("updated_at") or 0.0)) if (qtrend_context or {}).get("updated_at") else None
     price_drift = _price_drift_snapshot((normalized_trigger or {}).get("price"), market, trigger_side)
+    current_price = _current_price_from_market(market)
+    
+    # Compute additional market contexts with fallback handling
+    try:
+        zones_context = _build_zones_context(symbol, now, current_price)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build zones_context for entry: {e}")
+        zones_context = {"total": 0, "support_count": 0, "resistance_count": 0}
+    
+    try:
+        sma_context = _build_sma_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build sma_context for entry: {e}")
+        sma_context = None
+    
+    try:
+        volatility_context = _build_volatility_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build volatility_context for entry: {e}")
+        volatility_context = None
+    
+    try:
+        spread_context = _build_spread_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build spread_context for entry: {e}")
+        spread_context = None
+    
+    try:
+        session_context = _compute_session_context(now)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build session_context for entry: {e}")
+        session_context = None
 
     payload = _fxai_entry_payload.build_entry_filter_payload(
         symbol=symbol,
@@ -3327,6 +3610,11 @@ def _build_entry_filter_prompt(
         trigger_age_sec=trigger_age_sec,
         stats_window_signals=stats.get("window_signals"),
         mt5_positions_summary=stats.get("mt5_positions_summary"),
+        zones_context=zones_context,
+        sma_context=sma_context,
+        volatility_context=volatility_context,
+        spread_context=spread_context,
+        session_context=session_context,
         qt_available=bool(qt_side),
         qt_side=qt_side,
         qt_dir=qt_dir,
@@ -3353,7 +3641,6 @@ def _build_entry_filter_prompt(
         fvg_opp=int(fvg_opp),
         zones_same=int(zones_same),
         zones_opp=int(zones_opp),
-        zones_confirmed_recent=int(zones_confirmed_recent),
         osgfc_side=str(osgfc_side or ""),
         osgfc_align=str(osgfc_align or ""),
         bid=float(market.get("bid") or 0.0),
@@ -3492,6 +3779,39 @@ def _build_close_logic_prompt(
     if len(recent_signals_clean) > 8:
         recent_signals_clean = recent_signals_clean[-8:]
 
+    # Compute additional market contexts with fallback handling
+    current_price = _current_price_from_market(market)
+    
+    try:
+        zones_context = _build_zones_context(symbol, now, current_price)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build zones_context: {e}")
+        zones_context = {"total": 0, "support_count": 0, "resistance_count": 0}
+    
+    try:
+        sma_context = _build_sma_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build sma_context: {e}")
+        sma_context = None
+    
+    try:
+        volatility_context = _build_volatility_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build volatility_context: {e}")
+        volatility_context = None
+    
+    try:
+        spread_context = _build_spread_context(market)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build spread_context: {e}")
+        spread_context = None
+    
+    try:
+        session_context = _compute_session_context(now)
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to build session_context: {e}")
+        session_context = None
+
     payload = _fxai_close_payload.build_close_logic_payload(
         symbol=symbol,
         phase_name=str(phase_name),
@@ -3508,6 +3828,11 @@ def _build_close_logic_prompt(
         q_age_sec=int(q_age_sec),
         stats=stats,
         market=market,
+        zones_context=zones_context,
+        sma_context=sma_context,
+        volatility_context=volatility_context,
+        spread_context=spread_context,
+        session_context=session_context,
         latest_signal=latest_signal,
         recent_signals_clean=recent_signals_clean,
     )

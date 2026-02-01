@@ -20,6 +20,11 @@ def build_close_logic_payload(
     q_age_sec: int,
     stats: Dict[str, Any],
     market: Dict[str, Any],
+    zones_context: Optional[Dict[str, Any]],
+    sma_context: Optional[Dict[str, Any]],
+    volatility_context: Optional[Dict[str, Any]],
+    spread_context: Optional[Dict[str, Any]],
+    session_context: Optional[Dict[str, Any]],
     latest_signal: Dict[str, Any],
     recent_signals_clean: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -91,6 +96,11 @@ def build_close_logic_payload(
             "atr_m5_approx": market.get("atr"),
             "spread_points": market.get("spread"),
         },
+        "zones_context": zones_context,
+        "sma_context": sma_context,
+        "volatility_context": volatility_context,
+        "spread_context": spread_context,
+        "session_context": session_context,
         "latest_signal": {
             "source": latest_signal.get("source"),
             "side": latest_signal.get("side"),
