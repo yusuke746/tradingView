@@ -220,6 +220,14 @@ ALLOW_MULTI_ENTRY_SAME_QTREND = _env_bool("ALLOW_MULTI_ENTRY_SAME_QTREND", "0")
 ADDON_MAX_ENTRIES_PER_QTREND = int(os.getenv("ADDON_MAX_ENTRIES_PER_QTREND", "5"))
 ADDON_MAX_ENTRIES_PER_POSITION = int(os.getenv("ADDON_MAX_ENTRIES_PER_POSITION", "5"))
 
+# Phase control: DEVELOPMENT (Phase 1) duration limits for day trading.
+# Default: 15 minutes (900s). Positions that fail to reach breakeven by this time
+# are transitioned to Phase 2 for stricter exit evaluation.
+MAX_DEVELOPMENT_SEC = float(os.getenv("MAX_DEVELOPMENT_SEC", "900"))
+# Breakeven band multipliers: tighter bands = faster Phase 2 transition.
+BREAKEVEN_BAND_ATR_MULTIPLIER = float(os.getenv("BREAKEVEN_BAND_ATR_MULTIPLIER", "0.10"))
+BREAKEVEN_BAND_SPREAD_MULTIPLIER = float(os.getenv("BREAKEVEN_BAND_SPREAD_MULTIPLIER", "1.5"))
+
 
 # --- AI config ---
 OPENAI_API_KEY = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
@@ -3801,11 +3809,16 @@ def _build_close_logic_prompt(
     move_points_pts = (move_points / point) if (point > 0 and move_points != 0.0) else (0.0 if point > 0 else None)
 
     # Breakeven-like band: within noise/spread/volatility. Used only as a hint to AI.
+    # CRITICAL: Tightened from ATR*0.15 to ATR*0.10 to reduce false positives.
     breakeven_band_points = 0.0
     try:
-        breakeven_band_points = max(0.0, float(spread_points) * 1.5, float(atr_points) * 0.15)
+        breakeven_band_points = max(
+            0.0,
+            float(spread_points) * BREAKEVEN_BAND_SPREAD_MULTIPLIER,
+            float(atr_points) * BREAKEVEN_BAND_ATR_MULTIPLIER
+        )
     except Exception:
-        breakeven_band_points = max(0.0, float(spread_points) * 1.5)
+        breakeven_band_points = max(0.0, float(spread_points) * BREAKEVEN_BAND_SPREAD_MULTIPLIER)
 
     is_breakeven_like = False
     if move_points_pts is not None:
@@ -3823,7 +3836,13 @@ def _build_close_logic_prompt(
         profit_protect_threshold_points = float(spread_points) * 4.0
 
     in_profit_protect = (move_points_pts is not None) and (float(move_points_pts) >= float(profit_protect_threshold_points))
-    in_development = (holding_sec > 0 and holding_sec < 15.0 * 60.0) or bool(is_breakeven_like)
+    
+    # CRITICAL FIX: Phase 1 (DEVELOPMENT) duration enforcement.
+    # OLD: (holding_sec < 900) OR is_breakeven_like → caused infinite Phase 1 in ranging markets.
+    # NEW: (holding_sec < MAX_DEVELOPMENT_SEC) AND is_breakeven_like → strict time limit.
+    # Day trading principle: positions that fail to reach breakeven within 15 min are losing trades.
+    max_dev_sec = float(MAX_DEVELOPMENT_SEC or 900.0)
+    in_development = (holding_sec > 0 and holding_sec < max_dev_sec) and bool(is_breakeven_like)
 
     phase_name = "PROFIT_PROTECT" if in_profit_protect else "DEVELOPMENT" if in_development else "DEVELOPMENT"
 
