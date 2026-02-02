@@ -2,6 +2,7 @@ import os
 import json
 import time
 import socket
+import statistics
 from datetime import datetime, timezone, timedelta
 from threading import Lock, Thread
 from typing import Optional, Dict, Any, List
@@ -186,6 +187,7 @@ HEARTBEAT_STALE_MODE = str(os.getenv("HEARTBEAT_STALE_MODE", "freeze") or "freez
 CACHE_FILE = str(os.getenv("CACHE_FILE", "signals_cache.json") or "signals_cache.json").strip()
 SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))
 SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", str(SIGNAL_LOOKBACK_SEC)))
+FVG_LOOKBACK_SEC = int(os.getenv("FVG_LOOKBACK_SEC", "1200"))
 
 CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")
 CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "2.0"))
@@ -271,7 +273,11 @@ ENTRY_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("ENTRY_POST_SIGNAL_MAX_WAIT_SEC
 # This keeps logic simple: we re-run the same entry prompt with fresher context.
 DELAYED_ENTRY_ENABLED = _env_bool("DELAYED_ENTRY_ENABLED", "1")
 # Maximum time to keep a pending Lorentzian trigger.
-DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", str(CONFLUENCE_WINDOW_SEC)))
+# Default: 5 minutes (300s) to prevent stale triggers from persisting.
+DELAYED_ENTRY_MAX_WAIT_SEC = float(os.getenv("DELAYED_ENTRY_MAX_WAIT_SEC", "300"))
+# Hard TTL: absolute maximum age for any Lorentzian trigger (prevents zombie signals).
+# Default: 15 minutes (900s) = 3x DELAYED_ENTRY_MAX_WAIT_SEC.
+DELAYED_ENTRY_HARD_TTL_SEC = float(os.getenv("DELAYED_ENTRY_HARD_TTL_SEC", "900"))
 # Minimum interval between AI re-evaluations for the same pending trigger.
 DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC = float(os.getenv("DELAYED_ENTRY_MIN_RETRY_INTERVAL_SEC", "1"))
 # Safety cap: maximum number of attempts for one pending trigger (including the initial attempt).
@@ -1276,17 +1282,24 @@ def _schedule_deferred_mgmt(symbol: str, normalized_signal: dict, now: float) ->
 
 
 def _prune_pending_entries_locked(now: float) -> None:
+    """Remove expired pending entries.
+    
+    CRITICAL: Lorentzian triggers older than DELAYED_ENTRY_HARD_TTL_SEC are removed
+    to prevent stale signals from being re-evaluated with incorrect timestamps.
+    """
     remove = []
     for sym, st in _pending_entry_by_symbol.items():
         try:
             expires_at = float((st or {}).get("expires_at") or 0.0)
             attempts = int((st or {}).get("attempts") or 0)
-            if expires_at > 0 and now >= expires_at:
+            created_at = float((st or {}).get("created_at") or 0.0)
+            
+            # Hard TTL: Remove Lorentzian triggers older than configured limit.
+            # This prevents "zombie signals" from persisting with stale timestamps.
+            if (created_at > 0 and (now - created_at) >= DELAYED_ENTRY_HARD_TTL_SEC) or \
+               (expires_at > 0 and now >= expires_at) or \
+               (int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS)):
                 remove.append(sym)
-                continue
-            if int(DELAYED_ENTRY_MAX_ATTEMPTS or 0) > 0 and attempts >= int(DELAYED_ENTRY_MAX_ATTEMPTS):
-                remove.append(sym)
-                continue
         except Exception:
             remove.append(sym)
     for sym in remove:
@@ -1294,13 +1307,17 @@ def _prune_pending_entries_locked(now: float) -> None:
 
 
 def _upsert_pending_entry(symbol: str, trigger: dict, now: float) -> None:
+    """Create or update a pending entry with proper expiration.
+    
+    Default expiration: 5 minutes (300s) to prevent stale triggers.
+    """
     if not DELAYED_ENTRY_ENABLED:
         return
     try:
-        max_wait = float(DELAYED_ENTRY_MAX_WAIT_SEC or 0.0)
+        max_wait = float(DELAYED_ENTRY_MAX_WAIT_SEC or 300.0)
     except Exception:
-        max_wait = 0.0
-    expires_at = (now + max_wait) if max_wait > 0 else (now + float(CONFLUENCE_WINDOW_SEC or 600))
+        max_wait = 300.0
+    expires_at = now + max_wait
 
     with _pending_entry_lock:
         _prune_pending_entries_locked(now)
@@ -1418,6 +1435,11 @@ def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> boo
 
 
 def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float) -> Optional[tuple[str, int]]:
+    """Attempt delayed entry re-evaluation when supportive signals arrive.
+    
+    CRITICAL: Validates trigger age to prevent stale Lorentzian signals
+    from being re-evaluated with incorrect timestamps.
+    """
     if not DELAYED_ENTRY_ENABLED:
         return None
 
@@ -1434,15 +1456,25 @@ def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float)
     with _pending_entry_lock:
         _prune_pending_entries_locked(now)
         st = _pending_entry_by_symbol.get(symbol)
-        st_copy = dict(st) if isinstance(st, dict) else None
+        if not st or not isinstance(st, dict):
+            return None
+        
+        # CRITICAL: Validate trigger age while holding lock to prevent race conditions.
+        created_at = float(st.get("created_at") or 0.0)
+        if created_at > 0 and (now - created_at) >= DELAYED_ENTRY_HARD_TTL_SEC:
+            _pending_entry_by_symbol.pop(symbol, None)
+            print(f"[FXAI][DELAYED_ENTRY] Rejected stale trigger for {symbol}: age={(now - created_at):.1f}s")
+            return None
+        
+        trigger = st.get("trigger") if isinstance(st.get("trigger"), dict) else None
+        if not trigger:
+            _pending_entry_by_symbol.pop(symbol, None)
+            return None
+        
+        # Make a copy for processing outside lock
+        st_copy = dict(st)
 
-    if not st_copy:
-        return None
-
-    trigger = st_copy.get("trigger") if isinstance(st_copy.get("trigger"), dict) else None
-    if not trigger:
-        _clear_pending_entry(symbol, reason="missing_trigger")
-        return None
+    # Continue processing with copy (lock released)
 
     # If we already processed this Lorentzian trigger, drop the pending state.
     try:
@@ -1907,6 +1939,7 @@ def _build_sma_context(market: Dict[str, Any]) -> Dict[str, Any]:
     """Build SMA context with distance and slope information."""
     sma_price = float((market or {}).get("m15_ma") or 0.0)
     point = float((market or {}).get("point") or 0.0)
+    atr_points = float((market or {}).get("atr_points") or 0.0)
     slope = (market or {}).get("m15_sma20_slope") or "FLAT"
     if slope not in {"UP", "DOWN", "FLAT"}:
         slope = "FLAT"
@@ -1916,15 +1949,19 @@ def _build_sma_context(market: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "price": float(sma_price) if sma_price > 0 else None,
             "distance_points": None,
+            "distance_atr_ratio": None,
             "relationship": None,
             "slope": slope,
         }
 
     distance_points = abs(cur - sma_price) / point
+    # When ATR=0, use 999.9 as explicit "extreme deviation" flag for AI prompt
+    distance_atr_ratio = (distance_points / atr_points) if atr_points > 0 else 999.9
     relationship = "ABOVE" if cur >= sma_price else "BELOW"
     return {
         "price": float(sma_price),
         "distance_points": float(distance_points),
+        "distance_atr_ratio": distance_atr_ratio,
         "relationship": relationship,
         "slope": slope,
     }
@@ -2915,6 +2952,7 @@ def _prune_signals_cache_locked(now: float) -> None:
     Zone情報は、
     - 「存在/構造（例: new_zone_confirmed）」は長く保持（デフォルト24h）
     - 「接触/touch（例: zone_retrace_touch）」は短く保持（デフォルト20m）
+    - FVG は 15分足対応のため保持を延長（デフォルト20m）
     に分離し、古いtouchを合流として誤認するバグを防ぐ。
     """
     keep_list, changed = _fxai_signal_cache.prune_signals_cache(
@@ -2922,6 +2960,7 @@ def _prune_signals_cache_locked(now: float) -> None:
         now=now,
         zone_lookback_sec=ZONE_LOOKBACK_SEC,
         zone_touch_lookback_sec=ZONE_TOUCH_LOOKBACK_SEC,
+        fvg_lookback_sec=FVG_LOOKBACK_SEC,
         signal_lookback_sec=SIGNAL_LOOKBACK_SEC,
     )
 
@@ -2956,6 +2995,7 @@ def _filter_fresh_signals(symbol: str, now: float) -> list:
         signal_max_age_sec=SIGNAL_MAX_AGE_SEC,
         zone_lookback_sec=ZONE_LOOKBACK_SEC,
         zone_touch_lookback_sec=ZONE_TOUCH_LOOKBACK_SEC,
+        fvg_lookback_sec=FVG_LOOKBACK_SEC,
     )
 
 
@@ -3009,18 +3049,26 @@ def get_mt5_market_data(symbol: str):
     ma15 = 0.0
     m15_slope = "FLAT"
     if rates_m15 is not None and len(rates_m15) > 0:
+        # CRITICAL: MT5 returns bars in [newest, ..., oldest] order.
+        # Index 0 is the current FORMING bar; skip it to avoid false slope signals.
         closes = [_rate_field(r, "close", 0.0) for r in rates_m15]
         if len(closes) >= 20:
             ma15 = sum(closes[:20]) / 20.0
         else:
             ma15 = sum(closes) / max(1, len(closes))
 
-        if len(closes) >= 22:
-            sma0 = sum(closes[0:20]) / 20.0  # Current SMA(20)
-            sma2 = sum(closes[2:22]) / 20.0  # SMA(20) from 2 bars ago
-            delta = sma0 - sma2
+        if len(closes) >= 23:
+            # Use CLOSED bars only (skip the current forming bar at index 0).
+            sma1 = sum(closes[1:21]) / 20.0  # SMA(20) as of last closed bar
+            sma3 = sum(closes[3:23]) / 20.0  # SMA(20) from 2 closed bars earlier
+            delta = sma1 - sma3
+        elif len(closes) >= 22:
+            # Fallback: still skip current bar, compare last closed vs 1 bar earlier.
+            sma1 = sum(closes[1:21]) / 20.0
+            sma2 = sum(closes[2:22]) / 20.0
+            delta = sma1 - sma2
             # Threshold: 0.01% of price or minimum $0.01 (for XAUUSD ~$2600, thresh ≈ $0.026)
-            thresh = max(abs(sma0) * 1e-4, 0.01)
+            thresh = max(abs(sma1) * 1e-4, 0.01)
             if delta > thresh:
                 m15_slope = "UP"
             elif delta < -thresh:
@@ -3079,17 +3127,27 @@ def get_mt5_market_data(symbol: str):
     ask = float(getattr(tick, "ask", 0.0) or 0.0)
     spread = ((ask - bid) / point) if point > 0 else 0.0
 
-    # 24h average spread: approximate from high-low ranges (more reliable than spread field)
+    # Average spread: lightweight approximation using recent M5 bars' typical spread.
+    # Avoid heavy tick-by-tick queries; use high-low as proxy (conservative overestimate).
     spread_avg_24h = 0.0
-    if rates_m5_60 is not None and len(rates_m5_60) > 0 and point > 0:
-        hl_ranges = []
-        for r in rates_m5_60:
+    if point > 0 and rates_m5_60 is not None and len(rates_m5_60) >= 12:
+        # Use M5 bars' median high-low range as a proxy for typical spread environment.
+        # This is an overestimate (includes intrabar movement), but avoids mixing units.
+        hl_ranges_pts = []
+        for r in rates_m5_60[:min(48, len(rates_m5_60))]:  # cap at ~4 hours
             h = _rate_field(r, "high", 0.0)
             l = _rate_field(r, "low", 0.0)
             if h > 0 and l > 0 and h >= l:
-                hl_ranges.append((h - l) / point)
-        if hl_ranges:
-            spread_avg_24h = sum(hl_ranges) / len(hl_ranges)
+                hl_ranges_pts.append((h - l) / point)
+        if len(hl_ranges_pts) >= 12:
+            # Use median to avoid outliers (news spikes, etc.)
+            spread_avg_24h = statistics.median(hl_ranges_pts)
+
+    # Fallback: if bars unavailable or median failed, clamp to reasonable range around current.
+    # Avoid setting avg=current when current is anomalous (e.g., spread spike).
+    if spread_avg_24h <= 0:
+        # Use a conservative default based on typical GOLD spread range (40-80 pts).
+        spread_avg_24h = max(40.0, min(80.0, spread)) if spread > 0 else 50.0
 
     atr_points = (atr / point) if point > 0 else 0.0
     atr_to_spread = (atr_points / spread) if spread > 0 else None

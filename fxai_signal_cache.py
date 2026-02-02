@@ -35,12 +35,28 @@ def is_zone_touch_signal(s: Dict[str, Any]) -> bool:
     return event in {"zone_retrace_touch", "zone_touch"} or ("touch" in event)
 
 
+def is_fvg_signal(s: Dict[str, Any]) -> bool:
+    """Detect FVG signals (15-min timeframe support).
+    
+    Uses strict allowlist to prevent false positives from partial matches.
+    """
+    src = (s.get("source") or "").strip().lower()
+    src_norm = src.replace(" ", "").replace("_", "")
+    # Strict allowlist: only known FVG sources
+    return src_norm in {"fvg", "luxalgofvg"}
+
+
+# Default FVG lookback: 20 minutes to cover 15-min candle context.
+DEFAULT_FVG_LOOKBACK_SEC = 1200
+
+
 def prune_signals_cache(
     *,
     signals_cache: List[Dict[str, Any]],
     now: float,
     zone_lookback_sec: Any,
     zone_touch_lookback_sec: Any,
+    fvg_lookback_sec: Any,
     signal_lookback_sec: Any,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Return (kept_signals, changed).
@@ -98,9 +114,13 @@ def prune_signals_cache(
                 keep_list.append(s)
             continue
 
-        # Non-Zones: simple time-based retention (no Q-Trend anchoring).
-        # We keep recent evidence so Lorentzian triggers can reference it.
-        limit_sec = float(signal_lookback_sec or 1200)
+        # FVG: keep longer to cover 15-min candle context.
+        if is_fvg_signal(s):
+            limit_sec = float(fvg_lookback_sec or DEFAULT_FVG_LOOKBACK_SEC)
+        else:
+            # Non-Zones/FVG: simple time-based retention (no Q-Trend anchoring).
+            # We keep recent evidence so Lorentzian triggers can reference it.
+            limit_sec = float(signal_lookback_sec or 1200)
         if age < limit_sec:
             keep_list.append(s)
 
@@ -115,6 +135,7 @@ def filter_fresh_signals_from_normalized(
     signal_max_age_sec: Any,
     zone_lookback_sec: Any,
     zone_touch_lookback_sec: Any,
+    fvg_lookback_sec: Any,
 ) -> List[Dict[str, Any]]:
     """Filter a normalized list by freshness.
 
@@ -132,18 +153,29 @@ def filter_fresh_signals_from_normalized(
             continue
 
         # Zones touch is a momentary event; keep it short-lived.
+        # Prefer receive_time for zone touch (reliable for touch events).
         if is_zone_touch_signal(s):
             rt = float(s.get("receive_time") or 0.0)
-            if rt <= 0 or (now - rt) > float(zone_touch_lookback_sec):
-                continue
+            if rt > 0:  # receive_time available: use it exclusively
+                if (now - rt) <= float(zone_touch_lookback_sec):
+                    fresh.append(s)
+            # If receive_time missing/invalid: skip signal (zone touch requires receive_time)
+            continue
 
         st = float(s.get("signal_time") or 0.0)
         if st <= 0:
             continue
         age = now - st
-        if abs(age) > signal_max_age_sec:
+        
+        # FVG uses dedicated lookback (typically longer than other signals for 15-min TF).
+        if is_fvg_signal(s):
+            if abs(age) > float(fvg_lookback_sec or DEFAULT_FVG_LOOKBACK_SEC):
+                continue
+        # Non-FVG signals use standard max_age_sec.
+        elif abs(age) > signal_max_age_sec:
             # future/old both drop（v2.6 DebugReplayCsv の代替はここでは省略）
             continue
+        
         fresh.append(s)
 
     return fresh
