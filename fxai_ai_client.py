@@ -43,6 +43,7 @@ def call_openai_json_with_retry(
                 ],
                 temperature=0.0,
                 timeout=timeout_sec,
+                store=True,
             )
             raw_content = (res.choices[0].message.content or "").strip()
             if raw_content.startswith("```"):
