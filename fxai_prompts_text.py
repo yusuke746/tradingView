@@ -74,10 +74,12 @@ CLOSE_LOGIC_PROMPT_PREFIX: str = (
     "    - If reversal risk rises, close faster to secure gains.\n"
     "    - TRAIL_MODE can be TIGHT when momentum weakens/chops, NORMAL otherwise; WIDE only when momentum is VERY STRONG and reversal risk is low.\n\n"
     "TASK:\n"
-    "1. Decide ACTION: HOLD or CLOSE.\n"
+    "1. Provide CLOSE confidence only. Higher = stronger close conviction.\n"
+    "   Interpretation guide: 0 = definitely HOLD, 50 = uncertain, 100 = must CLOSE.\n"
+    "   The system will CLOSE only when confidence >= constraints.min_close_confidence.\n"
     "2. Decide TRAIL_MODE (Dynamic Trailing): WIDE | NORMAL | TIGHT.\n"
     "Return ONLY strict JSON with this schema (no extra keys, no markdown):\n"
-    '{"action": "HOLD"|"CLOSE", "confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "brief"}\n\n'
+    '{"confidence": 0-100, "trail_mode": "WIDE"|"NORMAL"|"TIGHT", "reason": "brief"}\n\n'
     "ContextJSON:\n"
 )
 

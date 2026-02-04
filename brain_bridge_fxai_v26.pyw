@@ -1062,7 +1062,6 @@ def _run_position_management_once(
     if (not ai_decision) or ai_decision["confidence"] < AI_CLOSE_MIN_CONFIDENCE:
         if (not ai_decision) and AI_CLOSE_FALLBACK == "default_close":
             ai_decision = {
-                "action": "CLOSE",
                 "confidence": int(_clamp(AI_CLOSE_DEFAULT_CONFIDENCE, 0, 100)),
                 "reason": "fallback_default_close",
                 "trail_mode": "NORMAL",
@@ -1077,15 +1076,22 @@ def _run_position_management_once(
                 last_mgmt_at=time.time(),
             )
             _zmq_send_json_with_metrics({"type": "HOLD", "reason": "ai_fallback_hold"}, symbol=symbol, kind="mgmt_hold_fallback")
-            ai_decision = {"action": "HOLD", "confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
+            ai_decision = {"confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
 
-    decision_action = (ai_decision or {}).get("action")
-    decision_reason = (ai_decision or {}).get("reason") or ""
-    decision_conf = int((ai_decision or {}).get("confidence") or 0)
-    decision_trail = (ai_decision or {}).get("trail_mode", "NORMAL")
-    openai_rid = (ai_decision or {}).get("_openai_response_id")
-    ai_ms = (ai_decision or {}).get("_ai_latency_ms")
-    if decision_action == "CLOSE":
+    # _validate_ai_close_decision() が既に型検証済みなので、直接取得可能
+    decision_reason = ai_decision.get("reason", "")
+    decision_conf = ai_decision.get("confidence", 0)  # 既に int 型
+    decision_trail = ai_decision.get("trail_mode", "NORMAL")
+    openai_rid = ai_decision.get("_openai_response_id")
+    ai_ms = ai_decision.get("_ai_latency_ms")
+    
+    # 型安全な閾値取得 (空文字列や不正値への耐性)
+    try:
+        close_threshold = int(AI_CLOSE_MIN_CONFIDENCE or 0)
+    except (ValueError, TypeError):
+        close_threshold = 65  # デフォルト値
+    
+    if decision_conf >= close_threshold:
         _zmq_send_json_with_metrics({"type": "CLOSE", "reason": decision_reason}, symbol=symbol, kind="mgmt_close")
         _set_status(
             last_result="CLOSE",
@@ -3739,32 +3745,35 @@ def _build_entry_filter_prompt(
 
 
 def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """期待するJSON: {action: "HOLD"|"CLOSE", confidence: 0-100, reason: str}"""
+    """期待するJSON: {confidence: 0-100, reason: str, trail_mode: "WIDE"|"NORMAL"|"TIGHT"}
+    
+    NOTE: trail_mode は現在 ZMQ 経由で MT5 に送信されるがロジックでは未使用。
+          将来的なトレーリングストップ実装のため保持。
+    """
     if not isinstance(decision, dict):
         return None
-    action = decision.get("action")
-    if not isinstance(action, str):
-        return None
-    action = action.strip().upper()
-    if action not in {"HOLD", "CLOSE"}:
-        return None
+    
+    # _safe_int が既に int を返すため、_clamp の結果も int
     confidence = _safe_int(decision.get("confidence"), AI_CLOSE_DEFAULT_CONFIDENCE)
-    confidence = int(_clamp(confidence, 0, 100))
+    confidence = _clamp(confidence, 0, 100)  # 既に int なので冗長な int() 不要
+    
     reason = decision.get("reason")
     if not isinstance(reason, str):
         reason = ""
     reason = reason.strip()
 
-    # 追加: trail_modeの検証
-    trail_mode = decision.get("trail_mode", "NORMAL").upper()
+    # trail_mode の検証（将来のトレーリングストップ機能用）
+    trail_mode = str(decision.get("trail_mode", "NORMAL")).upper()
     if trail_mode not in {"WIDE", "NORMAL", "TIGHT"}:
         trail_mode = "NORMAL"
 
-    out: Dict[str, Any] = {"action": action, "confidence": confidence, "reason": reason, "trail_mode": trail_mode}
-    if "_openai_response_id" in decision:
-        out["_openai_response_id"] = decision.get("_openai_response_id")
-    if "_ai_latency_ms" in decision:
-        out["_ai_latency_ms"] = decision.get("_ai_latency_ms")
+    out: Dict[str, Any] = {"confidence": confidence, "reason": reason, "trail_mode": trail_mode}
+    
+    # オプショナルなメタデータを保持
+    for key in ("_openai_response_id", "_ai_latency_ms"):
+        if key in decision:
+            out[key] = decision[key]
+    
     return out
 
 
@@ -3889,6 +3898,12 @@ def _build_close_logic_prompt(
         print(f"[FXAI][WARN] Failed to build session_context: {e}")
         session_context = None
 
+    # 型安全な閾値取得 (空文字列や不正値への耐性)
+    try:
+        min_conf = int(AI_CLOSE_MIN_CONFIDENCE or 0) if AI_CLOSE_MIN_CONFIDENCE else None
+    except (ValueError, TypeError):
+        min_conf = 65  # デフォルト値
+    
     payload = _fxai_close_payload.build_close_logic_payload(
         symbol=symbol,
         phase_name=str(phase_name),
@@ -3912,6 +3927,7 @@ def _build_close_logic_prompt(
         session_context=session_context,
         latest_signal=latest_signal,
         recent_signals_clean=recent_signals_clean,
+        min_close_confidence=min_conf,
     )
 
     if PROMPT_COMPACT_ENABLED:

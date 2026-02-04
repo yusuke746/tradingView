@@ -27,6 +27,7 @@ def build_close_logic_payload(
     session_context: Optional[Dict[str, Any]],
     latest_signal: Dict[str, Any],
     recent_signals_clean: List[Dict[str, Any]],
+    min_close_confidence: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build the ContextJSON payload for CLOSE/HOLD prompt.
 
@@ -111,6 +112,11 @@ def build_close_logic_payload(
         },
         "recent_signals": recent_signals_clean,
         "recent_signals_count": int(len(recent_signals_clean)),
+        "constraints": {
+            "close_confidence_range": [0, 100],
+            "min_close_confidence": min_close_confidence,  # 呼び出し元で int 変換済み
+            "note": "System will CLOSE only when confidence >= min_close_confidence; otherwise HOLD.",
+        },
         "notes": {
             "opposition_handling": "Opposition signals can be noise. Prioritize confirmed/structural reversal signs (e.g., strong opposite Zones context) over single touch events.",
             "day_trading_goal": "Loss-cut small, Profit-target large. If profit is available and reversal risk rises, take profit. If loss grows and reversal evidence increases, exit early.",

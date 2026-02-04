@@ -10,19 +10,18 @@ def _env_get(env: Optional[Dict[str, Any]], name: str, default: str) -> Any:
     return os.getenv(name, default)
 
 
+def _parse_env_args(env_or_name: Union[Dict[str, Any], str], name_or_default: str, default: str) -> tuple[Optional[Dict[str, Any]], str, str]:
+    """Parse backwards-compatible env function signatures."""
+    if isinstance(env_or_name, dict):
+        return env_or_name, str(name_or_default), str(default)
+    return None, str(env_or_name), str(name_or_default)
+
+
 def env_bool(env_or_name: Union[Dict[str, Any], str], name_or_default: str = "0", default: str = "0") -> bool:
     # Backwards compatible signatures:
     # - env_bool(name, default)
     # - env_bool(env_dict, name, default)
-    if isinstance(env_or_name, dict):
-        env = env_or_name
-        name = str(name_or_default)
-        dflt = str(default)
-    else:
-        env = None
-        name = str(env_or_name)
-        dflt = str(name_or_default)
-
+    env, name, dflt = _parse_env_args(env_or_name, name_or_default, default)
     v = _env_get(env, name, dflt)
     if v is None:
         return False
@@ -33,25 +32,17 @@ def env_int(env_or_name: Union[Dict[str, Any], str], name_or_default: str = "0",
     # Backwards compatible signatures:
     # - env_int(name, default)
     # - env_int(env_dict, name, default)
-    if isinstance(env_or_name, dict):
-        env = env_or_name
-        name = str(name_or_default)
-        dflt = str(default)
-    else:
-        env = None
-        name = str(env_or_name)
-        dflt = str(name_or_default)
-
+    env, name, dflt = _parse_env_args(env_or_name, name_or_default, default)
     v = _env_get(env, name, dflt)
     try:
         return int(str(v).strip())
-    except Exception:
+    except (ValueError, AttributeError):
         try:
             return int(float(str(v).strip()))
-        except Exception:
+        except (ValueError, AttributeError):
             try:
                 return int(str(dflt).strip())
-            except Exception:
+            except (ValueError, AttributeError):
                 return 0
 
 
@@ -64,19 +55,14 @@ def sanitize_untrusted_text(value: Any, *, max_len: int = 160) -> str:
 
     if value is None:
         return ""
-    try:
-        s = str(value)
-    except Exception:
-        return ""
-
+    
+    s = str(value)
     # Remove NULLs and control characters; normalize whitespace.
-    s = s.replace("\x00", " ")
-    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = s.replace("\x00", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
     s = "".join(ch for ch in s if ch.isprintable())
     s = " ".join(s.split())
-    if max_len > 0 and len(s) > max_len:
-        s = s[:max_len]
-    return s
+    
+    return s[:max_len] if max_len > 0 and len(s) > max_len else s
 
 
 def request_is_https(req) -> bool:
@@ -112,30 +98,41 @@ def get_client_ip(req) -> str:
 
 _rate_limit_lock = Lock()
 _rate_limit_state: Dict[str, Dict[str, Any]] = {}
+_RATE_LIMIT_MAX_KEYS = 10000  # Prevent unbounded memory growth
 
 
 def rate_limit_allow(key: str, *, limit_per_min: int) -> bool:
     """Simple in-memory rate limiter (fixed 60s window).
 
     Disabled when limit_per_min <= 0.
+    Automatically cleans up stale entries to prevent memory leak.
     """
 
     try:
         lim = int(limit_per_min)
-    except Exception:
+    except (ValueError, TypeError):
         lim = 0
     if lim <= 0:
         return True
 
     now = time.time()
     with _rate_limit_lock:
+        # Memory protection: clean up stale entries if too many keys
+        if len(_rate_limit_state) > _RATE_LIMIT_MAX_KEYS:
+            _rate_limit_state.clear()
+        
         st = _rate_limit_state.get(key)
-        if not isinstance(st, dict):
-            st = {"start": float(now), "count": 0}
-        start = float(st.get("start") or 0.0)
+        if st is None or not isinstance(st, dict):
+            _rate_limit_state[key] = {"start": now, "count": 1}
+            return True
+        
+        start = float(st.get("start", 0.0))
+        # Reset window if expired
         if start <= 0.0 or (now - start) >= 60.0:
-            st = {"start": float(now), "count": 0}
-
-        st["count"] = int(st.get("count") or 0) + 1
-        _rate_limit_state[key] = st
-        return int(st["count"]) <= lim
+            _rate_limit_state[key] = {"start": now, "count": 1}
+            return True
+        
+        # Increment and check limit
+        count = int(st.get("count", 0)) + 1
+        st["count"] = count
+        return count <= lim
