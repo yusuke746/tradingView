@@ -190,7 +190,7 @@ SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", str(SIGNAL_LOOKBACK_SEC
 FVG_LOOKBACK_SEC = int(os.getenv("FVG_LOOKBACK_SEC", "1200"))
 
 # Zombie signal TTL (hard prune): signals older than this are removed from cache
-ZOMBIE_SIGNAL_TTL_SEC = int(os.getenv("ZOMBIE_SIGNAL_TTL_SEC", "900"))
+ZOMBIE_SIGNAL_TTL_SEC = int(os.getenv("ZOMBIE_SIGNAL_TTL_SEC", "1000"))
 
 CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")
 CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "2.0"))
