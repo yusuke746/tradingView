@@ -189,6 +189,9 @@ SIGNAL_LOOKBACK_SEC = int(os.getenv("SIGNAL_LOOKBACK_SEC", "1200"))
 SIGNAL_MAX_AGE_SEC = int(os.getenv("SIGNAL_MAX_AGE_SEC", str(SIGNAL_LOOKBACK_SEC)))
 FVG_LOOKBACK_SEC = int(os.getenv("FVG_LOOKBACK_SEC", "1200"))
 
+# Zombie signal TTL (hard prune): signals older than this are removed from cache
+ZOMBIE_SIGNAL_TTL_SEC = int(os.getenv("ZOMBIE_SIGNAL_TTL_SEC", "900"))
+
 CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")
 CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "2.0"))
 # Force flush even if signals keep arriving frequently
@@ -204,6 +207,10 @@ ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", "1200"))
 # Signal cache indexing (OFF by default to avoid any behavior risk)
 SIGNAL_INDEX_ENABLED = _env_bool("SIGNAL_INDEX_ENABLED", "0")
 SIGNAL_INDEX_BUCKET_SEC = int(os.getenv("SIGNAL_INDEX_BUCKET_SEC", "60"))
+
+# Spread history (points) for stable average spread estimation
+SPREAD_HISTORY_WINDOW_SEC = int(os.getenv("SPREAD_HISTORY_WINDOW_SEC", "86400"))
+SPREAD_HISTORY_MAX = int(os.getenv("SPREAD_HISTORY_MAX", "2000"))
 
 
 # --- Metrics / log aggregation (for fast tuning) ---
@@ -364,6 +371,9 @@ _cache_dirty = False
 _cache_last_save_at = 0.0
 _cache_last_dirty_at = 0.0
 _cache_flush_thread_started = False
+
+_spread_history_lock = Lock()
+_spread_history_by_symbol: Dict[str, List[tuple]] = {}
 
 _metrics_lock = Lock()
 _metrics: Dict[str, Any] = {
@@ -2244,11 +2254,13 @@ def _normalize_signal_fields(signal: dict) -> dict:
     if isinstance(s.get("confirmed"), str):
         s["confirmed"] = _sanitize_untrusted_text(s["confirmed"], max_len=24).strip().lower()
 
-    parsed = _parse_signal_time_to_epoch(s.get("time"))
-    if parsed is not None:
-        s["signal_time"] = parsed
-    else:
-        s["signal_time"] = s.get("receive_time")
+    # CRITICAL: signal_time must be immutable once set. Never overwrite existing value.
+    if "signal_time" not in s or s.get("signal_time") is None:
+        parsed = _parse_signal_time_to_epoch(s.get("time"))
+        if parsed is not None:
+            s["signal_time"] = parsed
+        else:
+            s["signal_time"] = s.get("receive_time")
 
     # Keep timeframe (tf) if provided by alert templates.
     tf_in = s.get("tf") or s.get("timeframe") or s.get("interval")
@@ -2978,6 +2990,25 @@ def _prune_signals_cache_locked(now: float) -> None:
         signal_lookback_sec=SIGNAL_LOOKBACK_SEC,
     )
 
+    # Hard prune: remove any signals older than ZOMBIE_SIGNAL_TTL_SEC (default 15m)
+    ttl_sec = float(ZOMBIE_SIGNAL_TTL_SEC or 0)
+    if ttl_sec > 0:
+        before_len = len(keep_list)
+        pruned = []
+        for s in keep_list:
+            try:
+                st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
+            except Exception:
+                st = 0.0
+            if st <= 0:
+                continue
+            if (now - st) >= ttl_sec:
+                continue
+            pruned.append(s)
+        keep_list = pruned
+        if len(keep_list) != before_len:
+            changed = True
+
     if changed:
         signals_cache[:] = keep_list
 
@@ -3141,21 +3172,34 @@ def get_mt5_market_data(symbol: str):
     ask = float(getattr(tick, "ask", 0.0) or 0.0)
     spread = ((ask - bid) / point) if point > 0 else 0.0
 
-    # Average spread: lightweight approximation using recent M5 bars' typical spread.
-    # Avoid heavy tick-by-tick queries; use high-low as proxy (conservative overestimate).
+    # Average spread: compute from actual tick spreads (points) history.
+    # This avoids mixing price ranges into spread statistics.
     spread_avg_24h = 0.0
-    if point > 0 and rates_m5_60 is not None and len(rates_m5_60) >= 12:
-        # Use M5 bars' median high-low range as a proxy for typical spread environment.
-        # This is an overestimate (includes intrabar movement), but avoids mixing units.
-        hl_ranges_pts = []
-        for r in rates_m5_60[:min(48, len(rates_m5_60))]:  # cap at ~4 hours
-            h = _rate_field(r, "high", 0.0)
-            l = _rate_field(r, "low", 0.0)
-            if h > 0 and l > 0 and h >= l:
-                hl_ranges_pts.append((h - l) / point)
-        if len(hl_ranges_pts) >= 12:
-            # Use median to avoid outliers (news spikes, etc.)
-            spread_avg_24h = statistics.median(hl_ranges_pts)
+    now_ts = time.time()
+    if spread > 0:
+        sym = (symbol or "").strip().upper()
+        with _spread_history_lock:
+            hist = _spread_history_by_symbol.get(sym)
+            if hist is None:
+                hist = []
+                _spread_history_by_symbol[sym] = hist
+            
+            hist.append((now_ts, float(spread)))
+            
+            # Prune by time window first (most effective for memory)
+            win = float(SPREAD_HISTORY_WINDOW_SEC or 0)
+            if win > 0:
+                cutoff = now_ts - win
+                hist[:] = [x for x in hist if float(x[0]) >= cutoff]
+            
+            # Then prune by max size (safety cap)
+            max_n = int(SPREAD_HISTORY_MAX or 0)
+            if max_n > 0 and len(hist) > max_n:
+                hist[:] = hist[-max_n:]
+            
+            # Compute average from remaining samples
+            if hist:
+                spread_avg_24h = float(sum(v for _, v in hist) / len(hist))
 
     # Fallback: if bars unavailable or median failed, clamp to reasonable range around current.
     # Avoid setting avg=current when current is anomalous (e.g., spread spike).
@@ -3298,8 +3342,14 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         except Exception:
             profit = 0.0
         
-        # Use robust helper function that tries multiple MT5 time fields
-        t_open = _mt5_position_open_time_seconds(p)
+        # Use explicit pos.time if available (primary), then fall back to helper.
+        try:
+            raw_time = getattr(p, "time", None)
+            t_open = _mt5_time_to_unix_seconds(raw_time) if raw_time is not None else 0.0
+        except Exception:
+            t_open = 0.0
+        if t_open <= 0:
+            t_open = _mt5_position_open_time_seconds(p)
         if t_open <= 0:
             print(f"[WARN] get_mt5_positions_summary: missing/invalid pos.time for ticket={getattr(p, 'ticket', 'unknown')}")
             # Skip this position for holding time calculation but still count volume/profit
@@ -3339,19 +3389,17 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
 
         total_profit += profit
 
-        # Update oldest_open_time and max_holding_sec
+        # Track oldest position time (will compute max_holding after loop)
         if t_open < oldest_open_time:
             oldest_open_time = t_open
-        holding_duration = max(0.0, now_ts - t_open)
-        if holding_duration > max_holding:
-            max_holding = holding_duration
 
-    # Finalize: if no valid position times were found, reset to None/0
+    # Finalize: compute max_holding from oldest position
     if oldest_open_time == float("inf"):
         oldest_open_time = None
         max_holding = 0.0
         print(f"[WARN] get_mt5_positions_summary: No valid position times found for {len(positions)} positions")
     else:
+        max_holding = max(0.0, now_ts - oldest_open_time)
         print(
             f"[DEBUG] Calculated max_holding_sec: {max_holding:.1f}s "
             f"(Oldest: {oldest_open_time:.1f}, Now: {now_ts:.1f}, Positions: {len(positions)})"
