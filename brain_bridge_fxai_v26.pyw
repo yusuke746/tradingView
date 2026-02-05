@@ -4,6 +4,7 @@ import time
 import socket
 import statistics
 from datetime import datetime, timezone, timedelta
+import math
 from threading import Lock, Thread
 from typing import Optional, Dict, Any, List
 
@@ -207,6 +208,9 @@ ZONE_TOUCH_LOOKBACK_SEC = int(os.getenv("ZONE_TOUCH_LOOKBACK_SEC", "1200"))
 # Signal cache indexing (OFF by default to avoid any behavior risk)
 SIGNAL_INDEX_ENABLED = _env_bool("SIGNAL_INDEX_ENABLED", "0")
 SIGNAL_INDEX_BUCKET_SEC = int(os.getenv("SIGNAL_INDEX_BUCKET_SEC", "60"))
+
+# Position time extraction debug (temporarily ON for diagnostics)
+DEBUG_POSITION_TIME = _env_bool("DEBUG_POSITION_TIME", "1")
 
 # Spread history (points) for stable average spread estimation
 SPREAD_HISTORY_WINDOW_SEC = int(os.getenv("SPREAD_HISTORY_WINDOW_SEC", "86400"))
@@ -3259,7 +3263,7 @@ def _mt5_time_to_unix_seconds(v: Any) -> float:
         fv = float(v)
     except Exception:
         return 0.0
-    if fv <= 0:
+    if (not math.isfinite(fv)) or fv <= 0:
         return 0.0
     # Heuristic: treat very large values as milliseconds.
     if fv >= 1.0e12:
@@ -3271,28 +3275,30 @@ def _mt5_position_open_time_seconds(p: Any) -> float:
     """Extract position open time from MT5 position object (best-effort)."""
     # Prefer explicit open/create time fields when available.
     for key in (
-        # Some bindings expose explicit open time.
-        "time_open",
+        "time",           # Most common: position open time (seconds)
+        "time_msc",       # Millisecond variant
+        "time_open",      # Explicit open time
         "time_open_msc",
-        "time",
-        "time_msc",
         "time_create",
         "time_create_msc",
         "time_setup",
         "time_setup_msc",
-        # Fallbacks: update time is still better than zero.
-        "time_update",
+        "time_update",    # Fallback: better than nothing
         "time_update_msc",
     ):
         try:
             raw = getattr(p, key, None)
+            if raw is None:
+                continue
+            ts = _mt5_time_to_unix_seconds(raw)
+            if ts > 0:
+                if DEBUG_POSITION_TIME:
+                    print(f"[DEBUG] _mt5_position_open_time_seconds: key={key}, ts={ts:.1f}")
+                return ts
         except Exception:
-            raw = None
-        ts = _mt5_time_to_unix_seconds(raw)
-        if ts > 0:
-            print(f"[DEBUG] _mt5_position_open_time_seconds: Found time from key={key}, raw={raw}, ts={ts}")
-            return ts
-    print(f"[DEBUG] _mt5_position_open_time_seconds: No valid time found, returning 0")
+            continue
+    if DEBUG_POSITION_TIME:
+        print(f"[DEBUG] _mt5_position_open_time_seconds: No valid time found")
     return 0.0
 
 
@@ -3329,6 +3335,7 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
     sell_count = 0
 
     for p in positions:
+        # Extract basic position data
         try:
             vol = float(getattr(p, "volume", 0.0) or 0.0)
         except Exception:
@@ -3342,36 +3349,9 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         except Exception:
             profit = 0.0
         
-        # Use explicit pos.time if available (primary), then fall back to helper.
-        try:
-            raw_time = getattr(p, "time", None)
-            t_open = _mt5_time_to_unix_seconds(raw_time) if raw_time is not None else 0.0
-        except Exception:
-            t_open = 0.0
-        if t_open <= 0:
-            t_open = _mt5_position_open_time_seconds(p)
-        if t_open <= 0:
-            print(f"[WARN] get_mt5_positions_summary: missing/invalid pos.time for ticket={getattr(p, 'ticket', 'unknown')}")
-            # Skip this position for holding time calculation but still count volume/profit
-            ptype = getattr(p, "type", None)
-            if ptype == mt5.POSITION_TYPE_BUY:
-                buy_vol += vol
-                net_volume += vol
-                buy_profit += profit
-                if vol > 0 and open_px > 0:
-                    buy_open_px_sum += (open_px * vol)
-                buy_count += 1
-            elif ptype == mt5.POSITION_TYPE_SELL:
-                sell_vol += vol
-                net_volume -= vol
-                sell_profit += profit
-                if vol > 0 and open_px > 0:
-                    sell_open_px_sum += (open_px * vol)
-                sell_count += 1
-            total_profit += profit
-            continue
-
         ptype = getattr(p, "type", None)
+        
+        # Aggregate volume/profit (always, regardless of time validity)
         if ptype == mt5.POSITION_TYPE_BUY:
             buy_vol += vol
             net_volume += vol
@@ -3386,9 +3366,21 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             if vol > 0 and open_px > 0:
                 sell_open_px_sum += (open_px * vol)
             sell_count += 1
-
+        
         total_profit += profit
-
+        
+        # Extract open time for holding duration calculation
+        try:
+            t_open = _mt5_position_open_time_seconds(p)
+        except Exception:
+            t_open = 0.0
+        
+        if t_open <= 0:
+            # Position has no valid open time; skip holding time tracking
+            if DEBUG_POSITION_TIME:
+                print(f"[WARN] get_mt5_positions_summary: missing time for ticket={getattr(p, 'ticket', '?')}")
+            continue
+        
         # Track oldest position time (will compute max_holding after loop)
         if t_open < oldest_open_time:
             oldest_open_time = t_open
@@ -3397,13 +3389,12 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
     if oldest_open_time == float("inf"):
         oldest_open_time = None
         max_holding = 0.0
-        print(f"[WARN] get_mt5_positions_summary: No valid position times found for {len(positions)} positions")
+        if DEBUG_POSITION_TIME:
+            print(f"[WARN] get_mt5_positions_summary: No valid times for {len(positions)} positions")
     else:
         max_holding = max(0.0, now_ts - oldest_open_time)
-        print(
-            f"[DEBUG] Calculated max_holding_sec: {max_holding:.1f}s "
-            f"(Oldest: {oldest_open_time:.1f}, Now: {now_ts:.1f}, Positions: {len(positions)})"
-        )
+        if DEBUG_POSITION_TIME:
+            print(f"[DEBUG] max_holding_sec={max_holding:.1f}s (oldest={oldest_open_time:.1f})")
 
     net_side = "flat"
     if net_volume > 0:
