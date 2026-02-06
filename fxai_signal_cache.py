@@ -305,10 +305,13 @@ def append_signal_dedup(
             prev_key = signal_dedupe_key(prev)
             if prev_key != key:
                 continue
+            # Same key found: check if within dedupe window
             prt = float(prev.get("receive_time") or 0.0)
             if prt > 0 and (now - prt) <= float(dedupe_window_sec or 0.0):
+                # Within window: duplicate
                 return False
-            return False
+            # Outside window: allow as new signal (break to append)
+            break
         except Exception:
             continue
 
