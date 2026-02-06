@@ -1210,6 +1210,75 @@ def _mgmt_deferred_worker(symbol: str) -> None:
         print(f"[FXAI][MGMT] Deferred worker error for {symbol}: {e}")
 
 
+def _try_schedule_pyramid_entry(
+    symbol: str,
+    pending_entry_trigger: bool,
+    normalized_trigger: Optional[dict],
+    pos_summary: dict,
+    now: float,
+) -> None:
+    """Try to schedule a PYRAMID deferred entry when conditions are met.
+    
+    PYRAMID-DEFER: Allow same-direction deferred entry during management defer.
+    Safety gates: same direction only + profit gate (50% of profit_protect threshold).
+    """
+    if not (pending_entry_trigger and normalized_trigger):
+        return
+    
+    trig_side = (normalized_trigger.get("side") or "").strip().lower()
+    net_side = (pos_summary.get("net_side") or "").strip().lower()
+    
+    # Gate 1: Same direction only
+    if trig_side not in {"buy", "sell"} or net_side not in {"buy", "sell"}:
+        return
+    if net_side != trig_side:
+        return
+    
+    # Gate 2: Profit gate (must have unrealized profit)
+    try:
+        market = get_mt5_market_data(symbol)
+        cur = _current_price_from_market(market)
+        point = float((market or {}).get("point") or 0.0)
+        
+        if cur <= 0 or point <= 0:
+            return
+        
+        if net_side == "buy":
+            net_avg_open = float(pos_summary.get("buy_avg_open") or 0.0)
+            move_points = cur - net_avg_open
+        else:
+            net_avg_open = float(pos_summary.get("sell_avg_open") or 0.0)
+            move_points = net_avg_open - cur
+        
+        if net_avg_open <= 0:
+            return
+        
+        spread_points = float((market or {}).get("spread") or 0.0)
+        atr_points = float((market or {}).get("atr_points") or 0.0)
+        profit_protect_threshold_points = _compute_profit_protect_threshold_points(spread_points, atr_points)
+        
+        if profit_protect_threshold_points <= 0:
+            return
+        
+        net_move_points = float(move_points) / float(point)
+        min_profit_gate = float(profit_protect_threshold_points) * 0.5
+        
+        if net_move_points < min_profit_gate:
+            return
+        
+        # All gates passed: schedule PYRAMID entry
+        normalized_trigger["entry_mode"] = "PYRAMID"
+        if DELAYED_ENTRY_ENABLED:
+            _upsert_pending_entry(symbol, normalized_trigger, float(now))
+        if _schedule_deferred_entry(symbol, normalized_trigger, float(now)):
+            print(
+                f"[FXAI][PYRAMID] Deferred entry scheduled: "
+                f"net_move={net_move_points:.1f}pts >= gate={min_profit_gate:.1f}pts"
+            )
+    except Exception as e:
+        print(f"[FXAI][PYRAMID] Failed to schedule: {e}")
+
+
 def _schedule_deferred_mgmt(symbol: str, normalized_signal: dict, now: float) -> bool:
     """Schedule a deferred management AI run after a short settle window.
 
@@ -1521,9 +1590,12 @@ def _maybe_attempt_delayed_entry(symbol: str, incoming_signal: dict, now: float)
 
     # Only attempt delayed entries when flat (do not create add-ons minutes later).
     pos_summary = get_mt5_positions_summary(symbol)
+    # PYRAMID-DEFER: allow pyramiding deferred entries to continue even if positions are open.
+    entry_mode = str((trigger or {}).get("entry_mode") or "").strip().upper()
     if int(pos_summary.get("positions_open") or 0) > 0:
-        _clear_pending_entry(symbol, reason="positions_open")
-        return None
+        if entry_mode != "PYRAMID":
+            _clear_pending_entry(symbol, reason="positions_open")
+            return None
 
     retry_src = (incoming_signal.get("source") or "")
     retry_evt = (incoming_signal.get("event") or "")
@@ -3848,6 +3920,14 @@ def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
     return out
 
 
+def _compute_profit_protect_threshold_points(spread_points: float, atr_points: float) -> float:
+    """Compute profit protection threshold (shared logic for management and pyramiding)."""
+    try:
+        return max(float(spread_points) * 4.0, float(atr_points) * 0.9)
+    except Exception:
+        return float(spread_points) * 4.0 if spread_points > 0 else 0.0
+
+
 def _build_close_logic_prompt(
     symbol: str,
     market: dict,
@@ -3908,12 +3988,7 @@ def _build_close_logic_prompt(
         # Money PnL scale differs by account/broker/lot size and may misclassify phases.
         is_breakeven_like = False
 
-    profit_protect_threshold_points = 0.0
-    try:
-        # Make PROFIT_PROTECT harder to enter; avoid early fear-based closes.
-        profit_protect_threshold_points = max(float(spread_points) * 4.0, float(atr_points) * 0.9)
-    except Exception:
-        profit_protect_threshold_points = float(spread_points) * 4.0
+    profit_protect_threshold_points = _compute_profit_protect_threshold_points(spread_points, atr_points)
 
     in_profit_protect = (move_points_pts is not None) and (float(move_points_pts) >= float(profit_protect_threshold_points))
     
@@ -4802,6 +4877,8 @@ def webhook():
     pos_summary = get_mt5_positions_summary(symbol)
     if int(pos_summary.get("positions_open") or 0) > 0:
         if AI_CLOSE_ENABLED and _schedule_deferred_mgmt(symbol, normalized, float(now)):
+            # PYRAMID-DEFER: allow same-direction deferred entry while management is deferred.
+            _try_schedule_pyramid_entry(symbol, pending_entry_trigger, normalized_trigger, pos_summary, float(now))
             return "Mgmt deferred", 200
         # If settle window disabled, run immediately (serialized).
         with _mgmt_lock:
