@@ -3003,49 +3003,6 @@ def _prune_signals_cache_locked(now: float) -> None:
         signal_lookback_sec=SIGNAL_LOOKBACK_SEC,
     )
 
-    # Smart hard prune: apply signal-type-specific TTLs (respects Zone/FVG long retention)
-    ttl_sec = float(ZOMBIE_SIGNAL_TTL_SEC or 0)
-    if ttl_sec > 0:
-        before_len = len(keep_list)
-        pruned = []
-        skipped_no_time = 0
-        skipped_expired = 0
-        for s in keep_list:
-            try:
-                st = float(s.get("signal_time") or s.get("receive_time") or 0.0)
-            except Exception:
-                st = 0.0
-            if st <= 0:
-                skipped_no_time += 1
-                continue
-            
-            # Determine signal-specific max age
-            max_age = ttl_sec  # Default: entry triggers (1000s)
-            try:
-                if _fxai_signal_cache.is_zone_presence_signal(s):
-                    # Zone structure: use long retention (12h default)
-                    max_age = max(ttl_sec, float(ZONE_LOOKBACK_SEC or 0))
-                elif _fxai_signal_cache.is_zone_touch_signal(s):
-                    # Zone touch: use medium retention (20min default)
-                    max_age = max(ttl_sec, float(ZONE_TOUCH_LOOKBACK_SEC or 0))
-                elif _fxai_signal_cache.is_fvg_signal(s):
-                    # FVG: use medium retention (20min default for 15min tf)
-                    max_age = max(ttl_sec, float(FVG_LOOKBACK_SEC or 0))
-            except Exception as e:
-                print(f"[WARN] Signal type detection failed: {e}")
-            
-            if (now - st) >= max_age:
-                skipped_expired += 1
-                continue
-            pruned.append(s)
-        
-        if skipped_no_time > 0 or skipped_expired > 0:
-            print(f"[DEBUG] Prune: before={before_len}, kept={len(pruned)}, no_time={skipped_no_time}, expired={skipped_expired}")
-        
-        keep_list = pruned
-        if len(keep_list) != before_len:
-            changed = True
-
     if changed:
         signals_cache[:] = keep_list
 
