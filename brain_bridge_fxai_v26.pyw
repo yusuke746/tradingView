@@ -193,8 +193,8 @@ FVG_LOOKBACK_SEC = int(os.getenv("FVG_LOOKBACK_SEC", "1200"))
 # Zombie signal TTL (hard prune): signals older than this are removed from cache
 ZOMBIE_SIGNAL_TTL_SEC = int(os.getenv("ZOMBIE_SIGNAL_TTL_SEC", "1000"))
 
-CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")
-CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "2.0"))
+CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "3")
+CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "5.0"))
 # Force flush even if signals keep arriving frequently
 CACHE_FLUSH_FORCE_SEC = float(os.getenv("CACHE_FLUSH_FORCE_SEC", "10.0"))
 
@@ -232,9 +232,9 @@ ADDON_MAX_ENTRIES_PER_QTREND = int(os.getenv("ADDON_MAX_ENTRIES_PER_QTREND", "5"
 ADDON_MAX_ENTRIES_PER_POSITION = int(os.getenv("ADDON_MAX_ENTRIES_PER_POSITION", "5"))
 
 # Phase control: DEVELOPMENT (Phase 1) duration limits for day trading.
-# Default: 15 minutes (900s). Positions that fail to reach breakeven by this time
+# Default: 30 minutes (1800s). Positions that fail to reach breakeven by this time
 # are transitioned to Phase 2 for stricter exit evaluation.
-MAX_DEVELOPMENT_SEC = float(os.getenv("MAX_DEVELOPMENT_SEC", "900"))
+MAX_DEVELOPMENT_SEC = float(os.getenv("MAX_DEVELOPMENT_SEC", "1800"))
 # Breakeven band multipliers: tighter bands = faster Phase 2 transition.
 BREAKEVEN_BAND_ATR_MULTIPLIER = float(os.getenv("BREAKEVEN_BAND_ATR_MULTIPLIER", "0.10"))
 BREAKEVEN_BAND_SPREAD_MULTIPLIER = float(os.getenv("BREAKEVEN_BAND_SPREAD_MULTIPLIER", "1.5"))
@@ -283,7 +283,7 @@ POST_TRIGGER_WAIT_SEC = float(os.getenv("POST_TRIGGER_WAIT_SEC", "0"))
 # When a Lorentzian entry_trigger arrives, do NOT evaluate immediately; instead, wait a short
 # time to let out-of-order context (Zones/FVG/Q-Trend) arrive, then evaluate once.
 # This reduces "early entry" risk when TradingView alerts arrive slightly delayed.
-ENTRY_POST_SIGNAL_WAIT_SEC = float(os.getenv("ENTRY_POST_SIGNAL_WAIT_SEC", "2"))
+ENTRY_POST_SIGNAL_WAIT_SEC = float(os.getenv("ENTRY_POST_SIGNAL_WAIT_SEC", "3"))
 ENTRY_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("ENTRY_POST_SIGNAL_MAX_WAIT_SEC", str(ENTRY_POST_SIGNAL_WAIT_SEC)))
 
 # --- Delayed entry re-evaluation (minutes-level) ---
@@ -313,8 +313,8 @@ AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65")
 
 # Management settle window: when positions are open, wait briefly to let near-simultaneous
 # context alerts (e.g., Q-Trend + Zones + FVG) arrive, then run ONE AI decision.
-MGMT_POST_SIGNAL_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_WAIT_SEC", "1"))
-MGMT_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_MAX_WAIT_SEC", "1"))
+MGMT_POST_SIGNAL_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_WAIT_SEC", "3"))
+MGMT_POST_SIGNAL_MAX_WAIT_SEC = float(os.getenv("MGMT_POST_SIGNAL_MAX_WAIT_SEC", "3"))
 
 
 # --- Local entry safety guards (professional defaults) ---
@@ -2071,7 +2071,12 @@ def _extract_zone_level(signal: Dict[str, Any]) -> Optional[float]:
 
 
 def _build_zones_context(symbol: str, now: float, current_price: float) -> Dict[str, Any]:
-    """Build zones_context: counts of zones above/below current price."""
+    """Build zones_context: counts of zones above/below current price.
+    
+    IMPORTANT: Includes zones from multiple timeframes (m5, m15, h1) to capture
+    all structural levels from TradingView alerts. 24h cache retention ensures
+    strong zones remain visible for context.
+    """
     if current_price <= 0:
         return {"total": 0, "support_count": 0, "resistance_count": 0}
 
@@ -2082,6 +2087,10 @@ def _build_zones_context(symbol: str, now: float, current_price: float) -> Dict[
     for s in normalized:
         if not is_zone_presence_signal(s):
             continue
+        # Accept zones from multiple timeframes (m5, m15, h1) for structural context
+        tf = (s.get("tf") or "").strip().lower()
+        if tf and tf not in ["m5", "m15", "h1"]:
+            continue  # Skip zones from other timeframes (e.g., m1, h4)
         level = _extract_zone_level(s)
         if level is None:
             continue
@@ -2994,7 +3003,7 @@ def _prune_signals_cache_locked(now: float) -> None:
         signal_lookback_sec=SIGNAL_LOOKBACK_SEC,
     )
 
-    # Hard prune: remove any signals older than ZOMBIE_SIGNAL_TTL_SEC (default 15m)
+    # Smart hard prune: apply signal-type-specific TTLs (respects Zone/FVG long retention)
     ttl_sec = float(ZOMBIE_SIGNAL_TTL_SEC or 0)
     if ttl_sec > 0:
         before_len = len(keep_list)
@@ -3006,7 +3015,20 @@ def _prune_signals_cache_locked(now: float) -> None:
                 st = 0.0
             if st <= 0:
                 continue
-            if (now - st) >= ttl_sec:
+            
+            # Determine signal-specific max age
+            max_age = ttl_sec  # Default: entry triggers (1000s)
+            if _fxai_signal_cache.is_zone_presence_signal(s):
+                # Zone structure: use long retention (12h default)
+                max_age = max(ttl_sec, float(ZONE_LOOKBACK_SEC or 0))
+            elif _fxai_signal_cache.is_zone_touch_signal(s):
+                # Zone touch: use medium retention (20min default)
+                max_age = max(ttl_sec, float(ZONE_TOUCH_LOOKBACK_SEC or 0))
+            elif _fxai_signal_cache.is_fvg_signal(s):
+                # FVG: use medium retention (20min default for 15min tf)
+                max_age = max(ttl_sec, float(FVG_LOOKBACK_SEC or 0))
+            
+            if (now - st) >= max_age:
                 continue
             pruned.append(s)
         keep_list = pruned
@@ -3026,6 +3048,35 @@ def _is_zone_presence_signal(s: dict) -> bool:
 
 def _is_zone_touch_signal(s: dict) -> bool:
     return _fxai_signal_cache.is_zone_touch_signal(s)
+
+
+def _is_fvg_signal(s: dict) -> bool:
+    """Return True if a signal represents an FVG (Fair Value Gap) event/presence."""
+    try:
+        fn = getattr(_fxai_signal_cache, "is_fvg_signal", None)
+        if callable(fn):
+            return bool(fn(s))
+    except Exception:
+        pass
+
+    if not isinstance(s, dict):
+        return False
+
+    try:
+        src = str(s.get("source") or "").strip()
+        sig_type = str(s.get("signal_type") or "").strip().lower()
+        evt = str(s.get("event") or "").strip().lower()
+    except Exception:
+        return False
+
+    if src in {"FVG", "LuxAlgo_FVG"}:
+        return True
+    if "fvg" in sig_type:
+        return True
+    if "fvg" in evt:
+        return True
+    return False
+
 
 def _filter_fresh_signals(symbol: str, now: float) -> list:
     """v2.6の SignalMaxAgeSec 相当：signal_time が古すぎるものを落とす。"""
@@ -3392,7 +3443,14 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         if DEBUG_POSITION_TIME:
             print(f"[WARN] get_mt5_positions_summary: No valid times for {len(positions)} positions")
     else:
-        max_holding = max(0.0, now_ts - oldest_open_time)
+        raw_holding = now_ts - oldest_open_time
+        # MT5サーバー時刻とローカル時刻のズレで負になる場合は警告
+        if raw_holding < 0:
+            if DEBUG_POSITION_TIME:
+                print(f"[WARN] Negative holding_sec={raw_holding:.1f}s (server time ahead by {abs(raw_holding):.1f}s)")
+            max_holding = abs(raw_holding)  # 絶対値を使用（小さい値として扱う）
+        else:
+            max_holding = raw_holding
         if DEBUG_POSITION_TIME:
             print(f"[DEBUG] max_holding_sec={max_holding:.1f}s (oldest={oldest_open_time:.1f})")
 
@@ -3888,8 +3946,8 @@ def _build_close_logic_prompt(
     # CRITICAL FIX: Phase 1 (DEVELOPMENT) duration enforcement.
     # OLD: (holding_sec < 900) OR is_breakeven_like → caused infinite Phase 1 in ranging markets.
     # NEW: (holding_sec < MAX_DEVELOPMENT_SEC) AND is_breakeven_like → strict time limit.
-    # Day trading principle: positions that fail to reach breakeven within 15 min are losing trades.
-    max_dev_sec = float(MAX_DEVELOPMENT_SEC or 900.0)
+    # Day trading principle: positions that fail to reach breakeven within 30 min are losing trades.
+    max_dev_sec = float(MAX_DEVELOPMENT_SEC or 1800.0)
     in_development = (holding_sec > 0 and holding_sec < max_dev_sec) and bool(is_breakeven_like)
 
     phase_name = "PROFIT_PROTECT" if in_profit_protect else "DEVELOPMENT" if in_development else "DEVELOPMENT"
