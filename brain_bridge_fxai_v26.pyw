@@ -3412,11 +3412,17 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             print(f"[WARN] get_mt5_positions_summary: No valid times for {len(positions)} positions")
     else:
         raw_holding = now_ts - oldest_open_time
-        # MT5サーバー時刻とローカル時刻のズレで負になる場合は警告
+        # MT5サーバー時刻のズレ対応（小さなズレのみ補正、大きなズレは異常として扱う）
         if raw_holding < 0:
-            if DEBUG_POSITION_TIME:
-                print(f"[WARN] Negative holding_sec={raw_holding:.1f}s (server time ahead by {abs(raw_holding):.1f}s)")
-            max_holding = abs(raw_holding)  # 絶対値を使用（小さい値として扱う）
+            # 負の値: サーバー時刻が未来
+            if raw_holding >= -300:  # 5分以内のズレは許容（abs補正）
+                if DEBUG_POSITION_TIME:
+                    print(f"[WARN] Small negative holding_sec={raw_holding:.1f}s (using abs)")
+                max_holding = abs(raw_holding)
+            else:  # 5分超のズレは異常（0として扱う）
+                if DEBUG_POSITION_TIME:
+                    print(f"[WARN] Large negative holding_sec={raw_holding:.1f}s (server time way ahead, treating as 0)")
+                max_holding = 0.0
         else:
             max_holding = raw_holding
         if DEBUG_POSITION_TIME:
@@ -4712,11 +4718,19 @@ def webhook():
     normalized = _normalize_signal_fields(signal)
 
     with signals_lock:
+        cache_before = len(signals_cache)
         appended = _append_signal_dedup_locked(normalized)
+        cache_after = len(signals_cache)
         _prune_signals_cache_locked(now)
+        cache_after_prune = len(signals_cache)
         _mark_cache_dirty_locked(now)
         if not CACHE_ASYNC_FLUSH_ENABLED:
             _save_cache_locked()
+        
+        if appended:
+            print(f"[DEBUG] Cache: before={cache_before}, after_append={cache_after}, after_prune={cache_after_prune}, dirty={_cache_dirty}")
+        elif cache_before == 0:
+            print(f"[WARN] Failed to append signal to empty cache!")
 
     # Record webhook-level metrics (even if duplicate)
     try:
