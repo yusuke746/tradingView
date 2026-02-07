@@ -1721,6 +1721,31 @@ def _summarize_heartbeat_payload(payload: Any) -> Any:
     return payload
 
 
+def _get_server_time_offset_sec() -> Optional[float]:
+    """Return broker server offset vs UTC (seconds), if known."""
+    with _status_lock:
+        payload = _last_status.get("last_heartbeat_payload")
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        offset = payload.get("server_gmt_offset_sec")
+        if offset is not None:
+            return float(offset)
+    except Exception:
+        pass
+
+    try:
+        gmt_ts = payload.get("gmt_ts")
+        srv_ts = payload.get("trade_server_ts")
+        if gmt_ts is not None and srv_ts is not None:
+            return float(srv_ts) - float(gmt_ts)
+    except Exception:
+        pass
+
+    return None
+
+
 _weekend_close_last_sent_week_by_symbol: Dict[str, str] = {}
 
 
@@ -3411,6 +3436,10 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         }
 
     now_ts = time.time()
+    server_offset_sec = _get_server_time_offset_sec()
+    now_ts_for_holding = now_ts + float(server_offset_sec) if server_offset_sec is not None else now_ts
+    if DEBUG_POSITION_TIME and server_offset_sec is not None:
+        print(f"[DEBUG] get_mt5_positions_summary: server_offset_sec={server_offset_sec:.1f}")
     print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now_ts}, positions_count={len(positions)}")
     net_volume = 0.0
     total_profit = 0.0
@@ -3483,7 +3512,7 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         if DEBUG_POSITION_TIME:
             print(f"[WARN] get_mt5_positions_summary: No valid times for {len(positions)} positions")
     else:
-        raw_holding = now_ts - oldest_open_time
+        raw_holding = now_ts_for_holding - oldest_open_time
         # MT5サーバー時刻のズレ対応（小さなズレのみ補正、大きなズレは異常として扱う）
         if raw_holding < 0:
             # 負の値: サーバー時刻が未来
