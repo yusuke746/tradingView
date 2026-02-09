@@ -226,7 +226,7 @@ METRICS_MAX_EXAMPLES = int(os.getenv("METRICS_MAX_EXAMPLES", "80"))
 # --- Auto-tuning (rolling) ---
 AUTO_TUNE_ENABLED = _env_bool("AUTO_TUNE_ENABLED", "1")
 AUTO_TUNE_INTERVAL_SEC = float(os.getenv("AUTO_TUNE_INTERVAL_SEC", "86400"))
-AUTO_TUNE_PCTL = float(os.getenv("AUTO_TUNE_PCTL", "0.95"))
+AUTO_TUNE_PCTL = float(os.getenv("AUTO_TUNE_PCTL", "0.98"))
 AUTO_TUNE_MIN_SAMPLES = int(os.getenv("AUTO_TUNE_MIN_SAMPLES", "80"))
 AUTO_TUNE_ENV_PATH = str(os.getenv("AUTO_TUNE_ENV_PATH", ".env") or ".env").strip()
 AUTO_TUNE_WRITE_ENV = _env_bool("AUTO_TUNE_WRITE_ENV", "1")
