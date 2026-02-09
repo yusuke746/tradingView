@@ -4359,16 +4359,24 @@ def _build_close_logic_prompt(
 
     profit_protect_threshold_points = _compute_profit_protect_threshold_points(spread_points, atr_points)
 
-    in_profit_protect = (move_points_pts is not None) and (float(move_points_pts) >= float(profit_protect_threshold_points))
+    in_profit_protect = (move_points_pts is not None) and (move_points_pts >= profit_protect_threshold_points)
     
     # CRITICAL FIX: Phase 1 (DEVELOPMENT) duration enforcement.
     # OLD: (holding_sec < 900) OR is_breakeven_like → caused infinite Phase 1 in ranging markets.
     # NEW: (holding_sec < MAX_DEVELOPMENT_SEC) AND is_breakeven_like → strict time limit.
     # Day trading principle: positions that fail to reach breakeven within 30 min are losing trades.
-    max_dev_sec = float(MAX_DEVELOPMENT_SEC or 1800.0)
-    in_development = (holding_sec > 0 and holding_sec < max_dev_sec) and bool(is_breakeven_like)
-
-    phase_name = "PROFIT_PROTECT" if in_profit_protect else "DEVELOPMENT" if in_development else "DEVELOPMENT"
+    max_dev_sec = MAX_DEVELOPMENT_SEC  # already float from config
+    
+    # Phase 2 (PROFIT_PROTECT) triggers: profit threshold OR time limit exceeded
+    in_phase2_by_time = (holding_sec >= max_dev_sec)
+    
+    # Phase determination: Phase 2 takes priority over Phase 1.
+    # All non-Phase-2 positions default to DEVELOPMENT (育成フェーズ: insensitive to noise).
+    phase_name = "PROFIT_PROTECT" if (in_profit_protect or in_phase2_by_time) else "DEVELOPMENT"
+    
+    # Note: in_development is computed for debugging/logging but NOT used in phase_name determination.
+    # Phase 1 condition: short duration AND near breakeven (computed for future extensibility).
+    in_development = (holding_sec < max_dev_sec) and is_breakeven_like
 
     # Recent signals gathered during settle window (if available). Keep it small.
     recent_signals_clean: List[dict] = []
