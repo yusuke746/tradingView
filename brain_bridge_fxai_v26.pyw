@@ -223,6 +223,18 @@ METRICS_FILE = str(os.getenv("METRICS_FILE", "entry_metrics.json") or "entry_met
 METRICS_KEEP_DAYS = int(os.getenv("METRICS_KEEP_DAYS", "14"))
 METRICS_MAX_EXAMPLES = int(os.getenv("METRICS_MAX_EXAMPLES", "80"))
 
+# --- Auto-tuning (rolling) ---
+AUTO_TUNE_ENABLED = _env_bool("AUTO_TUNE_ENABLED", "1")
+AUTO_TUNE_INTERVAL_SEC = float(os.getenv("AUTO_TUNE_INTERVAL_SEC", "86400"))
+AUTO_TUNE_PCTL = float(os.getenv("AUTO_TUNE_PCTL", "0.90"))
+AUTO_TUNE_MIN_SAMPLES = int(os.getenv("AUTO_TUNE_MIN_SAMPLES", "80"))
+AUTO_TUNE_ENV_PATH = str(os.getenv("AUTO_TUNE_ENV_PATH", ".env") or ".env").strip()
+AUTO_TUNE_WRITE_ENV = _env_bool("AUTO_TUNE_WRITE_ENV", "1")
+SPREAD_MAX_ATR_RATIO_MIN = float(os.getenv("SPREAD_MAX_ATR_RATIO_MIN", "0.03"))
+SPREAD_MAX_ATR_RATIO_MAX = float(os.getenv("SPREAD_MAX_ATR_RATIO_MAX", "0.25"))
+DRIFT_LIMIT_ATR_MULT_MIN = float(os.getenv("DRIFT_LIMIT_ATR_MULT_MIN", "0.05"))
+DRIFT_LIMIT_ATR_MULT_MAX = float(os.getenv("DRIFT_LIMIT_ATR_MULT_MAX", "0.35"))
+
 
 # --- Behavior toggles ---
 ASSUME_ACTION_IS_QTREND = _env_bool("ASSUME_ACTION_IS_QTREND", "0")
@@ -323,6 +335,16 @@ ENTRY_MAX_SPREAD_POINTS = float(os.getenv("ENTRY_MAX_SPREAD_POINTS", "90"))
 ENTRY_MIN_ATR_TO_SPREAD = float(os.getenv("ENTRY_MIN_ATR_TO_SPREAD", "2.5"))
 ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "25"))
 
+# Dynamic spread guards (ATR-relative). Set <= 0 to disable.
+SPREAD_MAX_ATR_RATIO = float(os.getenv("SPREAD_MAX_ATR_RATIO", "0.10"))
+
+# Dynamic drift guard (ATR-relative). Set <= 0 to disable.
+DRIFT_LIMIT_ATR_MULT = float(os.getenv("DRIFT_LIMIT_ATR_MULT", "0.15"))
+DRIFT_LIMIT_MIN_POINTS = float(os.getenv("DRIFT_LIMIT_MIN_POINTS", "10"))
+DRIFT_LIMIT_MAX_POINTS = float(os.getenv("DRIFT_LIMIT_MAX_POINTS", "120"))
+ATR_SPIKE_CAP_MULT = float(os.getenv("ATR_SPIKE_CAP_MULT", "1.6"))
+ATR_FLOOR_MULT = float(os.getenv("ATR_FLOOR_MULT", "0.7"))
+
 # --- Entry race-condition guards ---
 # Prevent duplicate orders when multiple near-simultaneous webhooks cause entry flow to run twice.
 # 1) processing lock: blocks concurrent entry placements per symbol
@@ -378,6 +400,9 @@ _cache_flush_thread_started = False
 
 _spread_history_lock = Lock()
 _spread_history_by_symbol: Dict[str, List[tuple]] = {}
+
+_auto_tune_lock = Lock()
+_auto_tune_last_ts = 0.0
 
 _metrics_lock = Lock()
 _metrics: Dict[str, Any] = {
@@ -761,6 +786,10 @@ def init_runtime() -> bool:
                 _load_metrics()
             except Exception as e:
                 print(f"[FXAI][WARN] Metrics load failed: {e}")
+            try:
+                _maybe_autotune_from_metrics(symbol=SYMBOL)
+            except Exception as e:
+                print(f"[FXAI][WARN] Auto-tune on startup failed: {e}")
 
         # Start background loops
         if ZMQ_HEARTBEAT_ENABLED:
@@ -1957,7 +1986,155 @@ def _drift_point_size(symbol: str, point: float) -> float:
     return p
 
 
-def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: str) -> tuple[bool, str]:
+def _effective_atr_price(market: Dict[str, Any]) -> float:
+    try:
+        atr = float((market or {}).get("atr") or 0.0)
+        atr_avg = float((market or {}).get("atr_avg_24h") or 0.0)
+    except Exception:
+        return 0.0
+    if atr <= 0:
+        return 0.0
+    if atr_avg > 0:
+        cap_mult = float(ATR_SPIKE_CAP_MULT or 0.0)
+        floor_mult = float(ATR_FLOOR_MULT or 0.0)
+        if cap_mult > 0:
+            atr = min(atr, atr_avg * cap_mult)
+        if floor_mult > 0:
+            atr = max(atr, atr_avg * floor_mult)
+    return atr
+
+
+def _dynamic_drift_limit_points(market: Dict[str, Any]) -> float:
+    limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
+    atr_price = _effective_atr_price(market)
+    try:
+        drift_point = float((market or {}).get("drift_point") or (market or {}).get("point") or 0.0)
+    except Exception:
+        drift_point = 0.0
+    if atr_price > 0 and drift_point > 0 and float(DRIFT_LIMIT_ATR_MULT or 0.0) > 0:
+        limit_points = (atr_price * float(DRIFT_LIMIT_ATR_MULT)) / drift_point
+        if float(DRIFT_LIMIT_MIN_POINTS or 0.0) > 0:
+            limit_points = max(limit_points, float(DRIFT_LIMIT_MIN_POINTS))
+        if float(DRIFT_LIMIT_MAX_POINTS or 0.0) > 0:
+            limit_points = min(limit_points, float(DRIFT_LIMIT_MAX_POINTS))
+    return limit_points
+
+
+def _clamp(v: float, lo: Optional[float], hi: Optional[float]) -> float:
+    try:
+        out = float(v)
+    except Exception:
+        return 0.0
+    if lo is not None:
+        try:
+            out = max(out, float(lo))
+        except Exception:
+            pass
+    if hi is not None:
+        try:
+            out = min(out, float(hi))
+        except Exception:
+            pass
+    return out
+
+
+def _percentile(values: List[float], p: float) -> Optional[float]:
+    """Compute percentile using linear interpolation (nearest-rank fallback)."""
+    if not values:
+        return None
+    try:
+        pct = float(p)
+    except (TypeError, ValueError):
+        return None
+    pct = max(0.0, min(1.0, pct))
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return None
+    # Use statistics.quantiles for Python 3.8+ (more accurate)
+    try:
+        return float(statistics.quantiles(vals, n=100, method='inclusive')[int(pct * 100)])
+    except (AttributeError, IndexError):
+        # Fallback for older Python or edge cases
+        idx = int(round(pct * (len(vals) - 1)))
+        return float(vals[max(0, min(idx, len(vals) - 1))])
+
+
+def _format_env_value(v: Any) -> str:
+    try:
+        if isinstance(v, float):
+            return f"{v:.6f}".rstrip("0").rstrip(".") or "0"
+        if isinstance(v, int):
+            return str(int(v))
+        if isinstance(v, bool):
+            return "1" if v else "0"
+    except Exception:
+        pass
+    return str(v)
+
+
+def _resolve_env_path(path_raw: str) -> str:
+    path = str(path_raw or ".env").strip() or ".env"
+    if os.path.isabs(path):
+        return path
+    return os.path.join(os.getcwd(), path)
+
+
+def _update_env_file(path: str, updates: Dict[str, Any]) -> bool:
+    """Atomically update .env file (existing keys replaced, new keys appended)."""
+    if not updates:
+        return False
+    try:
+        existing_lines: List[str] = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing_lines = f.readlines()
+            except (IOError, OSError) as e:
+                print(f"[FXAI][WARN] Failed to read .env: {e}")
+                return False
+
+        key_index: Dict[str, int] = {}
+        for i, line in enumerate(existing_lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].lstrip()
+            if "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key:
+                key_index[key] = i
+
+        for key, value in updates.items():
+            env_val = _format_env_value(value)
+            new_line = f"{key}={env_val}\n"
+            if key in key_index:
+                existing_lines[key_index[key]] = new_line
+            else:
+                existing_lines.append(new_line)
+
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(existing_lines)
+            os.replace(tmp_path, path)
+        except (IOError, OSError) as e:
+            print(f"[FXAI][ERROR] Failed to write .env: {e}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[FXAI][ERROR] Unexpected error updating .env: {e}")
+        return False
+
+
+def _check_price_drift(
+    signal_price: Any,
+    current_market: Dict[str, Any],
+    side: str,
+    *,
+    limit_points: Optional[float] = None,
+) -> tuple[bool, str]:
     """Check price drift between signal price and current market.
 
     - BUY: block if current_ask > signal_price + limit
@@ -1965,8 +2142,9 @@ def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: 
 
     Returns (ok, reason).
     """
-    limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
-    if limit_points <= 0:
+    if limit_points is None:
+        limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
+    if float(limit_points or 0.0) <= 0:
         return True, "disabled"
 
     try:
@@ -2015,10 +2193,10 @@ def _check_price_drift(signal_price: Any, current_market: Dict[str, Any], side: 
 
 def _price_drift_snapshot(signal_price: Any, current_market: Dict[str, Any], side: str) -> Dict[str, Any]:
     """Return a compact snapshot for prompts/metrics (never raises)."""
-    limit_points = float(DRIFT_LIMIT_POINTS or 0.0)
-    ok, reason = _check_price_drift(signal_price, current_market, side)
+    limit_points = _dynamic_drift_limit_points(current_market)
+    ok, reason = _check_price_drift(signal_price, current_market, side, limit_points=limit_points)
     snap: Dict[str, Any] = {
-        "enabled": bool(limit_points > 0),
+        "enabled": bool(float(limit_points or 0.0) > 0),
         "hard_block_enabled": bool(DRIFT_HARD_BLOCK_ENABLED),
         "limit_points": limit_points,
         "ok": bool(ok),
@@ -2806,6 +2984,116 @@ def _metrics_append_example_locked(examples: List[Dict[str, Any]], ex: Dict[str,
     _fxai_metrics.append_example(examples, ex, max_n=int(METRICS_MAX_EXAMPLES or 80))
 
 
+def _collect_autotune_samples(metrics: Dict[str, Any], *, symbol: Optional[str] = None) -> Dict[str, List[float]]:
+    sym = (symbol or SYMBOL or "GOLD").strip().upper()
+    by_day = metrics.get("by_day") if isinstance(metrics, dict) else None
+    if not isinstance(by_day, dict):
+        return {"spread_to_atr": [], "drift_ratio": []}
+
+    spread_to_atr: List[float] = []
+    drift_ratio: List[float] = []
+
+    for day in by_day.values():
+        if not isinstance(day, dict):
+            continue
+        # Prefer target symbol bucket; fallback to all buckets only if target missing
+        bucket = day.get(sym)
+        if isinstance(bucket, dict):
+            buckets = [bucket]
+        else:
+            buckets = [v for v in day.values() if isinstance(v, dict)]
+
+        for bucket in buckets:
+            examples = bucket.get("examples")
+            if not isinstance(examples, list):
+                continue
+            for ex in examples:
+                if not isinstance(ex, dict):
+                    continue
+                try:
+                    atr_to_spread = ex.get("atr_to_spread")
+                    if atr_to_spread is not None and float(atr_to_spread) > 0:
+                        spread_to_atr.append(1.0 / float(atr_to_spread))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+                try:
+                    drift_pts = ex.get("drift_points")
+                    atr_points = ex.get("atr_points")
+                    if drift_pts is not None and atr_points is not None and float(atr_points) > 0:
+                        drift_ratio.append(abs(float(drift_pts)) / float(atr_points))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+    return {"spread_to_atr": spread_to_atr, "drift_ratio": drift_ratio}
+
+
+def _compute_autotune_settings(metrics: Dict[str, Any], *, symbol: Optional[str] = None) -> Dict[str, float]:
+    samples = _collect_autotune_samples(metrics, symbol=symbol)
+    spread_vals = samples.get("spread_to_atr") or []
+    drift_vals = samples.get("drift_ratio") or []
+
+    min_samples = max(10, int(AUTO_TUNE_MIN_SAMPLES or 0))
+    pctl = float(AUTO_TUNE_PCTL or 0.90)
+
+    settings: Dict[str, float] = {}
+
+    if len(spread_vals) >= min_samples:
+        s = _percentile(spread_vals, pctl)
+        if s is not None:
+            s = _clamp(s, SPREAD_MAX_ATR_RATIO_MIN, SPREAD_MAX_ATR_RATIO_MAX)
+            settings["SPREAD_MAX_ATR_RATIO"] = float(s)
+
+    if len(drift_vals) >= min_samples:
+        d = _percentile(drift_vals, pctl)
+        if d is not None:
+            d = _clamp(d, DRIFT_LIMIT_ATR_MULT_MIN, DRIFT_LIMIT_ATR_MULT_MAX)
+            settings["DRIFT_LIMIT_ATR_MULT"] = float(d)
+
+    return settings
+
+
+def _apply_autotune_settings(settings: Dict[str, float]) -> None:
+    global SPREAD_MAX_ATR_RATIO, DRIFT_LIMIT_ATR_MULT
+    now = time.time()
+    if not settings:
+        with _auto_tune_lock:
+            _auto_tune_last_ts = now
+        return
+    if "SPREAD_MAX_ATR_RATIO" in settings:
+        SPREAD_MAX_ATR_RATIO = float(settings["SPREAD_MAX_ATR_RATIO"])
+        os.environ["SPREAD_MAX_ATR_RATIO"] = _format_env_value(SPREAD_MAX_ATR_RATIO)
+    if "DRIFT_LIMIT_ATR_MULT" in settings:
+        DRIFT_LIMIT_ATR_MULT = float(settings["DRIFT_LIMIT_ATR_MULT"])
+        os.environ["DRIFT_LIMIT_ATR_MULT"] = _format_env_value(DRIFT_LIMIT_ATR_MULT)
+
+
+def _maybe_autotune_from_metrics(*, symbol: Optional[str] = None) -> None:
+    if not AUTO_TUNE_ENABLED:
+        return
+    now = time.time()
+    with _auto_tune_lock:
+        global _auto_tune_last_ts
+        if _auto_tune_last_ts > 0 and (now - _auto_tune_last_ts) < float(AUTO_TUNE_INTERVAL_SEC or 0.0):
+            return
+
+    with _metrics_lock:
+        settings = _compute_autotune_settings(_metrics, symbol=symbol)
+    if not settings:
+        return
+
+    _apply_autotune_settings(settings)
+
+    if AUTO_TUNE_WRITE_ENV:
+        env_path = _resolve_env_path(AUTO_TUNE_ENV_PATH)
+        _update_env_file(env_path, settings)
+
+    with _auto_tune_lock:
+        _auto_tune_last_ts = now
+
+    print(f"[FXAI] Auto-tuned settings applied: {settings}")
+
+
 def _record_webhook_metric(symbol: str, sig_type: str, appended: bool) -> None:
     if not ENTRY_METRICS_ENABLED:
         return
@@ -2852,16 +3140,33 @@ def _record_entry_outcome(
 
     spread_points = None
     atr_to_spread = None
+    drift_points = None
+    atr_points = None
     if isinstance(market, dict):
         try:
             spread_points = float(market.get("spread") or 0.0)
-        except Exception:
+        except (TypeError, ValueError):
             spread_points = None
         try:
             v = market.get("atr_to_spread")
             atr_to_spread = float(v) if v is not None else None
-        except Exception:
+        except (TypeError, ValueError):
             atr_to_spread = None
+        if spread_points is not None and atr_to_spread is not None:
+            try:
+                atr_points = float(spread_points) * float(atr_to_spread)
+            except (TypeError, ValueError, ArithmeticError):
+                atr_points = None
+
+        if isinstance(trigger, dict) and trigger:
+            try:
+                side = str(trigger.get("side") or action or "").strip().lower()
+                if side in {"buy", "sell"}:
+                    snap = _price_drift_snapshot(trigger.get("price"), market, side)
+                    drift_points = snap.get("drift_points")
+            except Exception as e:
+                print(f"[FXAI][DEBUG] Drift snapshot failed: {e}")
+                drift_points = None
 
     q_side = (qtrend or {}).get("side") if isinstance(qtrend, dict) else None
     q_strength = (qtrend or {}).get("strength") if isinstance(qtrend, dict) else None
@@ -2924,6 +3229,8 @@ def _record_entry_outcome(
             "ai_latency_ms": int(ai_latency_ms) if ai_latency_ms is not None else None,
             "spread_points": spread_points,
             "atr_to_spread": atr_to_spread,
+            "atr_points": atr_points,
+            "drift_points": drift_points,
             "qtrend": {"side": q_side, "strength": q_strength} if (q_side or q_strength) else None,
             "window_counts": w_counts,
             "zones_confirmed_recent": int(zones_confirmed_recent) if zones_confirmed_recent is not None else None,
@@ -2938,6 +3245,11 @@ def _record_entry_outcome(
         }
         _metrics_append_example_locked(examples, ex)
         _metrics_mark_dirty_locked()
+
+    try:
+        _maybe_autotune_from_metrics(symbol=symbol)
+    except Exception as e:
+        print(f"[FXAI][WARN] Auto-tune update failed: {e}")
 
 
 def _load_metrics() -> None:
@@ -3418,6 +3730,21 @@ def _mt5_position_open_time_seconds(p: Any) -> float:
     return 0.0
 
 
+def get_current_broker_time(symbol: Optional[str] = None) -> float:
+    """Return current MT5 broker time as a UNIX timestamp (seconds)."""
+    sym = (symbol or SYMBOL or "").strip().upper() or "GOLD"
+    try:
+        tick = mt5.symbol_info_tick(sym)
+        ts = float(getattr(tick, "time", 0.0) or 0.0)
+        if ts > 0:
+            return ts
+    except Exception as e:
+        print(f"[ERROR] get_current_broker_time failed for {sym}: {e}")
+    # Emergency fallback: UTC time (may reintroduce DST issues).
+    print(f"[WARN] Using UTC fallback for broker time (MT5 tick unavailable)")
+    return float(datetime.now(timezone.utc).timestamp())
+
+
 def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
     """MT5の保有ポジション概要（AI決済判断に必要な最小情報）を安全に返す。"""
     try:
@@ -3435,12 +3762,8 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
             "max_holding_sec": 0,
         }
 
-    now_ts = time.time()
-    server_offset_sec = _get_server_time_offset_sec()
-    now_ts_for_holding = now_ts + float(server_offset_sec) if server_offset_sec is not None else now_ts
-    if DEBUG_POSITION_TIME and server_offset_sec is not None:
-        print(f"[DEBUG] get_mt5_positions_summary: server_offset_sec={server_offset_sec:.1f}")
-    print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now_ts}, positions_count={len(positions)}")
+    now_ts_for_holding = get_current_broker_time(symbol)
+    print(f"[DEBUG] get_mt5_positions_summary: symbol={symbol}, now={now_ts_for_holding}, positions_count={len(positions)}")
     net_volume = 0.0
     total_profit = 0.0
     oldest_open_time = float("inf")
@@ -3554,6 +3877,23 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         "buy_avg_open": round(buy_avg_open, 6),
         "sell_avg_open": round(sell_avg_open, 6),
     }
+
+
+def check_trading_hours(symbol: str) -> bool:
+    """Return True if trading is allowed based on broker server time.
+    
+    Guards:
+    - 23:50-23:59: Market closing (prevent new entries, consider closing positions)
+    - 00:00-00:30: Market opening (wait for stable spread)
+    """
+    broker_now = get_current_broker_time(symbol)
+    dt = datetime.fromtimestamp(float(broker_now), tz=timezone.utc)
+    h, m = dt.hour, dt.minute
+    
+    if (h == 23 and m >= 50) or (h == 0 and m <= 30):
+        print(f"[Market Guard] Server Time: {h:02d}:{m:02d} - Market Closing/Opening Logic")
+        return False
+    return True
 
 
 def _compute_entry_multiplier(confirm_unique_sources: int, strong_after_q: bool) -> float:
@@ -4294,6 +4634,27 @@ def _attempt_entry_from_lorentzian(
         _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
         return _finish("Blocked by heartbeat", 503, "blocked_heartbeat")
 
+    # Market guard: block new entries during close/open hours based on broker time.
+    if not check_trading_hours(symbol):
+        # If positions are open, send CLOSE signal to EA.
+        if pos_summary and int((pos_summary or {}).get("positions_open") or 0) > 0:
+            try:
+                _zmq_send_json_with_metrics(
+                    {"type": "CLOSE", "reason": "market_guard_close"},
+                    symbol=symbol,
+                    kind="market_guard_close"
+                )
+                print(f"[Market Guard] CLOSE signal sent for {symbol} (positions open during guard window)")
+            except Exception as e:
+                print(f"[Market Guard] Failed to send CLOSE: {e}")
+        
+        _set_status(
+            last_result="Blocked by market guard",
+            last_result_at=time.time(),
+            last_entry_guard={"market_guard": True, "reason": "close_or_open_window"},
+        )
+        return _finish("Blocked by market guard", 200, "blocked_market_guard")
+
     positions_open = int((pos_summary or {}).get("positions_open") or 0)
     net_side = ((pos_summary or {}).get("net_side") or "flat").lower()
 
@@ -4352,6 +4713,14 @@ def _attempt_entry_from_lorentzian(
     except Exception:
         atr_to_spread_v = None
 
+    atr_eff_price = _effective_atr_price(market)
+    try:
+        point = float(market.get("point") or 0.0)
+    except Exception:
+        point = 0.0
+    atr_eff_points = (atr_eff_price / point) if point > 0 else 0.0
+    spread_to_atr = (spread_points / atr_eff_points) if atr_eff_points > 0 else None
+
     if spread_points <= 0:
         _set_status(last_result="Blocked (no spread)", last_result_at=time.time())
         return _finish("Blocked (no spread)", 503, "blocked_no_spread", market=market)
@@ -4364,7 +4733,15 @@ def _attempt_entry_from_lorentzian(
         )
         return _finish("Blocked (spread too wide)", 200, "blocked_spread", market=market)
 
-    if float(ENTRY_MIN_ATR_TO_SPREAD or 0.0) > 0 and (atr_to_spread_v is not None):
+    if float(SPREAD_MAX_ATR_RATIO or 0.0) > 0 and spread_to_atr is not None:
+        if spread_to_atr > float(SPREAD_MAX_ATR_RATIO):
+            _set_status(
+                last_result="Blocked (spread too wide vs ATR)",
+                last_result_at=time.time(),
+                last_entry_guard={"spread_to_atr": spread_to_atr, "max": float(SPREAD_MAX_ATR_RATIO)},
+            )
+            return _finish("Blocked (spread too wide vs ATR)", 200, "blocked_spread_vs_atr", market=market)
+    elif float(ENTRY_MIN_ATR_TO_SPREAD or 0.0) > 0 and (atr_to_spread_v is not None):
         if atr_to_spread_v < float(ENTRY_MIN_ATR_TO_SPREAD):
             _set_status(
                 last_result="Blocked (ATR too small vs spread)",
@@ -4389,7 +4766,13 @@ def _attempt_entry_from_lorentzian(
 
     # --- Price drift guard (especially important for delayed entry) ---
     # Prefer prompt-driven decisioning; only hard-block when explicitly enabled.
-    ok_drift, drift_reason = _check_price_drift(normalized_trigger.get("price"), market, trig_side)
+    dynamic_limit_points = _dynamic_drift_limit_points(market)
+    ok_drift, drift_reason = _check_price_drift(
+        normalized_trigger.get("price"),
+        market,
+        trig_side,
+        limit_points=dynamic_limit_points,
+    )
     if DRIFT_HARD_BLOCK_ENABLED and (not ok_drift):
         _set_status(
             last_result="Blocked (price drift)",
@@ -4397,7 +4780,7 @@ def _attempt_entry_from_lorentzian(
             last_entry_guard={
                 "price_drift": True,
                 "reason": drift_reason,
-                "limit_points": float(DRIFT_LIMIT_POINTS or 0.0),
+                "limit_points": float(dynamic_limit_points or 0.0),
                 "signal_price": normalized_trigger.get("price"),
                 "bid": market.get("bid"),
                 "ask": market.get("ask"),
@@ -5035,9 +5418,21 @@ def metrics():
         "DELAYED_ENTRY_MAX_ATTEMPTS": int(DELAYED_ENTRY_MAX_ATTEMPTS or 0),
         "ENTRY_FRESHNESS_SEC": float(ENTRY_FRESHNESS_SEC or 0.0),
         "DRIFT_LIMIT_POINTS": float(DRIFT_LIMIT_POINTS or 0.0),
+        "DRIFT_LIMIT_ATR_MULT": float(DRIFT_LIMIT_ATR_MULT or 0.0),
+        "DRIFT_LIMIT_MIN_POINTS": float(DRIFT_LIMIT_MIN_POINTS or 0.0),
+        "DRIFT_LIMIT_MAX_POINTS": float(DRIFT_LIMIT_MAX_POINTS or 0.0),
+        "ATR_SPIKE_CAP_MULT": float(ATR_SPIKE_CAP_MULT or 0.0),
+        "ATR_FLOOR_MULT": float(ATR_FLOOR_MULT or 0.0),
         "DRIFT_HARD_BLOCK_ENABLED": bool(DRIFT_HARD_BLOCK_ENABLED),
         "ENTRY_MAX_SPREAD_POINTS": float(ENTRY_MAX_SPREAD_POINTS),
         "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
+        "SPREAD_MAX_ATR_RATIO": float(SPREAD_MAX_ATR_RATIO or 0.0),
+        "AUTO_TUNE_ENABLED": bool(AUTO_TUNE_ENABLED),
+        "AUTO_TUNE_INTERVAL_SEC": float(AUTO_TUNE_INTERVAL_SEC or 0.0),
+        "AUTO_TUNE_PCTL": float(AUTO_TUNE_PCTL or 0.0),
+        "AUTO_TUNE_MIN_SAMPLES": int(AUTO_TUNE_MIN_SAMPLES or 0),
+        "AUTO_TUNE_ENV_PATH": str(AUTO_TUNE_ENV_PATH or ".env"),
+        "AUTO_TUNE_WRITE_ENV": bool(AUTO_TUNE_WRITE_ENV),
         "ENTRY_COOLDOWN_SEC": float(ENTRY_COOLDOWN_SEC),
         "ENTRY_PROCESSING_LOCK_MAX_SEC": float(ENTRY_PROCESSING_LOCK_MAX_SEC or 0.0),
         "ENTRY_TRIGGER_DEDUPE_TTL_SEC": float(ENTRY_TRIGGER_DEDUPE_TTL_SEC or 0.0),
