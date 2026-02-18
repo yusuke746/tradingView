@@ -1076,8 +1076,12 @@ def _run_position_management_once(
         )
     )
 
+    # REVIEW: settle window経由（recent_signals渡された場合）はスロットルをバイパス
+    # 理由: settle window後の評価は複数シグナルを集約した結果なので、スキップすると tp_mode等の更新が失われる
+    is_settle_window_eval = (recent_signals is not None and len(recent_signals) > 0)
+
     last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
-    if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like):
+    if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like) and (not is_settle_window_eval):
         _set_status(
             last_result="AI close throttled",
             last_result_at=time.time(),
@@ -1090,6 +1094,12 @@ def _run_position_management_once(
             },
         )
         return None
+
+    # Log throttle bypass reason (for observability)
+    if is_settle_window_eval:
+        print(f"[FXAI][MGMT] Throttle BYPASS: settle_window_eval (signals_count={len(recent_signals)})")
+    elif is_reversal_like:
+        print(f"[FXAI][MGMT] Throttle BYPASS: reversal_signal (src={src}, evt={evt}, sig_side={sig_side}, net_side={net_side})")
 
     attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
     _last_close_attempt_key = attempt_key
@@ -1108,6 +1118,7 @@ def _run_position_management_once(
                 "confidence": int(_clamp(AI_CLOSE_DEFAULT_CONFIDENCE, 0, 100)),
                 "reason": "fallback_default_close",
                 "trail_mode": "NORMAL",
+                "tp_mode": "NORMAL",  # REVIEW: fallback時もtp_modeを追加
             }
         else:
             _set_status(
@@ -1118,13 +1129,18 @@ def _run_position_management_once(
                 last_mgmt_reason="ai_fallback_hold",
                 last_mgmt_at=time.time(),
             )
-            _zmq_send_json_with_metrics({"type": "HOLD", "reason": "ai_fallback_hold"}, symbol=symbol, kind="mgmt_hold_fallback")
-            ai_decision = {"confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL"}
+            _zmq_send_json_with_metrics(
+                {"type": "HOLD", "reason": "ai_fallback_hold", "trail_mode": "NORMAL", "tp_mode": "NORMAL"},
+                symbol=symbol,
+                kind="mgmt_hold_fallback"
+            )
+            ai_decision = {"confidence": 0, "reason": "ai_fallback_hold", "trail_mode": "NORMAL", "tp_mode": "NORMAL"}
 
     # _validate_ai_close_decision() が既に型検証済みなので、直接取得可能
     decision_reason = ai_decision.get("reason", "")
     decision_conf = ai_decision.get("confidence", 0)  # 既に int 型
     decision_trail = ai_decision.get("trail_mode", "NORMAL")
+    decision_tp = ai_decision.get("tp_mode", "NORMAL")  # REVIEW: tp_mode を取得
     openai_rid = ai_decision.get("_openai_response_id")
     ai_ms = ai_decision.get("_ai_latency_ms")
     
@@ -1135,7 +1151,11 @@ def _run_position_management_once(
         close_threshold = 65  # デフォルト値
     
     if decision_conf >= close_threshold:
-        _zmq_send_json_with_metrics({"type": "CLOSE", "reason": decision_reason}, symbol=symbol, kind="mgmt_close")
+        _zmq_send_json_with_metrics(
+            {"type": "CLOSE", "reason": decision_reason, "trail_mode": decision_trail, "tp_mode": decision_tp},
+            symbol=symbol,
+            kind="mgmt_close"
+        )
         _set_status(
             last_result="CLOSE",
             last_result_at=time.time(),
@@ -1161,7 +1181,7 @@ def _run_position_management_once(
         return "CLOSE", 200
 
     _zmq_send_json_with_metrics(
-        {"type": "HOLD", "reason": decision_reason, "trail_mode": decision_trail},
+        {"type": "HOLD", "reason": decision_reason, "trail_mode": decision_trail, "tp_mode": decision_tp},
         symbol=symbol,
         kind="mgmt_hold",
     )
@@ -4257,10 +4277,10 @@ def _build_entry_filter_prompt(
 
 
 def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """期待するJSON: {confidence: 0-100, reason: str, trail_mode: "WIDE"|"NORMAL"|"TIGHT"}
+    """期待するJSON: {confidence: 0-100, reason: str, trail_mode: "WIDE"|"NORMAL"|"TIGHT", tp_mode: "WIDE"|"NORMAL"|"TIGHT"}
     
-    NOTE: trail_mode は現在 ZMQ 経由で MT5 に送信されるがロジックでは未使用。
-          将来的なトレーリングストップ実装のため保持。
+    NOTE: trail_mode は ZMQ 経由で MT5 に送信され、動的 SL トレーリングに使用。
+          tp_mode は ZMQ 経由で MT5 に送信され、動的 TP トレーリングに使用。
     """
     if not isinstance(decision, dict):
         return None
@@ -4274,12 +4294,17 @@ def _validate_ai_close_decision(decision: Dict[str, Any]) -> Optional[Dict[str, 
         reason = ""
     reason = reason.strip()
 
-    # trail_mode の検証（将来のトレーリングストップ機能用）
+    # trail_mode の検証（動的SLトレーリングストップ機能用）
     trail_mode = str(decision.get("trail_mode", "NORMAL")).upper()
     if trail_mode not in {"WIDE", "NORMAL", "TIGHT"}:
         trail_mode = "NORMAL"
 
-    out: Dict[str, Any] = {"confidence": confidence, "reason": reason, "trail_mode": trail_mode}
+    # REVIEW: tp_mode の検証（動的TPトレーリング機能用）
+    tp_mode = str(decision.get("tp_mode", "NORMAL")).upper()
+    if tp_mode not in {"WIDE", "NORMAL", "TIGHT"}:
+        tp_mode = "NORMAL"
+
+    out: Dict[str, Any] = {"confidence": confidence, "reason": reason, "trail_mode": trail_mode, "tp_mode": tp_mode}
     
     # オプショナルなメタデータを保持
     for key in ("_openai_response_id", "_ai_latency_ms"):
