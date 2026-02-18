@@ -115,11 +115,20 @@ def build_close_logic_payload(
         "constraints": {
             "close_confidence_range": [0, 100],
             "min_close_confidence": min_close_confidence,  # 呼び出し元で int 変換済み
-            "note": "System will CLOSE only when confidence >= min_close_confidence; otherwise HOLD.",
+            "trail_mode_range": ["WIDE", "NORMAL", "TIGHT"],
+            "tp_mode_range": ["WIDE", "NORMAL", "TIGHT"],
+            "note": "System will CLOSE only when confidence >= min_close_confidence; otherwise HOLD. trail_mode scales SLs dynamically. tp_mode scales TPs dynamically.",
+        },
+        "tp_mode_guide": {
+            "WIDE": {"description": "Aggressive (10x+ ATR target)", "use_when": "Strong momentum, low opp, SMA<3.0"},
+            "NORMAL": {"description": "Balanced (5-7x ATR target)", "use_when": "Most situations, healthy conditions"},
+            "TIGHT": {"description": "Defensive (2-3x ATR target)", "use_when": "Extended SMA >3.0, high opp, chop detected"},
+            "note": "trail_mode WIDE + tp_mode TIGHT = rare combo (strong momentum but fragile structure)",
         },
         "notes": {
             "opposition_handling": "Opposition signals can be noise. Prioritize confirmed/structural reversal signs (e.g., strong opposite Zones context) over single touch events.",
             "day_trading_goal": "Loss-cut small, Profit-target large. If profit is available and reversal risk rises, take profit. If loss grows and reversal evidence increases, exit early.",
+            "phase_1_exception": "Even in Phase 1 (Development), if sma_context.distance_atr_ratio > 4.0 AND momentum weakens, raise confidence to 70+ and set tp_mode=TIGHT. Do NOT blindly HOLD when SMA is overextended.",
         },
     }
 
