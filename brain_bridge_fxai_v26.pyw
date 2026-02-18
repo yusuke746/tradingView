@@ -263,7 +263,7 @@ API_RETRY_WAIT_SEC = float(os.getenv("API_RETRY_WAIT_SEC", "1.5"))
 
 AI_ENTRY_DEFAULT_SCORE = int(os.getenv("AI_ENTRY_DEFAULT_SCORE", "50"))
 AI_ENTRY_DEFAULT_LOT_MULTIPLIER = float(os.getenv("AI_ENTRY_DEFAULT_LOT_MULTIPLIER", "1.0"))
-AI_ENTRY_MIN_SCORE = int(os.getenv("AI_ENTRY_MIN_SCORE", "70"))
+AI_ENTRY_MIN_SCORE = int(os.getenv("AI_ENTRY_MIN_SCORE", "75"))
 # Optional: allow a lower minimum score only when Q-Trend is Strong AND aligned with Lorentzian.
 # Default keeps behavior unchanged.
 AI_ENTRY_MIN_SCORE_STRONG_ALIGNED = int(os.getenv("AI_ENTRY_MIN_SCORE_STRONG_ALIGNED", str(AI_ENTRY_MIN_SCORE)))
@@ -319,9 +319,9 @@ ENTRY_FRESHNESS_SEC = float(os.getenv("ENTRY_FRESHNESS_SEC", "15"))
 
 AI_CLOSE_ENABLED = _env_bool("AI_CLOSE_ENABLED", "1")
 AI_CLOSE_THROTTLE_SEC = float(os.getenv("AI_CLOSE_THROTTLE_SEC", "20"))
-AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "65"))
+AI_CLOSE_MIN_CONFIDENCE = int(os.getenv("AI_CLOSE_MIN_CONFIDENCE", "70"))
 AI_CLOSE_FALLBACK = str(os.getenv("AI_CLOSE_FALLBACK", "hold") or "hold").strip().lower()
-AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "65"))
+AI_CLOSE_DEFAULT_CONFIDENCE = int(os.getenv("AI_CLOSE_DEFAULT_CONFIDENCE", "70"))
 
 # Management settle window: when positions are open, wait briefly to let near-simultaneous
 # context alerts (e.g., Q-Trend + Zones + FVG) arrive, then run ONE AI decision.
