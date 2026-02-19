@@ -337,6 +337,9 @@ ENTRY_COOLDOWN_SEC = float(os.getenv("ENTRY_COOLDOWN_SEC", "25"))
 
 # Dynamic spread guards (ATR-relative). Set <= 0 to disable.
 SPREAD_MAX_ATR_RATIO = float(os.getenv("SPREAD_MAX_ATR_RATIO", "0.10"))
+# Soft override for spread-vs-ATR guard: when ATR/spread is still acceptable,
+# skip hard block and let AI score decide. Set <=0 to disable override.
+SPREAD_VS_ATR_SOFT_MIN = float(os.getenv("SPREAD_VS_ATR_SOFT_MIN", "10.0"))
 
 # Dynamic drift guard (ATR-relative). Set <= 0 to disable.
 DRIFT_LIMIT_ATR_MULT = float(os.getenv("DRIFT_LIMIT_ATR_MULT", "0.15"))
@@ -4753,6 +4756,14 @@ def _attempt_entry_from_lorentzian(
         point = 0.0
     atr_eff_points = (atr_eff_price / point) if point > 0 else 0.0
     spread_to_atr = (spread_points / atr_eff_points) if atr_eff_points > 0 else None
+    # Fallback: when the market payload omits the atr_to_spread field, derive it
+    # from the locally computed spread/ATR ratio so the soft-pass guard can still
+    # evaluate EV quality instead of silently falling through to hard-block.
+    if atr_to_spread_v is None and spread_to_atr is not None and spread_to_atr > 0.0:
+        try:
+            atr_to_spread_v = 1.0 / spread_to_atr
+        except Exception:
+            pass
 
     if spread_points <= 0:
         _set_status(last_result="Blocked (no spread)", last_result_at=time.time())
@@ -4766,14 +4777,29 @@ def _attempt_entry_from_lorentzian(
         )
         return _finish("Blocked (spread too wide)", 200, "blocked_spread", market=market)
 
-    if float(SPREAD_MAX_ATR_RATIO or 0.0) > 0 and spread_to_atr is not None:
-        if spread_to_atr > float(SPREAD_MAX_ATR_RATIO):
-            _set_status(
-                last_result="Blocked (spread too wide vs ATR)",
-                last_result_at=time.time(),
-                last_entry_guard={"spread_to_atr": spread_to_atr, "max": float(SPREAD_MAX_ATR_RATIO)},
-            )
-            return _finish("Blocked (spread too wide vs ATR)", 200, "blocked_spread_vs_atr", market=market)
+    if SPREAD_MAX_ATR_RATIO > 0.0 and spread_to_atr is not None:
+        if spread_to_atr > SPREAD_MAX_ATR_RATIO:
+            # Soft path: keep hard reject for clearly bad EV, but allow AI to judge
+            # borderline sessions where ATR/spread is still tradable.
+            if SPREAD_VS_ATR_SOFT_MIN > 0.0 and atr_to_spread_v is not None and atr_to_spread_v >= SPREAD_VS_ATR_SOFT_MIN:
+                _set_status(
+                    last_result="Spread high vs ATR (soft pass)",
+                    last_result_at=time.time(),
+                    last_entry_guard={
+                        "spread_to_atr": spread_to_atr,
+                        "max": SPREAD_MAX_ATR_RATIO,
+                        "atr_to_spread": atr_to_spread_v,
+                        "soft_min": SPREAD_VS_ATR_SOFT_MIN,
+                        "mode": "soft_pass_to_ai",
+                    },
+                )
+            else:
+                _set_status(
+                    last_result="Blocked (spread too wide vs ATR)",
+                    last_result_at=time.time(),
+                    last_entry_guard={"spread_to_atr": spread_to_atr, "max": SPREAD_MAX_ATR_RATIO},
+                )
+                return _finish("Blocked (spread too wide vs ATR)", 200, "blocked_spread_vs_atr", market=market)
     elif float(ENTRY_MIN_ATR_TO_SPREAD or 0.0) > 0 and (atr_to_spread_v is not None):
         if atr_to_spread_v < float(ENTRY_MIN_ATR_TO_SPREAD):
             _set_status(
@@ -5460,6 +5486,7 @@ def metrics():
         "ENTRY_MAX_SPREAD_POINTS": float(ENTRY_MAX_SPREAD_POINTS),
         "ENTRY_MIN_ATR_TO_SPREAD": float(ENTRY_MIN_ATR_TO_SPREAD),
         "SPREAD_MAX_ATR_RATIO": float(SPREAD_MAX_ATR_RATIO or 0.0),
+        "SPREAD_VS_ATR_SOFT_MIN": SPREAD_VS_ATR_SOFT_MIN,
         "AUTO_TUNE_ENABLED": bool(AUTO_TUNE_ENABLED),
         "AUTO_TUNE_INTERVAL_SEC": float(AUTO_TUNE_INTERVAL_SEC or 0.0),
         "AUTO_TUNE_PCTL": float(AUTO_TUNE_PCTL or 0.0),
