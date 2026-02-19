@@ -1152,6 +1152,25 @@ def _run_position_management_once(
         close_threshold = int(AI_CLOSE_MIN_CONFIDENCE or 0)
     except (ValueError, TypeError):
         close_threshold = 65  # デフォルト値
+
+    final_action = "CLOSE" if decision_conf >= close_threshold else "HOLD"
+    try:
+        _record_mgmt_outcome(
+            symbol=symbol,
+            action=final_action,
+            confidence=decision_conf,
+            min_close_confidence=close_threshold,
+            reason=decision_reason,
+            trail_mode=decision_trail,
+            tp_mode=decision_tp,
+            pos_summary=pos_summary,
+            market=market,
+            used_signals=used_signals,
+            openai_response_id=openai_rid,
+            ai_latency_ms=ai_ms,
+        )
+    except Exception as e:
+        print(f"[FXAI][WARN] Failed to record mgmt metrics: {e}")
     
     if decision_conf >= close_threshold:
         _zmq_send_json_with_metrics(
@@ -3273,6 +3292,151 @@ def _record_entry_outcome(
         _maybe_autotune_from_metrics(symbol=symbol)
     except Exception as e:
         print(f"[FXAI][WARN] Auto-tune update failed: {e}")
+
+
+def _record_mgmt_outcome(
+    *,
+    symbol: str,
+    action: str,
+    confidence: Optional[int],
+    min_close_confidence: Optional[int],
+    reason: Optional[str] = None,
+    trail_mode: Optional[str] = None,
+    tp_mode: Optional[str] = None,
+    pos_summary: Optional[Dict[str, Any]] = None,
+    market: Optional[Dict[str, Any]] = None,
+    used_signals: Optional[List[Dict[str, Any]]] = None,
+    openai_response_id: Optional[str] = None,
+    ai_latency_ms: Optional[int] = None,
+) -> None:
+    if not ENTRY_METRICS_ENABLED:
+        return
+
+    now = time.time()
+    day_key = _utc_day_key(now)
+
+    a = str(action or "").strip().upper()
+    conf: Optional[int]
+    try:
+        conf = int(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        conf = None
+
+    min_conf: Optional[int]
+    try:
+        min_conf = int(min_close_confidence) if min_close_confidence is not None else None
+    except (TypeError, ValueError):
+        min_conf = None
+
+    holding_sec = None
+    move_points = None
+    phase_name = "UNKNOWN"
+    spread_ratio = None
+    distance_atr_ratio = None
+
+    try:
+        if isinstance(pos_summary, dict):
+            holding_sec = float(pos_summary.get("max_holding_sec") or 0.0)
+            v = pos_summary.get("net_move_points")
+            move_points = float(v) if v is not None else None
+    except (TypeError, ValueError):
+        holding_sec = None
+        move_points = None
+
+    try:
+        if isinstance(market, dict):
+            spread_ctx = _build_spread_context(market)
+            if isinstance(spread_ctx, dict):
+                v = spread_ctx.get("spread_ratio")
+                spread_ratio = float(v) if v is not None else None
+    except Exception:
+        spread_ratio = None
+
+    try:
+        if isinstance(market, dict):
+            sma_ctx = _build_sma_context(market)
+            if isinstance(sma_ctx, dict):
+                v = sma_ctx.get("distance_atr_ratio")
+                distance_atr_ratio = float(v) if v is not None else None
+    except Exception:
+        distance_atr_ratio = None
+
+    try:
+        spread_points = float((market or {}).get("spread") or 0.0)
+        atr_points = float((market or {}).get("atr_points") or 0.0)
+        threshold_points = _compute_profit_protect_threshold_points(spread_points, atr_points)
+        in_profit_protect = (move_points is not None) and (move_points >= threshold_points)
+        in_phase2_by_time = (holding_sec is not None) and (holding_sec >= float(MAX_DEVELOPMENT_SEC or 0.0))
+        phase_name = "PROFIT_PROTECT" if (in_profit_protect or in_phase2_by_time) else "DEVELOPMENT"
+    except Exception:
+        phase_name = "UNKNOWN"
+
+    signal_count = 0
+    if isinstance(used_signals, list):
+        signal_count = len([s for s in used_signals if isinstance(s, dict)])
+
+    with _metrics_lock:
+        _metrics_prune_locked(now)
+        b = _metrics_get_bucket_locked(day_key, symbol)
+
+        mgmt = b.get("mgmt")
+        if not isinstance(mgmt, dict):
+            mgmt = {}
+            b["mgmt"] = mgmt
+
+        _metrics_inc_locked(mgmt, "decisions", 1)
+        if a == "CLOSE":
+            _metrics_inc_locked(mgmt, "close", 1)
+        elif a == "HOLD":
+            _metrics_inc_locked(mgmt, "hold", 1)
+
+        phase_counts = mgmt.get("phase_counts")
+        if not isinstance(phase_counts, dict):
+            phase_counts = {}
+            mgmt["phase_counts"] = phase_counts
+        _metrics_inc_map_locked(phase_counts, phase_name, 1)
+
+        if conf is not None:
+            conf_hist = mgmt.get("confidence_hist")
+            if not isinstance(conf_hist, dict):
+                conf_hist = {}
+                mgmt["confidence_hist"] = conf_hist
+            _metrics_inc_map_locked(conf_hist, _metrics_bucket_score(conf), 1)
+
+            if min_conf is not None and conf >= min_conf:
+                _metrics_inc_locked(mgmt, "at_or_above_threshold", 1)
+            if min_conf is not None and a == "CLOSE" and min_conf <= conf <= (min_conf + 5):
+                _metrics_inc_locked(mgmt, "close_near_threshold", 1)
+
+        if distance_atr_ratio is not None and a == "CLOSE" and distance_atr_ratio >= 4.0:
+            _metrics_inc_locked(mgmt, "close_overextended_sma", 1)
+        if spread_ratio is not None and a == "CLOSE" and spread_ratio > 1.5:
+            _metrics_inc_locked(mgmt, "close_high_spread", 1)
+
+        examples = mgmt.get("examples")
+        if not isinstance(examples, list):
+            examples = []
+            mgmt["examples"] = examples
+
+        ex = {
+            "ts": now,
+            "action": a,
+            "confidence": conf,
+            "min_required": min_conf,
+            "reason": (str(reason)[:220] if reason else None),
+            "trail_mode": (str(trail_mode).upper() if trail_mode else None),
+            "tp_mode": (str(tp_mode).upper() if tp_mode else None),
+            "phase": phase_name,
+            "holding_sec": holding_sec,
+            "move_points": move_points,
+            "distance_atr_ratio": distance_atr_ratio,
+            "spread_ratio": spread_ratio,
+            "signals_used_count": signal_count,
+            "openai_response_id": (str(openai_response_id)[:120] if openai_response_id else None),
+            "ai_latency_ms": int(ai_latency_ms) if ai_latency_ms is not None else None,
+        }
+        _metrics_append_example_locked(examples, ex)
+        _metrics_mark_dirty_locked()
 
 
 def _load_metrics() -> None:
