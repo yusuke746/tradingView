@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|  fxChartAI_ZmqMuscle_LRR.mq5                                    |
-//|  XAUUSD 5M Execution Engine - LRR Edition v3.2                  |
+//|  XAUUSD 5M Execution Engine - LRR Edition v3.21                 |
 //|                                                                  |
 //|  ■ アーキテクチャ:                                               |
 //|    Python(Brain) <--ZMQ--> MT5(Muscle)                          |
@@ -15,8 +15,8 @@
 //|    [7] LRR日次管理 (エントリー3回/日・連敗停止・ニュースフィルタ) |
 //|    [8] AI trail_mode/tp_mode (v26 HOLD/CLOSEから受信してチューニング) |
 //+------------------------------------------------------------------+
-#property version   "3.20"
-#property description "ZmqMuscle LRR v3.2 - trail_mode/tp_mode AI tuning support"
+#property version   "3.22"
+#property description "ZmqMuscle LRR v3.22 - grade B (50% lot) + dynamic TTL + Lorentzian retrigger"
 
 #include <Zmq/Zmq.mqh>
 #include <Trade/Trade.mqh>
@@ -1179,10 +1179,17 @@ void ProcessZmqMsg(CJAVal &obj)
    double aiConf      =obj["ai_confidence"].ToDbl();
    string aiReason    =obj["ai_reason"].ToStr();
    string sigReason   =obj["reason"].ToStr();
+   string setupGrade  =obj["setup_grade"].ToStr();   // "A+", "A", "REJECT", or "" (legacy)
 
    StringToUpper(action);
    if(action!="BUY"&&action!="SELL"){
       Print("[LRR][GATE] BLOCKED: invalid action='",action,"'");return;}
+
+   // --- setup_grade ゲート (A+/A only; REJECT = block; "" = legacy pass-through) ---
+   if(setupGrade=="REJECT"){
+      Print("[LRR][GATE] BLOCKED: setup_grade=REJECT. ai_reason=",aiReason);return;}
+   if(setupGrade!="" && setupGrade!="A+" && setupGrade!="A" && setupGrade!="B"){
+      Print("[LRR][GATE] BLOCKED: setup_grade unknown='",setupGrade,"'. Require A+/A/B.");return;}
 
    // --- セッションランク ---
    ENUM_SESSION_RANK sessionRank=GetCurrentSessionRank();
@@ -1212,6 +1219,17 @@ void ProcessZmqMsg(CJAVal &obj)
       double adj=NormalizeVolume(lot*MathMax(0.5,MathMin(2.0,pyMult)));
       Print("[LRR][LOT] PyMult=",DoubleToString(pyMult,2)," ",DoubleToString(lot,2),"->",DoubleToString(adj,2));
       lot=adj;
+   }
+   // setup_grade lot adjustment: A+ = full lot; A = 75%; B = 50%; "" = legacy pass-through
+   if(setupGrade=="A"){
+      double adjGradeA=NormalizeVolume(lot*0.75);
+      Print("[LRR][GRADE] A grade lot adj: ",DoubleToString(lot,2),"->",DoubleToString(adjGradeA,2));
+      lot=adjGradeA;
+   }
+   if(setupGrade=="B"){
+      double adjGradeB=NormalizeVolume(lot*0.50);
+      Print("[LRR][GRADE] B grade lot adj: ",DoubleToString(lot,2),"->",DoubleToString(adjGradeB,2));
+      lot=adjGradeB;
    }
    lot=MathMin(lot,InpMaxAllowedLot);
    if(lot<=0.0){Print("[LRR][GATE] BLOCKED: lot<=0.");return;}
@@ -1244,6 +1262,7 @@ void ProcessZmqMsg(CJAVal &obj)
       string regStr=(volRegime==VOL_HIGH)?"HIGH":(volRegime==VOL_LOW)?"LOW":"NORMAL";
       string sessStr=(sessionRank==SESSION_S)?"S":(sessionRank==SESSION_A)?"A":"B";
       Print("[LRR][ORDER] OK action=",action,
+            " grade=",setupGrade,
             " lot=",DoubleToString(lot,2),
             " price=",DoubleToString(price,_Digits),
             " sl=",DoubleToString(sl,_Digits),

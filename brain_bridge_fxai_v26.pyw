@@ -370,6 +370,38 @@ ATR_FLOOR_MULT = float(os.getenv("ATR_FLOOR_MULT", "0.7"))
 ENTRY_PROCESSING_LOCK_MAX_SEC = float(os.getenv("ENTRY_PROCESSING_LOCK_MAX_SEC", "20"))
 ENTRY_TRIGGER_DEDUPE_TTL_SEC = float(os.getenv("ENTRY_TRIGGER_DEDUPE_TTL_SEC", "120"))
 
+# --- LiquiditySweep primary trigger ---
+# TTL for how long a Sweep signal is "live" and can gate a ZonesTouch secondary trigger.
+# SWEEP_TTL_SEC is kept for backward compat; dynamic TTL uses BASE/ATR_MULT/MIN/MAX below.
+SWEEP_TTL_SEC = float(os.getenv("SWEEP_TTL_SEC", "120"))
+# Source / event strings for LiquiditySweep alert webhook
+SWEEP_TRIGGER_SOURCES: set = {"liquiditysweep", "liquidity_sweep", "sweep"}
+SWEEP_TRIGGER_EVENTS: set = {"liquidity_sweep", "sweep"}
+
+# --- ATR-based dynamic sweep TTL (Priority 2: frequency enhancement) ---
+# dynamic_ttl = clamp(BASE + (ATR_MA / ATR_CURRENT) * ATR_MULT, MIN, MAX)
+# Low vol (ATR/MA < 0.8) → ratio inverse > 1 → longer TTL; High vol → shorter TTL.
+SWEEP_TTL_BASE_SEC  = float(os.getenv("SWEEP_TTL_BASE_SEC",  "120"))
+SWEEP_TTL_ATR_MULT  = float(os.getenv("SWEEP_TTL_ATR_MULT",   "60"))
+SWEEP_TTL_MIN_SEC   = float(os.getenv("SWEEP_TTL_MIN_SEC",    "60"))
+SWEEP_TTL_MAX_SEC   = float(os.getenv("SWEEP_TTL_MAX_SEC",   "360"))
+
+# --- Sweep/Zone time-sync constraint window (Priority 1) ---
+# If Sweep and Zone timestamps are > this many seconds apart, A+ → A downgrade (not REJECT).
+SWEEP_ZONE_SYNC_WINDOW_SEC = float(os.getenv("SWEEP_ZONE_SYNC_WINDOW_SEC", "90"))
+
+# --- Extended TTL grades (Priority 3) ---
+# When enabled: grade A = TTL×2.5, grade B = TTL×5.0; grade B uses 50% lot in LRR.
+ALLOW_EXTENDED_SWEEP_TTL = _env_bool("ALLOW_EXTENDED_SWEEP_TTL", "1")
+
+# --- Lorentzian re-trigger when Sweep in cache (Priority 4) ---
+# When enabled: legacy Lorentzian entry_trigger can fire an entry if a recent Sweep exists.
+ENABLE_LORENTZIAN_RETRIGGER = _env_bool("ENABLE_LORENTZIAN_RETRIGGER", "1")
+
+# --- ZonesTouch same-zone dedupe window (Priority 5) ---
+# Zone touches from the same zone (same price level) within this window share a dedupe key.
+ZONE_DEDUPE_SEC = float(os.getenv("ZONE_DEDUPE_SEC", "300"))
+
 # --- Price drift safety (prompt-side by default) ---
 # Prevent entering far away from the trigger price (avoid chasing highs/lows).
 # Units are *points* (MT5 symbol_info.point based), consistent with spread_points.
@@ -468,6 +500,18 @@ _pending_entry_by_symbol: Dict[str, Dict[str, Any]] = {}
 _entry_agg_lock = Lock()
 _entry_agg_by_symbol: Dict[str, Dict[str, Any]] = {}
 _entry_agg_worker_running_by_symbol: Dict[str, bool] = {}
+
+# --- LiquiditySweep TTL cache ---
+# Tracks the most recent Sweep event per (symbol, side) so ZonesTouch can gate on it.
+# Structure: { symbol: { "buy": {"ts": float}, "sell": {"ts": float} } }
+_sweep_cache_lock = Lock()
+_sweep_cache_by_symbol: Dict[str, Dict[str, Any]] = {}
+
+# --- ZonesTouch TTL cache (Priority 1 sync window + Priority 5 dedupe) ---
+# Tracks the most recent ZonesTouch event per (symbol, side) for sync-window checks.
+# Structure: { symbol: { "buy": {"ts": float, "price": float}, "sell": {...} } }
+_zone_touch_cache_lock = Lock()
+_zone_touch_cache_by_symbol: Dict[str, Dict[str, Any]] = {}
 
 
 def _is_entry_agg_pending(symbol: str) -> bool:
@@ -615,7 +659,7 @@ def _schedule_deferred_entry(symbol: str, normalized_trigger: dict, now: float) 
 
 
 def _entry_trigger_dedupe_key(symbol: str, action: str, trigger: Optional[dict]) -> str:
-    """Build a stable key for a Lorentzian trigger to avoid duplicate order placement."""
+    """Build a stable key for a trigger to avoid duplicate order placement."""
     trig = trigger or {}
     src = (trig.get("source") or "")
     evt = (trig.get("event") or "")
@@ -627,8 +671,177 @@ def _entry_trigger_dedupe_key(symbol: str, action: str, trigger: Optional[dict])
     except Exception:
         st = 0.0
     price = trig.get("price")
+    # Priority 5: Zone-specific dedupe – use price level + time bucket to prevent
+    # same-zone re-entry spam within ZONE_DEDUPE_SEC window.
+    evt_lower = str(evt).strip().lower()
+    if evt_lower in {"zone_retrace_touch", "zone_touch", "zones_touch", "zone"}:
+        zone_lvl = trig.get("zone_level") or trig.get("level") or price or "0"
+        try:
+            bucket_size = max(float(ZONE_DEDUPE_SEC), 1.0)
+            ts_for_bucket = float(st_raw) if st_raw is not None else time.time()
+            zone_bucket = int(ts_for_bucket // bucket_size)
+        except Exception:
+            zone_bucket = 0
+        return f"ZONE:{symbol}:{action}:{side}:{zone_lvl}:{zone_bucket}"
     # Use 3 decimals to make it robust to float noise but still precise enough.
-    return f"LZTRIG:{symbol}:{action}:{side}:{tf}:{src}:{evt}:{st:.3f}:{price}"
+    return f"TRIG:{symbol}:{action}:{side}:{tf}:{src}:{evt}:{st:.3f}:{price}"
+
+
+# ---------------------------------------------------------------------------
+# LiquiditySweep TTL cache helpers
+# ---------------------------------------------------------------------------
+
+def _update_sweep_cache(symbol: str, side: str, ts: float) -> None:
+    """Record a fresh LiquiditySweep for (symbol, side)."""
+    side_norm = str(side).strip().lower()
+    if side_norm not in {"buy", "sell"}:
+        return
+    with _sweep_cache_lock:
+        sym_map = _sweep_cache_by_symbol.setdefault(symbol, {})
+        sym_map[side_norm] = {"ts": ts}
+
+
+def _get_sweep_entry_raw(symbol: str, side: str) -> Optional[Dict[str, Any]]:
+    """Return raw sweep cache entry without TTL check (None if not present)."""
+    side_norm = str(side).strip().lower()
+    with _sweep_cache_lock:
+        entry = (_sweep_cache_by_symbol.get(symbol) or {}).get(side_norm)
+    return entry if isinstance(entry, dict) else None
+
+
+def _compute_dynamic_sweep_ttl(market: Optional[dict]) -> float:
+    """
+    Priority 2: ATR-based dynamic sweep TTL.
+    dynamic_ttl = clamp(BASE + (ATR_MA / ATR_CURRENT) * ATR_MULT, MIN, MAX)
+    Low vol (ATR < ATR_MA) → inverse ratio > 1 → longer TTL;
+    High vol (ATR > ATR_MA) → shorter TTL.
+    Falls back to SWEEP_TTL_BASE_SEC when market data is unavailable.
+    """
+    try:
+        mkt = market or {}
+        atr_curr = float(mkt.get("atr") or 0.0)
+        atr_ma   = float(mkt.get("atr_avg_24h") or 0.0)
+        if atr_curr > 0 and atr_ma > 0:
+            ratio = atr_curr / atr_ma
+            # Inverse ratio: low vol (ratio<1) → 1/ratio > 1 → longer TTL
+            ttl = SWEEP_TTL_BASE_SEC + (1.0 / max(ratio, 0.1)) * SWEEP_TTL_ATR_MULT
+        else:
+            ttl = SWEEP_TTL_BASE_SEC
+    except Exception:
+        ttl = SWEEP_TTL_BASE_SEC
+    return max(SWEEP_TTL_MIN_SEC, min(float(ttl), SWEEP_TTL_MAX_SEC))
+
+
+def _get_recent_sweep(symbol: str, side: str, now: float,
+                      market: Optional[dict] = None,
+                      ttl_multiplier: float = 1.0) -> Optional[Dict[str, Any]]:
+    """Return sweep cache entry if within dynamic_ttl × ttl_multiplier, else None."""
+    entry = _get_sweep_entry_raw(symbol, side)
+    if entry is None:
+        return None
+    age = now - float(entry.get("ts") or 0.0)
+    effective_ttl = _compute_dynamic_sweep_ttl(market) * max(ttl_multiplier, 0.01)
+    if age < 0 or age > effective_ttl:
+        return None
+    return entry
+
+
+def _update_zone_touch_cache(symbol: str, side: str, ts: float, price: float) -> None:
+    """Priority 5: Record most recent ZonesTouch for (symbol, side) incl. price for sync checks."""
+    side_norm = str(side).strip().lower()
+    if side_norm not in {"buy", "sell"}:
+        return
+    with _zone_touch_cache_lock:
+        sym_map = _zone_touch_cache_by_symbol.setdefault(symbol, {})
+        sym_map[side_norm] = {"ts": ts, "price": price}
+
+
+def _get_recent_zone_touch(symbol: str, side: str, now: float, ttl: float) -> Optional[Dict[str, Any]]:
+    """Return zone touch cache entry if within ttl seconds, else None."""
+    side_norm = str(side).strip().lower()
+    with _zone_touch_cache_lock:
+        entry = (_zone_touch_cache_by_symbol.get(symbol) or {}).get(side_norm)
+    if not isinstance(entry, dict):
+        return None
+    age = now - float(entry.get("ts") or 0.0)
+    if age < 0 or age > ttl:
+        return None
+    return entry
+
+
+def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market: dict) -> str:
+    """
+    Priority 1-3: Grade the current setup.
+      A+  - Sweep (base TTL) + ZonesTouch recent + sync_ok + (FVG or MTF aligned)
+      A   - Sweep (base TTL) + ZonesTouch [sync failed or no FVG/MTF]
+            OR Sweep (ext TTL×2.5) + ZonesTouch + sync_ok [ALLOW_EXTENDED_SWEEP_TTL]
+            OR ZonesTouch + FVG + MTF aligned (sweep-less frequency fallback)
+      B   - Sweep (ext TTL×5.0) + ZonesTouch [ALLOW_EXTENDED_SWEEP_TTL]
+      REJECT - otherwise
+
+    Sweep/Zone time-sync (Priority 1): if Sweep and Zone timestamps differ by more than
+    SWEEP_ZONE_SYNC_WINDOW_SEC → downgrade A+ → A (NOT rejected).
+    """
+    side_norm    = str(side).strip().lower()
+    base_ttl     = _compute_dynamic_sweep_ttl(market)
+    ext_mult_a   = 2.5
+    ext_mult_b   = 5.0
+
+    sweep_entry  = _get_sweep_entry_raw(symbol, side_norm)
+    sweep_ts     = float((sweep_entry or {}).get("ts") or 0.0)
+    sweep_age    = (now - sweep_ts) if sweep_entry else float("inf")
+    has_sweep_base = (sweep_entry is not None) and (0.0 <= sweep_age <= base_ttl)
+
+    has_sweep_ext_a = (
+        ALLOW_EXTENDED_SWEEP_TTL
+        and sweep_entry is not None
+        and base_ttl < sweep_age <= base_ttl * ext_mult_a
+    )
+    has_sweep_ext_b = (
+        ALLOW_EXTENDED_SWEEP_TTL
+        and sweep_entry is not None
+        and 0.0 <= sweep_age <= base_ttl * ext_mult_b
+    )
+
+    zones_same  = int(stats.get("zones_touch_same") or 0)
+    zone_entry  = _get_recent_zone_touch(symbol, side_norm, now, base_ttl * ext_mult_b)
+    has_zone    = (zones_same > 0) or (zone_entry is not None)
+
+    fvg_same    = int(stats.get("fvg_touch_same") or 0)
+    has_fvg     = fvg_same > 0
+
+    bid         = float(market.get("bid") or 0.0)
+    m15_ma      = float(market.get("m15_ma") or 0.0)
+    action_upper = "BUY" if side_norm == "buy" else "SELL"
+    mtf_aligned = (action_upper == "BUY" and bid > m15_ma) or (action_upper == "SELL" and bid < m15_ma)
+
+    # --- Sweep/Zone time-sync check (Priority 1) ---
+    sync_ok = True
+    if has_sweep_base and zone_entry is not None:
+        zone_ts_val = float(zone_entry.get("ts") or 0.0)
+        if abs(sweep_ts - zone_ts_val) > SWEEP_ZONE_SYNC_WINDOW_SEC:
+            sync_ok = False  # timestamps too far apart → A+ → A (not REJECT)
+
+    # --- A+ grade ---
+    if has_sweep_base and has_zone and sync_ok and (has_fvg or mtf_aligned):
+        return "A+"
+
+    # --- A grade (3 paths to increase frequency) ---
+    # Path 1: sweep in base TTL + zone (sync failed or no FVG/MTF)
+    if has_sweep_base and has_zone:
+        return "A"
+    # Path 2: sweep in extended TTL×2.5 + zone + sync ok (ALLOW_EXTENDED_SWEEP_TTL)
+    if has_sweep_ext_a and has_zone and sync_ok:
+        return "A"
+    # Path 3: sweep-less fallback – zone + FVG + MTF (original non-sweep A path)
+    if has_zone and has_fvg and mtf_aligned:
+        return "A"
+
+    # --- B grade (extended TTL×5.0 sweep + any zone) ---
+    if has_sweep_ext_b and has_zone:
+        return "B"
+
+    return "REJECT"
 
 
 def _prune_processed_entry_triggers_locked(now: float) -> None:
@@ -1614,9 +1827,7 @@ def _should_trigger_delayed_reeval(incoming: dict, pending_trigger: dict) -> boo
     if src in {"FVG", "LuxAlgo_FVG"} and (evt == "fvg_touch" or "touch" in evt):
         return bool(is_confirmed or is_strong)
 
-    # Trend filter evidence: only when confirmed (avoid intrabar churn).
-    if src == "OSGFC" or sig_type == "trend_filter":
-        return bool(is_confirmed)
+    # OSGFC removed: was trend_filter context only, no longer a supported indicator.
 
     return False
 
@@ -2577,8 +2788,6 @@ def _normalize_signal_fields(signal: dict) -> dict:
             s["source"] = "FVG"
         elif src_lower in {"zonesdetector", "zones"}:
             s["source"] = "Zones"
-        elif src_lower in {"osgfc"}:
-            s["source"] = "OSGFC"
         else:
             s["source"] = src
 
@@ -4342,15 +4551,6 @@ def _build_entry_filter_prompt(
     confirm_n = int(stats.get("confirm_signals") or 0)
     opp_n = int(stats.get("opp_signals") or 0)
 
-    osgfc_side = (stats.get("osgfc_latest_side") or "").lower()
-    osgfc_align = (
-        "UNKNOWN"
-        if not osgfc_side
-        else "ALIGNED"
-        if ((action == "BUY" and osgfc_side == "buy") or (action == "SELL" and osgfc_side == "sell"))
-        else "MISALIGNED"
-    )
-
     fvg_same = int(stats.get("fvg_touch_same") or 0)
     fvg_opp = int(stats.get("fvg_touch_opp") or 0)
     zones_same = int(stats.get("zones_touch_same") or 0)
@@ -4461,8 +4661,7 @@ def _build_entry_filter_prompt(
         fvg_opp=int(fvg_opp),
         zones_same=int(zones_same),
         zones_opp=int(zones_opp),
-        osgfc_side=str(osgfc_side or ""),
-        osgfc_align=str(osgfc_align or ""),
+        sweep_grade=_compute_setup_grade(symbol, action.lower(), float(now), stats, market),
         bid=float(market.get("bid") or 0.0),
         ask=float(market.get("ask") or 0.0),
         m15_sma20=float(market.get("m15_ma") or 0.0),
@@ -4781,9 +4980,10 @@ def _attempt_entry_from_lorentzian(
 ) -> tuple[str, int]:
     """New spec entry flow.
 
-    - Triggered ONLY by Lorentzian entry_trigger.
-    - Q-Trend is context-only and read from in-memory cache.
-    - Zones/FVG context read from signals_cache.
+    - PRIMARY trigger:   LiquiditySweep (source=LiquiditySweep / event=liquidity_sweep)
+    - SECONDARY trigger: ZonesTouch gated by recent Sweep in TTL cache
+    - Q-Trend / Lorentzian / FVG: context-only, read from in-memory cache.
+    - setup_grade (A+/A/REJECT) injected into ORDER payload for downstream EA use.
     """
     trig_side = (normalized_trigger.get("side") or "").strip().lower()
     action = "BUY" if trig_side == "buy" else "SELL" if trig_side == "sell" else ""
@@ -5327,13 +5527,15 @@ def _attempt_entry_from_lorentzian(
         _set_status(last_result="Blocked by heartbeat", last_result_at=time.time())
         return _finish("Blocked by heartbeat", 503, "blocked_heartbeat", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
 
-    reason = ai_reason or "lorentzian_entry"
+    reason = ai_reason or "sweep_entry"
     # [LRR COMPAT] sweep_extreme: structure-based SL anchor for LRR.mq5.
     # BUY → 20-bar swing low; SELL → 20-bar swing high.
     # When >0, LRR.mq5 uses max(structure_dist, atr_noise_floor) for SL → tighter, more precise.
     _sweep_extreme = float(
         market.get("swing_low_20m5" if str(action).upper() == "BUY" else "swing_high_20m5") or 0.0
     )
+    # setup_grade: A+ / A / REJECT (computed from Sweep cache + context stats).
+    _setup_grade = _compute_setup_grade(symbol, trig_side, time.time(), stats, market)
     payload = {
         "type": "ORDER",
         "action": action,
@@ -5344,6 +5546,7 @@ def _attempt_entry_from_lorentzian(
         "reason": reason,
         "ai_confidence": ai_score,
         "ai_reason": ai_reason,
+        "setup_grade": _setup_grade,
     }
 
     # Acquire processing lock right before order placement to prevent duplicate orders.
@@ -5600,17 +5803,75 @@ def webhook():
         if _is_qtrend_source(str(normalized.get("source") or "")):
             _update_qtrend_context_from_signal(normalized)
 
-    # Entry trigger: Lorentzian starts the AI decision flow, but we may still run
-    # management first if positions are open.
-    if sig_type == "entry_trigger":
-        src = (normalized.get("source") or "").strip()
-        if src == "Lorentzian":
+    # ---------------------------------------------------------------------------
+    # ENTRY ROUTING (new architecture)
+    #
+    # PRIMARY:   LiquiditySweep  → sole autonomous entry trigger
+    # SECONDARY: ZonesTouch      → entry ONLY when a recent Sweep is in TTL cache
+    # CONTEXT:   Lorentzian / Q-Trend / FVG / Zones-structure / OSGFC
+    #            → update cache only, never trigger entry independently
+    # ---------------------------------------------------------------------------
+    src_in  = (normalized.get("source") or "").strip()
+    evt_in  = (normalized.get("event")  or "").strip().lower()
+    src_lwr = src_in.lower().replace("-", "_").replace(" ", "_")
+    sig_side_norm = (normalized.get("side") or "").strip().lower()
+
+    is_sweep_signal = (src_lwr in SWEEP_TRIGGER_SOURCES) or (evt_in in SWEEP_TRIGGER_EVENTS)
+    is_zone_touch   = (evt_in in {"zone_retrace_touch", "zone_touch"})
+
+    if is_sweep_signal:
+        # PRIMARY TRIGGER – update cache and fire entry.
+        if sig_side_norm in {"buy", "sell"}:
+            _update_sweep_cache(symbol, sig_side_norm, float(now))
+        pending_entry_trigger = True
+        normalized_trigger    = dict(normalized)
+        print(f"[FXAI][SWEEP] Primary trigger received: symbol={symbol} side={sig_side_norm}")
+
+    elif is_zone_touch:
+        # SECONDARY TRIGGER – gate on recent Sweep (extended TTL allowed for grade B).
+        # Priority 1+5: record zone touch in cache for sync-window and dedupe tracking.
+        if sig_side_norm in {"buy", "sell"}:
+            _update_zone_touch_cache(
+                symbol, sig_side_norm, float(now),
+                float(normalized.get("price") or normalized.get("level") or 0.0),
+            )
+        # Gate check: sweep must exist within max extended window (fine-grained grade assigned later).
+        max_gate_ttl = SWEEP_TTL_MAX_SEC * (5.0 if ALLOW_EXTENDED_SWEEP_TTL else 1.0)
+        sweep_raw    = _get_sweep_entry_raw(symbol, sig_side_norm) if sig_side_norm in {"buy", "sell"} else None
+        sweep_in_gate = (
+            sweep_raw is not None
+            and 0.0 <= (float(now) - float(sweep_raw.get("ts") or 0.0)) <= max_gate_ttl
+        )
+        if sweep_in_gate:
             pending_entry_trigger = True
-            normalized_trigger = dict(normalized)
+            normalized_trigger    = dict(normalized)
+            print(f"[FXAI][ZONE] Secondary trigger gated by Sweep: symbol={symbol} side={sig_side_norm}")
         else:
-            # Unknown entry_trigger: store for audit only.
-            _set_status(last_result="Stored (unknown entry_trigger)", last_result_at=time.time())
-            return "Stored", 200
+            # No Sweep in any window → store as context only, do not enter.
+            _set_status(last_result="Zone touch: no recent Sweep (context only)", last_result_at=time.time())
+            print(f"[FXAI][GATE] ZonesTouch blocked – no recent LiquiditySweep for {symbol}/{sig_side_norm}")
+            # Fall through so position management can still run if positions are open.
+
+    elif sig_type == "entry_trigger":
+        # Legacy Lorentzian entry_trigger: demoted to context-only in current architecture.
+        # Priority 4: ENABLE_LORENTZIAN_RETRIGGER – if a Sweep is in the (extended) cache,
+        # allow Lorentzian to re-trigger an entry as if it were a secondary signal.
+        if ENABLE_LORENTZIAN_RETRIGGER and sig_side_norm in {"buy", "sell"}:
+            max_retrig_ttl = SWEEP_TTL_MAX_SEC * (5.0 if ALLOW_EXTENDED_SWEEP_TTL else 1.0)
+            sweep_raw = _get_sweep_entry_raw(symbol, sig_side_norm)
+            if (sweep_raw is not None
+                    and 0.0 <= (float(now) - float(sweep_raw.get("ts") or 0.0)) <= max_retrig_ttl):
+                pending_entry_trigger = True
+                normalized_trigger    = dict(normalized)
+                print(f"[FXAI][LR-RETRIG] Lorentzian re-trigger via Sweep cache: "
+                      f"symbol={symbol} side={sig_side_norm}")
+            else:
+                _set_status(last_result="Lorentzian (context only, no Sweep in cache)", last_result_at=time.time())
+                print(f"[FXAI][CTX] Lorentzian entry_trigger from {src_in!r}: no Sweep in cache, context only")
+        else:
+            _set_status(last_result="Lorentzian (context only, not a trigger)", last_result_at=time.time())
+            print(f"[FXAI][CTX] Legacy entry_trigger from {src_in!r} stored as context (not a trigger in new arch)")
+        # Fall through so position management can still run if positions are open.
 
     # --- HEARTBEAT STALE POLICY ---
     # Under freeze mode: do not send any management (HOLD/CLOSE) nor entries while heartbeat is stale.
@@ -5635,7 +5896,7 @@ def webhook():
 
         # After management decision (unless CLOSED), allow add-on entries by falling through to ENTRY section.
 
-    # --- ENTRY (Lorentzian) ---
+    # --- ENTRY (LiquiditySweep primary / ZonesTouch gated secondary) ---
     if pending_entry_trigger and normalized_trigger:
         # Entry race guard: if an entry placement is ongoing, do not start another evaluation.
         if _is_entry_processing_locked(symbol, now=now):
