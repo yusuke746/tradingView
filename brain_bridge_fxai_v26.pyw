@@ -341,6 +341,21 @@ SPREAD_MAX_ATR_RATIO = float(os.getenv("SPREAD_MAX_ATR_RATIO", "0.10"))
 # skip hard block and let AI score decide. Set <=0 to disable override.
 SPREAD_VS_ATR_SOFT_MIN = float(os.getenv("SPREAD_VS_ATR_SOFT_MIN", "10.0"))
 
+# --- LRR Hard Guards (fxai_lrr_brain.py から移植) ---
+# AI の呼び出し前に「絶対に見込みがない」相場を機械的に弾く 3 条件。
+#   LRR_EV_HARD_MIN     : ATR/spread がこの値未満は EV ゼロと判断して即拒絶。
+#                         lrr_brain では 10.0。v26 の既存 ENTRY_MIN_ATR_TO_SPREAD(2.5)
+#                         より大幅に厳格。0 で無効化。
+#   LRR_DIST_HARD_REJECT: M15 SMA20 乖離が ATR の N 倍超は伸び切り → 即拒絶。
+#                         0 で無効化。
+#   LRR_VOL_PANIC_RATIO : ATR_now / ATR_24h がこの値以上はパニック相場 → 即拒絶。
+#                         0 で無効化。
+#   LRR_SPREAD_MED_LR   : Robbins-Monro スプレッド中央値の学習率。
+LRR_EV_HARD_MIN      = float(os.getenv("LRR_EV_HARD_MIN",      "10.0"))
+LRR_DIST_HARD_REJECT = float(os.getenv("LRR_DIST_HARD_REJECT", "5.0"))
+LRR_VOL_PANIC_RATIO  = float(os.getenv("LRR_VOL_PANIC_RATIO",  "2.0"))
+LRR_SPREAD_MED_LR    = float(os.getenv("LRR_SPREAD_MED_LR",    "0.03"))
+
 # Dynamic drift guard (ATR-relative). Set <= 0 to disable.
 DRIFT_LIMIT_ATR_MULT = float(os.getenv("DRIFT_LIMIT_ATR_MULT", "0.15"))
 DRIFT_LIMIT_MIN_POINTS = float(os.getenv("DRIFT_LIMIT_MIN_POINTS", "10"))
@@ -403,6 +418,10 @@ _cache_flush_thread_started = False
 
 _spread_history_lock = Lock()
 _spread_history_by_symbol: Dict[str, List[tuple]] = {}
+
+# Robbins-Monro O(1) rolling spread median (from fxai_lrr_brain)
+_spread_med_lock = Lock()
+_spread_med_by_symbol: Dict[str, float] = {}
 
 _auto_tune_lock = Lock()
 _auto_tune_last_ts = 0.0
@@ -3743,6 +3762,8 @@ def get_mt5_market_data(symbol: str):
     # ATR: 旧EA(iATR)に寄せて True Range で近似
     rates_m5 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 60)
     atr = 0.0
+    swing_low_20m5  = 0.0   # [LRR COMPAT] recent 20-bar swing low  (→ BUY sweep_extreme)
+    swing_high_20m5 = 0.0   # [LRR COMPAT] recent 20-bar swing high (→ SELL sweep_extreme)
     if rates_m5 is not None and len(rates_m5) >= 2:
         period = 14
         highs = [_rate_field(r, "high", 0.0) for r in rates_m5]
@@ -3759,6 +3780,16 @@ def get_mt5_market_data(symbol: str):
                 trs.append(tr)
         if trs:
             atr = sum(trs[:period]) / max(1, min(period, len(trs)))
+        # [LRR COMPAT] Swing extreme: last 20 CLOSED M5 bars (skip bar[0] = still forming)
+        # BUY → liquidity swept below → swing LOW acts as structure SL anchor
+        # SELL → liquidity swept above → swing HIGH acts as structure SL anchor
+        if len(rates_m5) >= 22:
+            _lows20f  = [v for v in [_rate_field(r, "low",  0.0) for r in rates_m5[1:21]] if v > 0.0]
+            _highs20f = [v for v in [_rate_field(r, "high", 0.0) for r in rates_m5[1:21]] if v > 0.0]
+            if _lows20f:
+                swing_low_20m5  = min(_lows20f)
+            if _highs20f:
+                swing_high_20m5 = max(_highs20f)
 
     # 24h average ATR: simplified using recent longer window
     # Full 288-bar rolling ATR is too expensive; use a 60-bar approximation
@@ -3843,7 +3874,25 @@ def get_mt5_market_data(symbol: str):
         "atr_to_spread": atr_to_spread,
         "spread": spread,
         "spread_avg_24h": spread_avg_24h,
+        "swing_low_20m5":  swing_low_20m5,
+        "swing_high_20m5": swing_high_20m5,
     }
+
+
+def _update_spread_med(symbol: str, spread: float) -> float:
+    """Robbins-Monro O(1) rolling median update.  更新式: med += lr * sign(x - med)
+    スパイク耐性があり O(n) ソート不要。lrr_brain §7 から移植。
+    Returns: new median estimate (points)
+    """
+    if spread <= 0:
+        return 0.0
+    sym = (symbol or "").strip().upper()
+    with _spread_med_lock:
+        med = _spread_med_by_symbol.get(sym, spread)
+        diff = spread - med
+        med += LRR_SPREAD_MED_LR * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+        _spread_med_by_symbol[sym] = med
+    return med
 
 
 def get_mt5_position_state(symbol: str):
@@ -4973,6 +5022,62 @@ def _attempt_entry_from_lorentzian(
             )
             return _finish("Blocked (ATR too small vs spread)", 200, "blocked_atr_to_spread", market=market)
 
+    # -------------------------------------------------------------------------
+    # LRR Hard Guards (fxai_lrr_brain §31 から移植 / AI 呼び出し前に機械的拒絶)
+    # -------------------------------------------------------------------------
+
+    # SpreadMed を更新し、spike 倍率チェックにも使う
+    spread_med = _update_spread_med(symbol, spread_points)
+
+    # [LRR-1] EV Hard Reject: ATR/spread が LRR_EV_HARD_MIN 未満 → コスト対効果ゼロ
+    if LRR_EV_HARD_MIN > 0 and atr_to_spread_v is not None and atr_to_spread_v < LRR_EV_HARD_MIN:
+        _set_status(
+            last_result="Blocked (LRR: EV hard reject)",
+            last_result_at=time.time(),
+            last_entry_guard={"lrr_ev": atr_to_spread_v, "min": LRR_EV_HARD_MIN},
+        )
+        print(f"[LRR_GUARD] EV hard reject: atr/spread={atr_to_spread_v:.1f} < {LRR_EV_HARD_MIN}")
+        return _finish("Blocked (LRR: EV hard reject)", 200, "lrr_blocked_ev", market=market)
+
+    # SpreadMed×2.5 スパイク検知 (Robbins-Monro 中央値の 2.5 倍超 = 異常ワイド)
+    if spread_med > 0 and spread_points > spread_med * 2.5:
+        _set_status(
+            last_result="Blocked (LRR: spread spike vs median)",
+            last_result_at=time.time(),
+            last_entry_guard={"spread": spread_points, "spread_med": round(spread_med, 2), "ratio": round(spread_points / spread_med, 2)},
+        )
+        print(f"[LRR_GUARD] Spread spike: {spread_points:.1f} > med {spread_med:.1f}×2.5")
+        return _finish("Blocked (LRR: spread spike)", 200, "lrr_blocked_spread_spike", market=market)
+
+    # [LRR-2] Distance Hard Reject: M15 SMA20 乖離 / ATR >= LRR_DIST_HARD_REJECT
+    if LRR_DIST_HARD_REJECT > 0:
+        _sma_ctx = _build_sma_context(market)
+        _dar = _sma_ctx.get("distance_atr_ratio")
+        if _dar is not None and _dar < 999.0 and _dar >= LRR_DIST_HARD_REJECT:
+            _set_status(
+                last_result="Blocked (LRR: distance overextended)",
+                last_result_at=time.time(),
+                last_entry_guard={"distance_atr_ratio": round(_dar, 2), "max": LRR_DIST_HARD_REJECT,
+                                  "relationship": _sma_ctx.get("relationship")},
+            )
+            print(f"[LRR_GUARD] Distance hard reject: d/atr={_dar:.2f} >= {LRR_DIST_HARD_REJECT}")
+            return _finish("Blocked (LRR: distance overextended)", 200, "lrr_blocked_dist", market=market)
+
+    # [LRR-3] Panic Vol Hard Reject: ATR_now / ATR_24h >= LRR_VOL_PANIC_RATIO
+    if LRR_VOL_PANIC_RATIO > 0:
+        _vol_ctx = _build_volatility_context(market)
+        _vr = _vol_ctx.get("volatility_ratio")
+        if _vr is not None and _vr >= LRR_VOL_PANIC_RATIO:
+            _set_status(
+                last_result="Blocked (LRR: panic volatility)",
+                last_result_at=time.time(),
+                last_entry_guard={"volatility_ratio": round(_vr, 2), "max": LRR_VOL_PANIC_RATIO},
+            )
+            print(f"[LRR_GUARD] Panic vol reject: vol_ratio={_vr:.2f} >= {LRR_VOL_PANIC_RATIO}")
+            return _finish("Blocked (LRR: panic volatility)", 200, "lrr_blocked_panic_vol", market=market)
+
+    # -------------------------------------------------------------------------
+
     if float(ENTRY_COOLDOWN_SEC or 0.0) > 0:
         with _entry_lock:
             last_sent = float(_last_order_sent_at_by_symbol.get(symbol, 0.0) or 0.0)
@@ -5223,11 +5328,18 @@ def _attempt_entry_from_lorentzian(
         return _finish("Blocked by heartbeat", 503, "blocked_heartbeat", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
 
     reason = ai_reason or "lorentzian_entry"
+    # [LRR COMPAT] sweep_extreme: structure-based SL anchor for LRR.mq5.
+    # BUY → 20-bar swing low; SELL → 20-bar swing high.
+    # When >0, LRR.mq5 uses max(structure_dist, atr_noise_floor) for SL → tighter, more precise.
+    _sweep_extreme = float(
+        market.get("swing_low_20m5" if str(action).upper() == "BUY" else "swing_high_20m5") or 0.0
+    )
     payload = {
         "type": "ORDER",
         "action": action,
         "symbol": symbol,
         "atr": float(market.get("atr") or 0.0),
+        "sweep_extreme": _sweep_extreme,
         "multiplier": final_multiplier,
         "reason": reason,
         "ai_confidence": ai_score,
