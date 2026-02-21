@@ -210,7 +210,7 @@ SIGNAL_INDEX_ENABLED = _env_bool("SIGNAL_INDEX_ENABLED", "0")
 SIGNAL_INDEX_BUCKET_SEC = int(os.getenv("SIGNAL_INDEX_BUCKET_SEC", "60"))
 
 # Position time extraction debug (temporarily ON for diagnostics)
-DEBUG_POSITION_TIME = _env_bool("DEBUG_POSITION_TIME", "1")
+DEBUG_POSITION_TIME = _env_bool("DEBUG_POSITION_TIME", "0")
 
 # Spread history (points) for stable average spread estimation
 SPREAD_HISTORY_WINDOW_SEC = int(os.getenv("SPREAD_HISTORY_WINDOW_SEC", "86400"))
@@ -720,7 +720,7 @@ def _compute_dynamic_sweep_ttl(market: Optional[dict]) -> float:
     try:
         mkt = market or {}
         atr_curr = float(mkt.get("atr") or 0.0)
-        atr_ma   = float(mkt.get("atr_avg_24h") or 0.0)
+        atr_ma   = float(mkt.get("atr_avg_5h") or 0.0)
         if atr_curr > 0 and atr_ma > 0:
             ratio = atr_curr / atr_ma
             # Inverse ratio: low vol (ratio<1) → 1/ratio > 1 → longer TTL
@@ -2181,10 +2181,6 @@ _last_close_attempt_at = 0.0
 
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
 def _compact_for_prompt(obj: Any, *, max_list_items: int, max_str_len: int, depth: int = 0, max_depth: int = 4) -> Any:
     """Optionally compact a JSON-serializable object for prompt size control.
 
@@ -2261,7 +2257,7 @@ def _drift_point_size(symbol: str, point: float) -> float:
 def _effective_atr_price(market: Dict[str, Any]) -> float:
     try:
         atr = float((market or {}).get("atr") or 0.0)
-        atr_avg = float((market or {}).get("atr_avg_24h") or 0.0)
+        atr_avg = float((market or {}).get("atr_avg_5h") or 0.0)
     except Exception:
         return 0.0
     if atr <= 0:
@@ -2544,11 +2540,11 @@ def _build_sma_context(market: Dict[str, Any]) -> Dict[str, Any]:
 
 def _build_volatility_context(market: Dict[str, Any]) -> Dict[str, Any]:
     cur_atr = float((market or {}).get("atr") or 0.0)
-    avg_atr = float((market or {}).get("atr_avg_24h") or 0.0)
+    avg_atr = float((market or {}).get("atr_avg_5h") or 0.0)
     ratio = (cur_atr / avg_atr) if (avg_atr > 0) else None
     return {
         "current_atr": float(cur_atr),
-        "average_atr_24h": float(avg_atr) if avg_atr > 0 else None,
+        "average_atr_5h": float(avg_atr) if avg_atr > 0 else None,
         "volatility_ratio": float(ratio) if ratio is not None else None,
     }
 
@@ -3954,6 +3950,14 @@ def get_mt5_market_data(symbol: str):
             sma1 = sum(closes[1:21]) / 20.0  # SMA(20) as of last closed bar
             sma3 = sum(closes[3:23]) / 20.0  # SMA(20) from 2 closed bars earlier
             delta = sma1 - sma3
+            # Threshold: 0.01% of price or minimum $0.01 (for XAUUSD ~$2600, thresh ≈ $0.026)
+            thresh = max(abs(sma1) * 1e-4, 0.01)
+            if delta > thresh:
+                m15_slope = "UP"
+            elif delta < -thresh:
+                m15_slope = "DOWN"
+            else:
+                m15_slope = "FLAT"
         elif len(closes) >= 22:
             # Fallback: still skip current bar, compare last closed vs 1 bar earlier.
             sma1 = sum(closes[1:21]) / 20.0
@@ -4000,9 +4004,9 @@ def get_mt5_market_data(symbol: str):
             if _highs20f:
                 swing_high_20m5 = max(_highs20f)
 
-    # 24h average ATR: simplified using recent longer window
+    # 5h average ATR: using 60-bar M5 window (60 bars × 5 min = 300 min ≈ 5 hours)
     # Full 288-bar rolling ATR is too expensive; use a 60-bar approximation
-    atr_avg_24h = 0.0
+    atr_avg_5h = 0.0
     rates_m5_60 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 62)
     if rates_m5_60 is not None and len(rates_m5_60) >= 15:
         highs_60 = [_rate_field(r, "high", 0.0) for r in rates_m5_60]
@@ -4018,7 +4022,7 @@ def get_mt5_market_data(symbol: str):
                 trs_60.append(tr)
         if len(trs_60) >= 14:
             # Simple average of TR over 14-period windows
-            atr_avg_24h = sum(trs_60[:min(60, len(trs_60))]) / max(1, min(60, len(trs_60)))
+            atr_avg_5h = sum(trs_60[:min(60, len(trs_60))]) / max(1, min(60, len(trs_60)))
 
     # If market data isn't available, reuse last known ATR for this symbol.
     if atr <= 0:
@@ -4076,7 +4080,7 @@ def get_mt5_market_data(symbol: str):
         "m15_ma": ma15,
         "m15_sma20_slope": m15_slope,
         "atr": atr,
-        "atr_avg_24h": atr_avg_24h,
+        "atr_avg_5h": atr_avg_5h,
         "point": point,
         "drift_point": drift_point,
         "atr_points": atr_points,
@@ -4175,8 +4179,12 @@ def _mt5_position_open_time_seconds(p: Any) -> float:
     return 0.0
 
 
-def get_current_broker_time(symbol: Optional[str] = None) -> float:
-    """Return current MT5 broker time as a UNIX timestamp (seconds)."""
+def get_current_broker_time(symbol: Optional[str] = None) -> Optional[float]:
+    """Return current MT5 broker time as a UNIX timestamp (seconds).
+
+    Returns None when the MT5 tick is unavailable.
+    Callers MUST handle None explicitly — UTC/datetime.now() fallback is forbidden.
+    """
     sym = (symbol or SYMBOL or "").strip().upper() or "GOLD"
     try:
         tick = mt5.symbol_info_tick(sym)
@@ -4185,9 +4193,8 @@ def get_current_broker_time(symbol: Optional[str] = None) -> float:
             return ts
     except Exception as e:
         print(f"[ERROR] get_current_broker_time failed for {sym}: {e}")
-    # Emergency fallback: UTC time (may reintroduce DST issues).
-    print(f"[WARN] Using UTC fallback for broker time (MT5 tick unavailable)")
-    return float(datetime.now(timezone.utc).timestamp())
+    print(f"[WARN] get_current_broker_time: MT5 tick unavailable for {sym} — returning None")
+    return None
 
 
 def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
@@ -4279,6 +4286,12 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
         max_holding = 0.0
         if DEBUG_POSITION_TIME:
             print(f"[WARN] get_mt5_positions_summary: No valid times for {len(positions)} positions")
+    elif now_ts_for_holding is None:
+        # Broker time unavailable — skip holding calculation, safe default = 0
+        oldest_open_time = float(oldest_open_time)
+        max_holding = 0.0
+        if DEBUG_POSITION_TIME:
+            print(f"[WARN] get_mt5_positions_summary: broker time unavailable, max_holding_sec=0")
     else:
         raw_holding = now_ts_for_holding - oldest_open_time
         # MT5サーバー時刻のズレ対応（小さなズレのみ補正、大きなズレは異常として扱う）
@@ -4326,17 +4339,24 @@ def get_mt5_positions_summary(symbol: str) -> Dict[str, Any]:
 
 def check_trading_hours(symbol: str) -> bool:
     """Return True if trading is allowed based on broker server time.
-    
+
     Guards:
-    - 23:50-23:59: Market closing (prevent new entries, consider closing positions)
+    - 23:55-23:59: Market closing (prevent new entries near rollover)
     - 00:00-00:30: Market opening (wait for stable spread)
+    - Broker time unavailable: deny (safe-side)
     """
     broker_now = get_current_broker_time(symbol)
+    if broker_now is None:
+        print(f"[Market Guard] Broker time unavailable for {symbol} — blocking entry (safe-side)")
+        return False
     dt = datetime.fromtimestamp(float(broker_now), tz=timezone.utc)
     h, m = dt.hour, dt.minute
-    
-    if (h == 23 and m >= 50) or (h == 0 and m <= 30):
-        print(f"[Market Guard] Server Time: {h:02d}:{m:02d} - Market Closing/Opening Logic")
+
+    if h == 23 and m >= 55:
+        print(f"[Market Guard] Server Time: {h:02d}:{m:02d} - Market Closing Logic")
+        return False
+    if h == 0 and m <= 30:
+        print(f"[Market Guard] Server Time: {h:02d}:{m:02d} - Market Opening Logic")
         return False
     return True
 

@@ -254,9 +254,6 @@ datetime g_panicUntil = 0;
 bool     g_newsBlockActive = false;
 datetime g_newsBlockUntil  = 0;
 
-// JSTオフセット: EET(GMT+2)+7=JST / 夏時間(GMT+3)は6に変更
-static const int JST_SERVER_OFFSET_HR = 7;
-
 // AI Trail/TP モード (v26 HOLD/CLOSE メッセージから更新)
 // 0=NORMAL, 1=WIDE, 2=TIGHT
 int      g_trailMode          = 0;
@@ -591,31 +588,32 @@ ENUM_VOL_REGIME GetVolRegime(double atrM5,double atrH1)
 }
 
 //==========================================================================
-//  セクション 11: セッションランク判定（JST時刻ベース）
+//  セクション 11: セッションランク判定（サーバー時刻（EET）ベース）
 //
-//  LRR Strategist定義:
-//    S級(×1.50): 22:20〜23:00 JST  (NYオープン)
-//    A級(×1.00): 17:00〜18:30 JST  (ロンドン) | 22:00〜22:19 JST
-//    B級(×0.70): 03:00〜03:59 JST  (アジア初動)
-//    無効(禁止) : 12:00〜16:59 JST  (DeadZone)
+//  LRR Strategist定義（サーバー時間 EET 固定値・夏冬共通）:
+//    S級(×1.50): 15:20〜16:00 EET  (NYオープン)
+//    A級(×1.00): 10:00〜11:30 EET  (ロンドン) | 15:00〜15:19 EET
+//    B級(×0.70): 20:00〜20:59 EET  (アジア初動)
+//    無効(禁止) : 05:00〜09:59 EET  (DeadZone)
 //
-//  MT5サーバーがEET(GMT+2)の場合: JST = server_time + 7h
-//  夏時間(GMT+3)の場合: JST_SERVER_OFFSET_HR = 6 に変更すること。
+//  ブローカーサーバー時間は夏冬で自動調整されるため、
+//  EET固定値で判定すれば夏冬どちらでも正確に動作する。
+//  （旧: JST基準 → JST_SERVER_OFFSET_HR による手動補正が必要だった）
 //==========================================================================
 
 ENUM_SESSION_RANK GetCurrentSessionRank()
 {
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(),dt);
-   int jstHr=(dt.hour+JST_SERVER_OFFSET_HR)%24;
-   int jstMin=dt.min;
-   if(jstHr>=12&&jstHr<=16)return SESSION_INVALID;
-   if(jstHr==22&&jstMin>=20)return SESSION_S;
-   if(jstHr==23&&jstMin==0) return SESSION_S;
-   if(jstHr==17)            return SESSION_A;
-   if(jstHr==18&&jstMin<=30)return SESSION_A;
-   if(jstHr==22&&jstMin<20) return SESSION_A;
-   if(jstHr==3)             return SESSION_B;
+   int serverHr =dt.hour;
+   int serverMin=dt.min;
+   if(serverHr>=5 &&serverHr<=9) return SESSION_INVALID;   // DeadZone  05:00-09:59 EET
+   if(serverHr==15&&serverMin>=20)return SESSION_S;         // NYオープン 15:20-15:59 EET
+   if(serverHr==16&&serverMin==0) return SESSION_S;         // NYオープン 16:00      EET
+   if(serverHr==10)               return SESSION_A;         // ロンドン   10:00-10:59 EET
+   if(serverHr==11&&serverMin<=30)return SESSION_A;         // ロンドン   11:00-11:30 EET
+   if(serverHr==15&&serverMin<20) return SESSION_A;         // NY待機     15:00-15:19 EET
+   if(serverHr==20)               return SESSION_B;         // アジア初動 20:00-20:59 EET
    return SESSION_A; // その他 → 保守的にA級
 }
 
