@@ -54,8 +54,8 @@ input int    InpMaxPositions        = 3;
 // ATRDistance  = clamp(ATR_M5*K_atr, MinATRStop, MaxATRStop)
 input group "=== ATR SL (Risk Manager §1) ==="
 input double InpKatr                = 1.2;   // ATR係数 (NY=1.0 / 通常=1.2 / 荒れ日=1.4)
-input double InpMinATRStop          = 0.25;  // 最小SL距離 ($)
-input double InpMaxATRStop          = 4.00;  // 最大SL距離 ($)
+input double InpMinATRStop          = 0.50;  // 最小SL距離 ($) [Phase5: $5100価格水準対応]
+input double InpMaxATRStop          = 10.00; // 最大SL距離 ($) [Phase5: $5100価格水準対応]
 input double InpBufferMin           = 0.05;  // 最小Structureバッファ ($)
 input double InpBufferSpreadMult    = 1.5;   // スプレッド連動バッファ倍率
 
@@ -65,7 +65,7 @@ input double InpBufferSpreadMult    = 1.5;   // スプレッド連動バッフ�
 input group "=== Vol-Adaptive Risk (Risk Manager §2) ==="
 input double InpBaseRisk            = 0.40;  // ベースリスク (%)
 input double InpMaxRiskPerTrade     = 0.60;  // 1Trade最大リスク (%)
-input double InpDailyLossCapPct     = 2.00;  // 日次損失上限 (%)
+input double InpDailyLossCapPct     = 3.00;  // 日次損失上限 (%) [Phase5: 検証期間暫定。フルロット移行時に2.00へ戻すこと]
 input double InpVolRatioHigh        = 1.35;  // 荒い判定: ATR_M5/ATR_H1 >= この値
 input double InpVolRatioLow         = 0.85;  // 静か判定: ATR_M5/ATR_H1 <  この値
 input double InpVolMultHigh         = 0.55;  // 荒い時VolMult
@@ -105,8 +105,9 @@ input int    InpSlippageStrikes     = 2;     // この回数でセッション�
 
 // --- LRR日次ルール ---
 input group "=== LRR Daily Rules ==="
-input int    InpMaxEntriesPerDay    = 3;     // 1日最大エントリー数
-input int    InpMaxConsecLosses     = 3;     // 連敗停止回数
+input int    InpMaxEntriesPerDay    = 6;     // 1日最大エントリー数 [Phase5: 検証期間緩和]
+input int    InpMaxConsecLosses     = 5;     // 連敗停止回数 [Phase5: 検証期間緩和]
+input int    InpMaxWeeklyConsecLosses = 10; // [Phase2] 週次連敗上限 (0=無効) [Phase5: 検証期間緩和]
 input bool   InpNewsFilterEnabled   = true;  // ニュースフィルター有効
 
 // --- TP段階決済 (LRR §5) ---
@@ -193,6 +194,7 @@ struct LRR_POS_RECORD {
    string   action;          // "BUY" / "SELL"
    bool     tp1Hit;
    bool     tp2Hit;
+   bool     isPyramid;       // [Phase4] ピラミッドエントリーフラグ
 };
 
 //==========================================================================
@@ -235,6 +237,10 @@ string   g_lastEmgSystem        = "";     // 最後に発動したシステム�
 int      g_dailyEntryCount   = 0;
 int      g_consecutiveLosses = 0;
 double   g_dailyRiskUsedPct  = 0.0;
+
+// [Phase2] 週次連敗カウンター
+int      g_weeklyConsecutiveLosses = 0;   // 週内連敗数（金曜終値でリセット）
+datetime g_weekStart               = 0;  // 現在週の開始日時（週変わり検出用）
 
 // ポジションレジストリ (Flash Cut / TP管理用, 最大10)
 LRR_POS_RECORD g_posReg[10];
@@ -298,6 +304,8 @@ int OnInit()
    g_dailyEntryCount      = 0;
    g_consecutiveLosses    = 0;
    g_dailyRiskUsedPct     = 0.0;
+   g_weeklyConsecutiveLosses = 0;
+   g_weekStart            = iTime(_Symbol, PERIOD_W1, 0);
    g_ec1FlashFiredToday   = false;
    g_ec2BlowoutFiredToday = false;
    g_ec3SlipStrikes       = 0;
@@ -398,16 +406,25 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    if(profit<0.0){
       g_consecutiveLosses++;
+      g_weeklyConsecutiveLosses++;  // [Phase2] 週次連敗カウンターインクリメント
       Print("[LRR][TRADE] Loss closed. profit=",DoubleToString(profit,2),
-            " consecLosses=",g_consecutiveLosses,"/",InpMaxConsecLosses);
+            " consecLosses=",g_consecutiveLosses,"/",InpMaxConsecLosses,
+            " weeklyConsecLosses=",g_weeklyConsecutiveLosses,"/",InpMaxWeeklyConsecLosses);
       if(g_consecutiveLosses>=InpMaxConsecLosses){
          g_haltEntries=true;
          Print("[LRR][TRADE] *** CONSEC_LOSS_HALT *** losses=",g_consecutiveLosses,
                " >= limit=",InpMaxConsecLosses," -> haltEntries=true");
       }
+      // [Phase2] 週次連敗上限到達時も停止
+      if(InpMaxWeeklyConsecLosses>0 && g_weeklyConsecutiveLosses>=InpMaxWeeklyConsecLosses){
+         g_haltEntries=true;
+         Print("[LRR][TRADE] *** WEEKLY_CONSEC_HALT *** weeklyLosses=",g_weeklyConsecutiveLosses,
+               " >= limit=",InpMaxWeeklyConsecLosses," -> haltEntries=true");
+      }
    }else{
       if(g_consecutiveLosses>0)
          Print("[LRR][TRADE] Win/BreakEven -> reset consecLosses (",g_consecutiveLosses,"->0).",
+               " weeklyConsecLosses remains=",g_weeklyConsecutiveLosses,
                " profit=",DoubleToString(profit,2));
       g_consecutiveLosses=0;
    }
@@ -723,7 +740,7 @@ double NormalizeVolume(double v)
 //==========================================================================
 
 void RegisterPos(ulong ticket,datetime t,double entryPx,double stopDist,
-                 string action,double riskDollar)
+                 string action,double riskDollar,bool isPyramid=false)
 {
    for(int i=0;i<10;i++){
       if(g_posReg[i].ticket==ticket){
@@ -731,6 +748,7 @@ void RegisterPos(ulong ticket,datetime t,double entryPx,double stopDist,
          g_posReg[i].stopDist=stopDist;g_posReg[i].action=action;
          g_posReg[i].initialRDollar=riskDollar;
          g_posReg[i].tp1Hit=false;g_posReg[i].tp2Hit=false;
+         g_posReg[i].isPyramid=isPyramid;
          return;
       }
    }
@@ -740,12 +758,13 @@ void RegisterPos(ulong ticket,datetime t,double entryPx,double stopDist,
          g_posReg[i].entryPrice=entryPx;g_posReg[i].stopDist=stopDist;
          g_posReg[i].action=action;g_posReg[i].initialRDollar=riskDollar;
          g_posReg[i].tp1Hit=false;g_posReg[i].tp2Hit=false;
+         g_posReg[i].isPyramid=isPyramid;  // [Phase4]
          if(i+1>g_posRegCount)g_posRegCount=i+1;
          Print("[LRR][REG] Registered ticket=",ticket,
                " entry=",DoubleToString(entryPx,_Digits),
                " stopDist=",DoubleToString(stopDist,_Digits),
                " riskDollar=",DoubleToString(riskDollar,2),
-               " action=",action);
+               " action=",action," isPyramid=",isPyramid);
          return;
       }
    }
@@ -890,6 +909,7 @@ void EmergencyCut_Blowout()
          continue;
       }
       if(isLoss&&floatingR>InpFloatingRPartial){
+         g_haltEntries=true; g_ec2BlowoutFiredToday=true;  // [Phase2-Fix] 部分決済後もエントリー停止
          g_lastEmgSystem="EC_BLOWOUT_PARTIAL";
          Print("[LRR][EC_BLOWOUT] *** PARTIAL CLOSE ",DoubleToString(InpPartialClosePct,0),"% ***",
                " ticket=",ticket,
@@ -1160,6 +1180,10 @@ void ProcessZmqMsg(CJAVal &obj)
    if(g_consecutiveLosses>=InpMaxConsecLosses){
       Print("[LRR][GATE] BLOCKED: consecLosses=",g_consecutiveLosses," >= limit=",InpMaxConsecLosses);
       g_haltEntries=true;return;}
+   // [Phase2] 週次連敗ゲート
+   if(InpMaxWeeklyConsecLosses>0 && g_weeklyConsecutiveLosses>=InpMaxWeeklyConsecLosses){
+      Print("[LRR][GATE] BLOCKED: weeklyConsecLosses=",g_weeklyConsecutiveLosses," >= limit=",InpMaxWeeklyConsecLosses);
+      g_haltEntries=true;return;}
 
    // --- ニュースフィルター ---
    if(IsNewsBlocked()){
@@ -1186,8 +1210,8 @@ void ProcessZmqMsg(CJAVal &obj)
    // --- setup_grade ゲート (A+/A only; REJECT = block; "" = legacy pass-through) ---
    if(setupGrade=="REJECT"){
       Print("[LRR][GATE] BLOCKED: setup_grade=REJECT. ai_reason=",aiReason);return;}
-   if(setupGrade!="" && setupGrade!="A+" && setupGrade!="A" && setupGrade!="B"){
-      Print("[LRR][GATE] BLOCKED: setup_grade unknown='",setupGrade,"'. Require A+/A/B.");return;}
+   if(setupGrade!="" && setupGrade!="A+" && setupGrade!="A" && setupGrade!="B" && setupGrade!="C"){
+      Print("[LRR][GATE] BLOCKED: setup_grade unknown='",setupGrade,"'. Require A+/A/B/C.");return;}
 
    // --- セッションランク ---
    ENUM_SESSION_RANK sessionRank=GetCurrentSessionRank();
@@ -1229,16 +1253,39 @@ void ProcessZmqMsg(CJAVal &obj)
       Print("[LRR][GRADE] B grade lot adj: ",DoubleToString(lot,2),"->",DoubleToString(adjGradeB,2));
       lot=adjGradeB;
    }
+   // [Phase2] Grade C: Lot×0.25 (低リスク頻度拡張枠)
+   if(setupGrade=="C"){
+      double adjGradeC=NormalizeVolume(lot*0.25);
+      Print("[LRR][GRADE] C grade lot adj: ",DoubleToString(lot,2),"->",DoubleToString(adjGradeC,2));
+      lot=adjGradeC;
+   }
    lot=MathMin(lot,InpMaxAllowedLot);
    if(lot<=0.0){Print("[LRR][GATE] BLOCKED: lot<=0.");return;}
 
-   // --- RRチェック (TP1/SL >= 1.5) ---
-   double tp1Dist=stopDist*InpTP1AtrMult;
+   // --- RRチェック (TP1/SL >= 1.5) [Phase1-Fix: tpMultを展開して実实ff RRを正確に判定] ---
+   double tpMultRR=1.0;
+   if(g_tpMode==1) tpMultRR=InpTpWideMultiplier;
+   else if(g_tpMode==2) tpMultRR=InpTpTightMultiplier;
+   double tp1Dist=stopDist*InpTP1AtrMult*tpMultRR;
    double rr=(stopDist>0.0)?(tp1Dist/stopDist):0.0;
    if(rr<1.5){
       Print("[LRR][GATE] BLOCKED: RR=",DoubleToString(rr,2)," < 1.5."
             " tp1Dist=",DoubleToString(tp1Dist,_Digits),
-            " stopDist=",DoubleToString(stopDist,_Digits));return;}
+            " stopDist=",DoubleToString(stopDist,_Digits),
+            " tpMult=",DoubleToString(tpMultRR,2));return;}
+
+   // [Phase4] ピラミッド防御: 既存ピラミッドポジションがあれば追撃は1回のみ
+   bool isPyramidOrder = false;
+   CJAVal *vPyramid=obj.HasKey("pyramid",jtBOOL);
+   if(vPyramid!=NULL && vPyramid.ToBool()) isPyramidOrder=true;
+   if(isPyramidOrder){
+      for(int pi=0;pi<10;pi++){
+         if(g_posReg[pi].ticket!=0 && g_posReg[pi].isPyramid){
+            Print("[LRR][GATE] BLOCKED: pyramid already exists (1回のみ制限). ticket=",g_posReg[pi].ticket);
+            return;
+         }
+      }
+   }
 
    // --- 注文実行 ---
    double expectedPx=price;
@@ -1248,12 +1295,13 @@ void ProcessZmqMsg(CJAVal &obj)
       g_dailyEntryCount++;
       g_dailyRiskUsedPct+=riskPct;
       double riskDollar=AccountInfoDouble(ACCOUNT_EQUITY)*(riskPct/100.0);
+      // isPyramidOrder は上部のゲートセクションで宣言済み [Phase4]
       CPositionInfo pos;
       for(int k=PositionsTotal()-1;k>=0;k--){
          if(!pos.SelectByIndex(k))continue;
          if(pos.Magic()!=InpMagicNumber||pos.Symbol()!=_Symbol)continue;
          double actualPx=pos.PriceOpen();
-         RegisterPos(pos.Ticket(),TimeCurrent(),actualPx,stopDist,action,riskDollar);
+         RegisterPos(pos.Ticket(),TimeCurrent(),actualPx,stopDist,action,riskDollar,isPyramidOrder);
          EmergencyCut_Quality(actualPx,expectedPx);
          break;
       }
@@ -1366,6 +1414,13 @@ void ResetDailyIfNeeded()
    g_ec3SlipStrikes=0; g_ec3SessionHalt=false; g_lastEmgSystem="";
    g_dailyEntryCount=0; g_consecutiveLosses=0; g_dailyRiskUsedPct=0.0;
    g_newsBlockActive=false;
+   // [Phase2] 金曜日の夜に週次連敗カウンターをリセット
+   datetime weekNow=iTime(_Symbol,PERIOD_W1,0);
+   if(weekNow!=g_weekStart){
+      Print("[LRR][WEEKLY_RESET] New week -> weeklyConsecLosses=",g_weeklyConsecutiveLosses,"->0");
+      g_weeklyConsecutiveLosses=0;
+      g_weekStart=weekNow;
+   }
    SaveLegacyEmgState();
    Print("[LRR][DAILY_RESET] OK. dayStartEquity=",DoubleToString(g_dayStartEquity,2));
 }

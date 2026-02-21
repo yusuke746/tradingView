@@ -193,7 +193,7 @@ FVG_LOOKBACK_SEC = int(os.getenv("FVG_LOOKBACK_SEC", "1200"))
 # Zombie signal TTL (hard prune): signals older than this are removed from cache
 ZOMBIE_SIGNAL_TTL_SEC = int(os.getenv("ZOMBIE_SIGNAL_TTL_SEC", "1000"))
 
-CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "3")
+CACHE_ASYNC_FLUSH_ENABLED = _env_bool("CACHE_ASYNC_FLUSH_ENABLED", "1")  # [Phase1-Fix] デフォルトを有効(1)に修正
 CACHE_FLUSH_INTERVAL_SEC = float(os.getenv("CACHE_FLUSH_INTERVAL_SEC", "5.0"))
 # Force flush even if signals keep arriving frequently
 CACHE_FLUSH_FORCE_SEC = float(os.getenv("CACHE_FLUSH_FORCE_SEC", "10.0"))
@@ -393,6 +393,18 @@ SWEEP_ZONE_SYNC_WINDOW_SEC = float(os.getenv("SWEEP_ZONE_SYNC_WINDOW_SEC", "90")
 # --- Extended TTL grades (Priority 3) ---
 # When enabled: grade A = TTL×2.5, grade B = TTL×5.0; grade B uses 50% lot in LRR.
 ALLOW_EXTENDED_SWEEP_TTL = _env_bool("ALLOW_EXTENDED_SWEEP_TTL", "1")
+
+# --- Grade C: Sweep単体（Zone不在）での低リスク頻度拡張 [Phase2] ---
+# 発動時 Lot×0.25。GRADE_C_ENABLED=0 で完全無効化。月間+15〜25回の頻度向上を見込む。
+GRADE_C_ENABLED = _env_bool("GRADE_C_ENABLED", "1")
+
+# --- Trend Regime Filter: COUNTER/NEUTRAL/TRENDレジーム識別で逆張りを抑制 [Phase3] ---
+# TRENDレジーム時: 逆張りSweepをREJECT。NEUTRALレジーム時: Grade Cを停止。
+TREND_REGIME_ENABLED = _env_bool("TREND_REGIME_ENABLED", "1")
+
+# --- Pyramid entry: 含み益ゲート倍率 [Phase4] ---
+# ATR_M5 × この値以上の含み益でピラミッド許可（既存 _try_schedule_pyramid_entry 利用）
+PYRAMID_MIN_PROFIT_ATR_MULT = float(os.getenv("PYRAMID_MIN_PROFIT_ATR_MULT", "1.0"))
 
 # --- Lorentzian re-trigger when Sweep in cache (Priority 4) ---
 # When enabled: legacy Lorentzian entry_trigger can fire an entry if a recent Sweep exists.
@@ -769,7 +781,7 @@ def _get_recent_zone_touch(symbol: str, side: str, now: float, ttl: float) -> Op
     return entry
 
 
-def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market: dict) -> tuple[str, str]:
+def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market: dict, *, is_lr_retrig: bool = False, regime: str = "COUNTER") -> tuple[str, str]:
     """
     Priority 1-3: Grade the current setup.
       A+  - Sweep (base TTL) + ZonesTouch recent + sync_ok + (FVG or MTF aligned)
@@ -783,6 +795,13 @@ def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market
     SWEEP_ZONE_SYNC_WINDOW_SEC → downgrade A+ → A (NOT rejected).
     """
     side_norm    = str(side).strip().lower()
+        # --- TRENDレジームでの逆張りブロック [Phase3-Fix] ---
+    # TREND時: QTrend方向と逆のエントリーは全グレードREJECT
+    if regime == "TREND":
+        q_side = str((stats or {}).get("q_side") or "").strip().lower()
+        side_check = str(side).strip().lower()
+        if q_side in {"buy", "sell"} and side_check in {"buy", "sell"} and q_side != side_check:
+            return "REJECT", "TREND_COUNTER_REJECT"
     base_ttl     = _compute_dynamic_sweep_ttl(market)
     ext_mult_a   = 2.5
     ext_mult_b   = 5.0
@@ -841,7 +860,57 @@ def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market
     if has_sweep_ext_b and has_zone:
         return "B", "B"
 
+    # --- B grade: Lorentzian re-trigger (LR_RETRIG) – has_zone を免除 [Phase1-Fix] ---
+    # エントリーゼロ化リスク解消: LR_RETRIG時はZone不要でGrade B（Lot×0.50）として扱う
+    if is_lr_retrig and sweep_entry is not None:
+        return "B", "LR_RETRIG_B"
+
+    # --- C grade: Sweep単体（Zone不在）– 頻度向上枠 [Phase2] ---
+    # Lot×0.25 の低リスク参加。NEUTRAL/TRENDレジームでは無効化される。
+    if GRADE_C_ENABLED and has_sweep_ext_b:
+        if regime == "NEUTRAL":
+            # NEUTRALレジームではGrade Cを停止 [Phase3]
+            return "REJECT", "REJECT"
+        if regime != "TREND":  # TRENDレジームも Grade C 参加は不許可
+            return "C", "C"
+
     return "REJECT", "REJECT"
+
+
+def _compute_trend_regime(market: dict, qtrend_ctx: Optional[dict] = None) -> str:
+    """Classify current market regime to guide entry filtering and position sizing. [Phase3]
+
+    Returns:
+        "COUNTER"  - 通常LRR逆張り条件（全グレード有効）
+        "NEUTRAL"  - ボラ上昇 / 中程度モメンタム（Grade C停止）
+        "TREND"    - 強一方向トレンド（逆張りSweepをREJECT）
+
+    Criteria:
+        ATR ratio = atr_now / atr_avg_5h
+        QTrend direction + strength
+    """
+    if not TREND_REGIME_ENABLED:
+        return "COUNTER"
+    try:
+        atr_now = float((market or {}).get("atr") or 0.0)
+        atr_avg = float((market or {}).get("atr_avg_5h") or 0.0)
+        ratio   = (atr_now / atr_avg) if (atr_avg > 0) else None
+        qt_strength = str((qtrend_ctx or {}).get("strength") or "").strip().lower()
+        qt_side     = str((qtrend_ctx or {}).get("side") or "").strip().lower()
+
+        # TREND: panic-level vol（LRR_VOL_PANIC_RATIOの85%超）
+        panic_thresh = float(LRR_VOL_PANIC_RATIO) * 0.85
+        if ratio is not None and ratio >= panic_thresh:
+            return "TREND"
+        # TREND: Strong Q-Trend + 中程度ボラ上昇
+        if qt_strength == "strong" and qt_side in {"buy", "sell"} and ratio is not None and ratio >= 1.3:
+            return "TREND"
+        # NEUTRAL: 中程度ボラ上昇 OR Strong Q-Trend（panic未到達）
+        if (ratio is not None and ratio >= 1.2) or (qt_strength == "strong" and qt_side in {"buy", "sell"}):
+            return "NEUTRAL"
+        return "COUNTER"
+    except Exception:
+        return "COUNTER"
 
 
 def _prune_processed_entry_triggers_locked(now: float) -> None:
@@ -1315,7 +1384,8 @@ def _run_position_management_once(
     # 理由: settle window後の評価は複数シグナルを集約した結果なので、スキップすると tp_mode等の更新が失われる
     is_settle_window_eval = (recent_signals is not None and len(recent_signals) > 0)
 
-    last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
+    with _close_throttle_lock:  # [Phase1-Fix] スレッドセーフにスロットル判定
+        last_attempt_age = now_mono - float(_last_close_attempt_at or 0.0)
     if (last_attempt_age < AI_CLOSE_THROTTLE_SEC) and (not is_reversal_like) and (not is_settle_window_eval):
         _set_status(
             last_result="AI close throttled",
@@ -1337,8 +1407,9 @@ def _run_position_management_once(
         print(f"[FXAI][MGMT] Throttle BYPASS: reversal_signal (src={src}, evt={evt}, sig_side={sig_side}, net_side={net_side})")
 
     attempt_key = f"{symbol}:{pos_summary.get('net_side')}:{int(pos_summary.get('positions_open') or 0)}:{src}:{evt}:{sig_side}"
-    _last_close_attempt_key = attempt_key
-    _last_close_attempt_at = now_mono
+    with _close_throttle_lock:  # [Phase1-Fix] アトミック更新
+        _last_close_attempt_key = attempt_key
+        _last_close_attempt_at = now_mono
 
     used_signals = None
     if isinstance(recent_signals, list) and recent_signals:
@@ -1562,10 +1633,13 @@ def _try_schedule_pyramid_entry(
         
         if profit_protect_threshold_points <= 0:
             return
-        
+
         net_move_points = float(move_points) / float(point)
-        min_profit_gate = float(profit_protect_threshold_points) * 0.5
-        
+        # [Phase4] ATR_M5 * PYRAMID_MIN_PROFIT_ATR_MULT を利益ゲートとして使用
+        atr_pts = float((market or {}).get("atr_points") or 0.0)
+        atr_profit_gate = atr_pts * float(PYRAMID_MIN_PROFIT_ATR_MULT) if atr_pts > 0 else 0.0
+        min_profit_gate = max(atr_profit_gate, float(profit_protect_threshold_points) * 0.5)
+
         if net_move_points < min_profit_gate:
             return
         
@@ -2173,9 +2247,11 @@ def _heartbeat_receiver_loop() -> None:
         )
 
 # --- De-dupe / throttle ---
+_ai_throttle_lock = Lock()        # [Phase1-Fix] Flask threaded環境でのRace condition防止
 _last_ai_attempt_key = None
 _last_ai_attempt_at = 0.0
 
+_close_throttle_lock = Lock()     # [Phase1-Fix] Flask threaded環境でのRace condition防止
 _last_close_attempt_key = None
 _last_close_attempt_at = 0.0
 
@@ -4643,11 +4719,20 @@ def _build_entry_filter_prompt(
         session_context = None
 
     # --- setup_grade + setup_path (LR_RETRIG override when trigger is entry_trigger) ---
-    _grade_tuple = _compute_setup_grade(symbol, action.lower(), float(now), stats, market)
+    _trig_sig_type_lr = str((normalized_trigger or {}).get("signal_type") or "").strip().lower()
+    _is_lr_retrig_flag = (_trig_sig_type_lr == "entry_trigger")
+    # TrendRegimeFilter: prompt/AI payload用にレジームを計算 [Phase3]
+    _qtrend_for_regime = qtrend_context if isinstance(qtrend_context, dict) else None
+    _trend_regime_val  = _compute_trend_regime(market, _qtrend_for_regime)
+    _grade_tuple = _compute_setup_grade(symbol, action.lower(), float(now), stats, market,
+                                        is_lr_retrig=_is_lr_retrig_flag,
+                                        regime=_trend_regime_val)
     _sweep_grade_val = _grade_tuple[0]
     _setup_path_val  = _grade_tuple[1]
-    _trig_sig_type_lr = str((normalized_trigger or {}).get("signal_type") or "").strip().lower()
-    if _trig_sig_type_lr == "entry_trigger":
+    # LR_RETRIG_B → AI promptには "LR_RETRIG" として通知（既存prompt互換）
+    if _setup_path_val == "LR_RETRIG_B":
+        _setup_path_val = "LR_RETRIG"
+    elif _is_lr_retrig_flag and _setup_path_val not in {"A_PLUS", "A_P1", "A_P2", "A_P3", "B", "C", "LR_RETRIG"}:
         _setup_path_val = "LR_RETRIG"
     # --- Timing fields for AI payload ---
     _sw_raw = _get_sweep_entry_raw(symbol, (action or "").lower())
@@ -5452,11 +5537,17 @@ def _attempt_entry_from_lorentzian(
         attempt_key = f"{attempt_key}:{attempt_context}"
 
     now_mono = time.time()
-    if (not bypass_ai_throttle) and _last_ai_attempt_key == attempt_key and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+    _should_throttle = False
+    with _ai_throttle_lock:  # [Phase1-Fix] Race condition防止: check-then-set をアトミックに
+        if (not bypass_ai_throttle) and _last_ai_attempt_key == attempt_key \
+                and (now_mono - float(_last_ai_attempt_at or 0.0)) < AI_ENTRY_THROTTLE_SEC:
+            _should_throttle = True
+        else:
+            _last_ai_attempt_key = attempt_key
+            _last_ai_attempt_at = now_mono
+    if _should_throttle:
         _set_status(last_result="AI throttled", last_result_at=time.time())
         return _finish("AI throttled", 200, "ai_throttled", market=market, qtrend_ctx=qtrend_ctx, window_signals=window_signals, zones_confirmed_recent=int(stats.get("zones_confirmed_recent") or 0))
-    _last_ai_attempt_key = attempt_key
-    _last_ai_attempt_at = now_mono
 
     ai_decision = _ai_entry_score(
         symbol,
@@ -5575,8 +5666,16 @@ def _attempt_entry_from_lorentzian(
     _sweep_extreme = float(
         market.get("swing_low_20m5" if str(action).upper() == "BUY" else "swing_high_20m5") or 0.0
     )
-    # setup_grade: A+ / A / REJECT (computed from Sweep cache + context stats).
-    _setup_grade, _ = _compute_setup_grade(symbol, trig_side, time.time(), stats, market)
+    # setup_grade: A+ / A / B / C / REJECT (computed from Sweep cache + context stats). [Phase1-Fix]
+    _is_lr_for_order = (
+        str((normalized_trigger or {}).get("signal_type") or "").strip().lower() == "entry_trigger"
+        or (attempt_context == "LR_RETRIG")
+    )
+    _order_regime = _compute_trend_regime(market, qtrend_ctx if isinstance(qtrend_ctx, dict) else None)
+    _setup_grade, _ = _compute_setup_grade(symbol, trig_side, time.time(), stats, market,
+                                           is_lr_retrig=_is_lr_for_order,
+                                           regime=_order_regime)
+    _is_pyramid = (str((normalized_trigger or {}).get("entry_mode") or "").upper() == "PYRAMID")
     payload = {
         "type": "ORDER",
         "action": action,
@@ -5588,6 +5687,7 @@ def _attempt_entry_from_lorentzian(
         "ai_confidence": ai_score,
         "ai_reason": ai_reason,
         "setup_grade": _setup_grade,
+        "pyramid": bool(_is_pyramid),  # [Phase4] ピラミッティング識別フラグ
     }
 
     # Acquire processing lock right before order placement to prevent duplicate orders.
