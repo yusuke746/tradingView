@@ -769,7 +769,7 @@ def _get_recent_zone_touch(symbol: str, side: str, now: float, ttl: float) -> Op
     return entry
 
 
-def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market: dict) -> str:
+def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market: dict) -> tuple[str, str]:
     """
     Priority 1-3: Grade the current setup.
       A+  - Sweep (base TTL) + ZonesTouch recent + sync_ok + (FVG or MTF aligned)
@@ -824,24 +824,24 @@ def _compute_setup_grade(symbol: str, side: str, now: float, stats: dict, market
 
     # --- A+ grade ---
     if has_sweep_base and has_zone and sync_ok and (has_fvg or mtf_aligned):
-        return "A+"
+        return "A+", "A_PLUS"
 
     # --- A grade (3 paths to increase frequency) ---
     # Path 1: sweep in base TTL + zone (sync failed or no FVG/MTF)
     if has_sweep_base and has_zone:
-        return "A"
+        return "A", "A_P1"
     # Path 2: sweep in extended TTL×2.5 + zone + sync ok (ALLOW_EXTENDED_SWEEP_TTL)
     if has_sweep_ext_a and has_zone and sync_ok:
-        return "A"
+        return "A", "A_P2"
     # Path 3: sweep-less fallback – zone + FVG + MTF (original non-sweep A path)
     if has_zone and has_fvg and mtf_aligned:
-        return "A"
+        return "A", "A_P3"
 
     # --- B grade (extended TTL×5.0 sweep + any zone) ---
     if has_sweep_ext_b and has_zone:
-        return "B"
+        return "B", "B"
 
-    return "REJECT"
+    return "REJECT", "REJECT"
 
 
 def _prune_processed_entry_triggers_locked(now: float) -> None:
@@ -4622,6 +4622,23 @@ def _build_entry_filter_prompt(
         print(f"[FXAI][WARN] Failed to build session_context for entry: {e}")
         session_context = None
 
+    # --- setup_grade + setup_path (LR_RETRIG override when trigger is entry_trigger) ---
+    _grade_tuple = _compute_setup_grade(symbol, action.lower(), float(now), stats, market)
+    _sweep_grade_val = _grade_tuple[0]
+    _setup_path_val  = _grade_tuple[1]
+    _trig_sig_type_lr = str((normalized_trigger or {}).get("signal_type") or "").strip().lower()
+    if _trig_sig_type_lr == "entry_trigger":
+        _setup_path_val = "LR_RETRIG"
+    # --- Timing fields for AI payload ---
+    _sw_raw = _get_sweep_entry_raw(symbol, (action or "").lower())
+    _sw_ts_val = float((_sw_raw or {}).get("ts") or 0.0)
+    _sweep_age_sec_ai = int(float(now) - _sw_ts_val) if _sw_raw else None
+    with _zone_touch_cache_lock:
+        _zone_raw = (_zone_touch_cache_by_symbol.get(symbol) or {}).get((action or "").lower())
+    _zone_ts_val = float((_zone_raw or {}).get("ts") or 0.0)
+    _zone_age_sec_ai = int(float(now) - _zone_ts_val) if _zone_raw else None
+    _sync_delta_sec_ai = int(abs(_sw_ts_val - _zone_ts_val)) if (_sw_raw and _zone_raw) else None
+
     payload = _fxai_entry_payload.build_entry_filter_payload(
         symbol=symbol,
         action=action,
@@ -4661,7 +4678,11 @@ def _build_entry_filter_prompt(
         fvg_opp=int(fvg_opp),
         zones_same=int(zones_same),
         zones_opp=int(zones_opp),
-        sweep_grade=_compute_setup_grade(symbol, action.lower(), float(now), stats, market),
+        sweep_grade=_sweep_grade_val,
+        sweep_age_sec=_sweep_age_sec_ai,
+        zone_age_sec=_zone_age_sec_ai,
+        sync_delta_sec=_sync_delta_sec_ai,
+        setup_path=_setup_path_val,
         bid=float(market.get("bid") or 0.0),
         ask=float(market.get("ask") or 0.0),
         m15_sma20=float(market.get("m15_ma") or 0.0),
@@ -5535,7 +5556,7 @@ def _attempt_entry_from_lorentzian(
         market.get("swing_low_20m5" if str(action).upper() == "BUY" else "swing_high_20m5") or 0.0
     )
     # setup_grade: A+ / A / REJECT (computed from Sweep cache + context stats).
-    _setup_grade = _compute_setup_grade(symbol, trig_side, time.time(), stats, market)
+    _setup_grade, _ = _compute_setup_grade(symbol, trig_side, time.time(), stats, market)
     payload = {
         "type": "ORDER",
         "action": action,
